@@ -48,11 +48,13 @@ r nohot "$B" /pnh
 r nowalk "$B" /pnw
 r g15 "$B" /p15
 r id2 "$B" /pid2
+r rel2 "$B" /p SS_RELEASE=2
 r def "$B" /p
 r nohot "$B" /pnh
 r nowalk "$B" /pnw
 r g15 "$B" /p15
 r id2 "$B" /pid2
+r rel2 "$B" /p SS_RELEASE=2
 st steps "$B" /p
 st nowalk "$B" /pnw
 st assist1 "$B" /pa1
@@ -80,5 +82,6 @@ r 60def "$B" /p
 r 60nohot "$B" /pnh
 r 60g15 "$B" /p15
 r 60id2 "$B" /pid2
+r 60rel2 "$B" /p SS_RELEASE=2
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
