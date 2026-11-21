@@ -52,34 +52,36 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 E="${PROBE_E:-20000000}"
 /generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
 B="$S/b"
-r line "$B" /p
+r pair "$B" /p
 dl " "
-r block "$B" /pb
-r swar "$B" /psw
-r line "$B" /p
-r block "$B" /pb
-echo "parse: wall cpu (touch scan fields ts type +event +user all swar block)"
+r table "$B" /pt
+r a512 "$B" /p512
+r dw15 "$B" /p15
+r pair "$B" /p
+r a512 "$B" /p512
+r c512k "$B" /p SS_CHUNK=524288
+r c128k "$B" /p SS_CHUNK=131072
+echo "parse: wall cpu (touch line fields ts type +event +user all table a512)"
 for round in 1 2; do
-for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p psw pb; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pt p512; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 done
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
 w noclick "$B" /dx1
 w nowrite "$B" /dx2
-w nosess "$B" /dx3
 w noheavy "$B" /dx4
-w def "$B" /p
+w nofile "$B" /dx6
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"
 if [ "$G" -le 22 ]; then
 E3=$(( E * 3 ))
 /generate --seed 9 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
 B="$S/c"
-r 60dense "$B" /p
+r 60pair "$B" /p
 dl " "
-r 60block "$B" /pb
-for v in pl1 pl2 pl4 pl7 p pb; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
-r 60dense "$B" /p
+r 60a512 "$B" /p512
+r 60dw15 "$B" /p15
+r 60pair "$B" /p
 fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
