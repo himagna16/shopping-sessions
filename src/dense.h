@@ -30,6 +30,9 @@
 #ifndef SS_DW
 #define SS_DW 14                    // log2 of the event numbers in one partition
 #endif
+#ifndef SS_RADIXMIN
+#define SS_RADIXMIN 4096           // a person with more clicks than this has them ordered by counting passes
+#endif
 #ifndef SS_CW
 #define SS_CW 10                    // log2 of the people in one click partition
 #endif
@@ -58,6 +61,34 @@ static inline SS_HOT u64 unscramble40(u64 value, u64 key) { return ((scramble_z(
 // The n bytes at p (the part of an ID after its letter) as a base-36 number,
 // if they are its canonical spelling: 1 to 8 of 0-9a-z, no leading zero, below
 // 2^40. Anything else gives ~0. p must be readable for 8 bytes.
+#ifndef SS_B36_SWAR
+// One table row per place: a character's digit times that place's power of 36,
+// or a value far out of range for a character that is no digit. The eight
+// lookups replace the checks and all but two of the multiplications.
+struct B36Table {
+    u64 row[8][128];
+    B36Table() {
+        u64 power = 1;
+        for (int place = 7; place >= 0; place--, power *= 36)
+            for (int c = 0; c < 128; c++) {
+                const int digit = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'z') ? c - 'a' + 10 : -1;
+                row[place][c] = digit < 0 ? (1ULL << 62) : u64(digit) * power;
+            }
+    }
+};
+alignas(64) static const B36Table g_b36;
+static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
+    if (n - 1 >= 8) return ~0ULL;
+    const u64 raw = rd64(p);
+    const unsigned s = unsigned(8 * (8 - n));
+    const u64 t = (raw << s) | (0x3030303030303030ULL & ((1ULL << s) - 1));    // right-aligned, padded with '0'
+    const u64 value = g_b36.row[0][t & 0x7F] + g_b36.row[1][(t >> 8) & 0x7F] + g_b36.row[2][(t >> 16) & 0x7F] + g_b36.row[3][(t >> 24) & 0x7F]
+                    + g_b36.row[4][(t >> 32) & 0x7F] + g_b36.row[5][(t >> 40) & 0x7F] + g_b36.row[6][(t >> 48) & 0x7F] + g_b36.row[7][t >> 56 & 0x7F];
+    // a byte over 127, a character that is no digit (its entry puts the sum out of range), a value over 2^40, or a leading zero
+    if (((t & 0x8080808080808080ULL) != 0) | (value > MASK40) | (((raw & 0xFF) == '0') & (n > 1))) return ~0ULL;
+    return value;
+}
+#else
 static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
     if (n - 1 >= 8) return ~0ULL;
     const u64 raw = rd64(p);
@@ -74,6 +105,7 @@ static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
     const u64 value = (quad & 0xFFFFFFFFULL) * 1679616 + (quad >> 32);
     return value > MASK40 ? ~0ULL : value;
 }
+#endif
 
 static inline u32 b36_text(char* out, u64 v) {
     char tmp[16];
@@ -143,6 +175,7 @@ struct DenseCtx {
     struct Run { u32 person, start, amask, flags; };
     hvec<Run> runs;
     hvec<Click> clicks;
+    hvec<u64> click_keys, click_tmp;
     hvec<i64> cat_cents;
     hvec<u32> cat_touched, camp_count, camp_slot, stamp, run_day, run_first;
     u32 session_id = 0;
@@ -229,17 +262,10 @@ static inline bool dense_click_less(u64 a, u64 b) {
 // ---------------------------------------------------------------- keys
 // Reads the start of the largest event file, recovers both keys from it and
 // sizes the tables. False leaves the run on the general path.
-static bool dense_setup(Shared& sh) {
-    Dense& D = g_dense;
-    const double began = now();
-    {
-        const char* v = getenv("SS_DENSE");
-        if (v && *v == '0') return false;
-    }
+// Recovers both keys from the start of the largest event file. False if the
+// data does not show them plainly.
+static bool dense_recover(Shared& sh, u64& ukey_out, u64& ekey_out, double& rows_out) {
     const u32 T = sh.cfg.threads;
-    if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
-    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
-
     size_t total_bytes = 0, best_size = 0;
     i64 best = -1;
     for (const Task& task : sh.event_tasks) {
@@ -362,8 +388,43 @@ static bool dense_setup(Shared& sh) {
     }
     if (keys.size() != 1) return false;
 
+    ukey_out = ukey;
+    ekey_out = keys[0];
+    rows_out = rows_est;
+    return true;
+}
+
+// Recovers the keys and sizes the tables. False leaves the run on the general path.
+// SS_DENSE=0 switches the dense path off; SS_DENSE=2 (tests) takes it even when
+// no key is found, with arbitrary keys: every ID then decodes to some number,
+// nearly all of them out of range, and the result must still be exact.
+static bool dense_setup(Shared& sh) {
+    Dense& D = g_dense;
+    const double began = now();
+    bool forced = false;
+    {
+        const char* v = getenv("SS_DENSE");
+        if (v && *v == '0') return false;
+        forced = v && *v == '2';
+    }
+    const u32 T = sh.cfg.threads;
+    if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
+    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
+    u64 ukey = 0, ekey = 0;
+    double rows_est = 0;
+    if (!dense_recover(sh, ukey, ekey, rows_est)) {
+        if (!forced) return false;
+        size_t total_bytes = 0;
+        for (const Task& task : sh.event_tasks) total_bytes += task.end - task.begin;
+        rows_est = double(total_bytes) / 40 + 16;
+        if (rows_est > 4.0e9) return false;
+        ukey = 0x5DEECE66DULL;
+        ekey = 0x2545F4914FULL;
+    }
+    const u64 pmax = std::min<u64>(1u << 23, u64(rows_est / 30 + rows_est / 300) + 256);
+    const u64 nidx = u64(rows_est + rows_est / 32) + 4096;
     D.ukey = ukey;
-    D.ekey = keys[0];
+    D.ekey = ekey;
     D.nidx = nidx;
     D.nparts = u32(nidx >> SS_DW) + 1;
     D.pmax = u32(pmax);
@@ -380,6 +441,248 @@ static bool dense_setup(Shared& sh) {
     g_dense_on = true;
     D.setup_seconds = now() - began;
     return true;
+}
+
+// ---------------------------------------------------------------- lines
+// The dense parsers read one line at a time. A line of the usual shape is
+// settled from the comma, newline and quote bits of one or two 64-byte windows:
+// the separators come out by position, and the quote rules are checked with the
+// same carry trick as scan_rows (an opening quote directly after a separator, a
+// closing one directly before the next, none elsewhere). Any other line (too
+// long for its windows, the wrong number of fields, a quote out of place) is
+// decided byte by byte, so the result is exact.
+template <int NF> struct Fields { const u8* s[NF]; const u8* e[NF]; };      // each field's content, quotes removed
+
+// One bit for every place where the quote rules are broken, given the
+// separators S and quotes Q of a window that starts at the start of a field.
+// A fault always shows at or before the separator that ends its field.
+static inline SS_HOT u64 quote_faults(u64 S, u64 Q) {
+    const u64 first = (S << 1) | 1;
+    const u64 open = Q & first, other = Q & ~first;
+    const u64 u = open << 1, t = other << 1;
+    const u64 sum = ~S + open;
+    return (t & ~S) | (u & S) | ((sum ^ (t | u)) & S);
+}
+
+// Decides a line byte by byte: [a, end) without its newline. False if malformed.
+template <int NF>
+static bool split_exact(const u8* a, const u8* end, Fields<NF>& f) {
+    int n = 0;
+    for (;;) {
+        const u8* comma = (const u8*)memchr(a, ',', size_t(end - a));
+        const u8* stop_at = comma ? comma : end;
+        if (n == NF) return false;
+        const u8 *s = a, *e = stop_at;
+        if (memchr(a, '"', size_t(stop_at - a))) {
+            if (stop_at - a < 2 || a[0] != '"' || stop_at[-1] != '"' || memchr(a + 1, '"', size_t(stop_at - a - 2))) return false;
+            s = a + 1;
+            e = stop_at - 1;
+        }
+        f.s[n] = s;
+        f.e[n] = e;
+        n++;
+        if (!comma) break;
+        a = comma + 1;
+    }
+    return n == NF;
+}
+
+// An event line: the first three fields end within 64 bytes of the line's
+// start, the other four and the newline within 64 bytes of the fourth's start.
+static inline SS_HOT bool line7(const u8* p, Fields<7>& f, const u8*& next) {
+    const Masks A = classify(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca); ca &= ca - 1;
+    const u32 c3 = tz64(ca);
+    if (c3 >= 64 || (A.nl & ((1ULL << c3) - 1))) return false;
+    const u8* q = p + c3 + 1;
+    const Masks B = classify(q);
+    u64 cb = B.comma;
+    const u32 c4 = tz64(cb); cb &= cb - 1;
+    const u32 c5 = tz64(cb); cb &= cb - 1;
+    const u32 c6 = tz64(cb); cb &= cb - 1;
+    const u32 c7 = tz64(cb);
+    const u32 e = tz64(B.nl);
+    const u64 QA = A.quote, QB = B.quote;
+    const u64 bad_a = quote_faults(A.comma | A.nl, QA) & (~0ULL >> (63 - c3));
+    const u64 bad_b = quote_faults(B.comma | B.nl, QB) & (~0ULL >> ((63 - e) & 63));
+    if ((c6 >= e) | (e >= 64) | (c7 <= e) | ((bad_a | bad_b) != 0)) return false;
+    const u32 o0 = u32(QA & 1), o1 = u32(QA >> (c1 + 1)) & 1, o2 = u32(QA >> (c2 + 1)) & 1;
+    const u32 o3 = u32(QB & 1), o4 = u32(QB >> (c4 + 1)) & 1, o5 = u32(QB >> (c5 + 1)) & 1, o6 = u32(QB >> (c6 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + c2 - o1;
+    f.s[2] = p + c2 + 1 + o2; f.e[2] = p + c3 - o2;
+    f.s[3] = q + o3;          f.e[3] = q + c4 - o3;
+    f.s[4] = q + c4 + 1 + o4; f.e[4] = q + c5 - o4;
+    f.s[5] = q + c5 + 1 + o5; f.e[5] = q + c6 - o5;
+    f.s[6] = q + c6 + 1 + o6; f.e[6] = q + e - o6;
+    next = q + e + 1;
+    return true;
+}
+
+// A click line: all four fields and the newline within 64 bytes.
+static inline SS_HOT bool line4(const u8* p, Fields<4>& f, const u8*& next) {
+    const Masks A = classify(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca); ca &= ca - 1;
+    const u32 c3 = tz64(ca); ca &= ca - 1;
+    const u32 c4 = tz64(ca);
+    const u32 e = tz64(A.nl);
+    const u64 Q = A.quote;
+    const u64 bad = quote_faults(A.comma | A.nl, Q) & (~0ULL >> ((63 - e) & 63));
+    if ((c3 >= e) | (e >= 64) | (c4 <= e) | (bad != 0)) return false;
+    const u32 o0 = u32(Q & 1), o1 = u32(Q >> (c1 + 1)) & 1, o2 = u32(Q >> (c2 + 1)) & 1, o3 = u32(Q >> (c3 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + c2 - o1;
+    f.s[2] = p + c2 + 1 + o2; f.e[2] = p + c3 - o2;
+    f.s[3] = p + c3 + 1 + o3; f.e[3] = p + e - o3;
+    next = p + e + 1;
+    return true;
+}
+
+// A link line: both fields and the newline within 64 bytes.
+static inline SS_HOT bool line2(const u8* p, Fields<2>& f, const u8*& next) {
+    const Masks A = classify(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca);
+    const u32 e = tz64(A.nl);
+    const u64 Q = A.quote;
+    const u64 bad = quote_faults(A.comma | A.nl, Q) & (~0ULL >> ((63 - e) & 63));
+    if ((c1 >= e) | (e >= 64) | (c2 <= e) | (bad != 0)) return false;
+    const u32 o0 = u32(Q & 1), o1 = u32(Q >> (c1 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + e - o1;
+    next = p + e + 1;
+    return true;
+}
+
+// Calls row(fields) for every well-formed line of NF fields that starts in
+// [start, stop); `last` is the newline that ends the last such line, with 64
+// readable bytes after it (as for scan_rows).
+template <int NF, class Fast, class Row>
+static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop, size_t last, Fast&& fast, Row&& row) {
+#ifdef SS_LINE0
+    // Measurement: the block scanner underneath, as before.
+    (void)fast;
+    scan_rows<NF>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
+        Fields<NF> f;
+        u32 quoted[NF];
+        for (int i = 0; i < NF; i++) quoted[i] = u32(buf[a[i] - 1] == '"');
+        for (int i = 0; i < NF; i++) {
+            f.s[i] = buf + a[i];
+            f.e[i] = i + 1 < NF ? buf + a[i + 1] - quoted[i + 1] - 1 - quoted[i] : buf + nlpos - quoted[i];
+        }
+        row(f);
+    });
+#else
+    const u8* p = buf + start;
+    const u8* const stop_at = buf + stop;
+    const u8* const last_nl = buf + last;
+    while (p < stop_at) {
+        __builtin_prefetch(p + 1024);
+        Fields<NF> f;
+        const u8* next;
+        if (__builtin_expect(!fast(p, f, next), 0)) {
+            const u8* nl = (const u8*)memchr(p, '\n', size_t(last_nl - p) + 1);    // found: `last` is a newline
+            next = nl + 1;
+            if (!split_exact<NF>(p, nl, f)) { p = next; continue; }
+        }
+        p = next;
+        row(f);
+    }
+#endif
+}
+
+#ifdef SS_SELFTEST
+// Test builds only (SS_LINETEST=N): random lines, mostly well-formed, some
+// broken; whenever a fast line reader accepts a line, the byte-by-byte reader
+// must accept it too and give the same fields and the same next line.
+template <int NF, class Fast>
+static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) {
+    auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+    std::vector<u8> buf;
+    u64 failures = 0;
+    for (u64 done = 0; done < lines;) {
+        buf.clear();
+        std::vector<size_t> starts;
+        for (int k = 0; k < 64; k++) {
+            starts.push_back(buf.size());
+            const int nf = rnd() % 10 < 9 ? NF : int(rnd() % 10) + 1;
+            for (int i = 0; i < nf; i++) {
+                if (i) buf.push_back(',');
+                size_t len = rnd() % 14;
+                if (rnd() % 40 == 0) len = rnd() % 90;
+                const bool quote = rnd() % 4 == 0;
+                if (quote) buf.push_back('"');
+                for (size_t j = 0; j < len; j++) buf.push_back(u8("abcxyz0189 :-TZ"[rnd() % 15]));
+                if (quote) buf.push_back('"');
+            }
+            const size_t from = starts.back();
+            if (rnd() % 6 == 0 && buf.size() > from) {
+                const size_t at = from + rnd() % (buf.size() - from);
+                switch (rnd() % 5) {
+                    case 0: buf[at] = '"'; break;
+                    case 1: buf[at] = ','; break;
+                    case 2: buf.insert(buf.begin() + long(at), '"'); break;
+                    case 3: buf.erase(buf.begin() + long(at)); break;
+                    default: buf[at] = '\r'; break;
+                }
+            }
+            buf.push_back('\n');
+        }
+        const size_t last = buf.size() - 1;
+        buf.resize(buf.size() + 256, 'x');
+        for (size_t line : starts) {
+            const u8* p = buf.data() + line;
+            const u8* nl = (const u8*)memchr(p, '\n', last - line + 1);
+            Fields<NF> exact, quick;
+            const bool exact_ok = split_exact<NF>(p, nl, exact);
+            const u8* next = nullptr;
+            const bool quick_ok = fast(p, quick, next);
+            done++;
+            if (!quick_ok) continue;
+            accepted++;
+            bool same = exact_ok && next == nl + 1;
+            for (int i = 0; same && i < NF; i++) same = exact.s[i] == quick.s[i] && exact.e[i] == quick.e[i];
+            if (!same) {
+                if (failures++ < 5) fprintf(stderr, "line test: %d fields, mismatch on [%.*s]\n", NF, int(nl - p), (const char*)p);
+            }
+        }
+    }
+    return failures;
+}
+static void line_selftest(u64 lines) {
+    u64 state = 0x9E3779B97F4A7C15ULL ^ lines, a7 = 0, a4 = 0, a2 = 0;
+    const u64 bad = line_selftest_one<7>(state, lines, line7, a7) + line_selftest_one<4>(state, lines, line4, a4) + line_selftest_one<2>(state, lines, line2, a2);
+    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
+            (unsigned long long)a7, (unsigned long long)a4, (unsigned long long)a2, (unsigned long long)bad);
+    _exit(bad ? 1 : 0);
+}
+#endif
+
+// After the links are read: the links of everyone handed to the general path
+// join the general union-find, and the alias map is built from it. Only links
+// hand people over, so this runs on the links thread while the others parse.
+static void dense_settle(Shared& sh) {
+    Dense& D = g_dense;
+    Links& links = sh.odd_links;
+    for (DenseCtx& cx : D.ctx)
+        for (u32 person : cx.marked) {
+            if (D.complex[person] == 2) continue;
+            D.complex[person] = 2;
+            const u64 parents = D.ptab[person] ^ IDENT;
+            if (parents == IDENT) continue;
+            for (u32 a = 0; a < 16; a++) {
+                const u32 parent = u32((parents >> (4 * a)) & 15);
+                if (parent != a) links.add(dense_user_key(person, a), dense_user_key(person, parent));
+            }
+        }
+    const double began = now();
+    links.solve(sh.alias);
+    sh.links_union = now() - began;
 }
 
 // ---------------------------------------------------------------- parse
@@ -410,9 +713,8 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
-        scan_rows<2>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-            QUOTED(0) QUOTED(1)
-            FIELD(0, 1) FIELD_LAST(1)
+        line_rows<2>(buf, start, stop, last, line2, [&](const Fields<2>& f) SS_INLINE {
+            const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1];
             if (s0 == e0 || s1 == e1) return;
             u32 ca = 0, cb = 0;
             const bool da = dense_user(s0, size_t(e0 - s0), ukey, pmax, ca);
@@ -431,6 +733,8 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     }
     while (out != in) apply(ring[out++ & 63]);
     sh.links_parse = now() - began;
+    dense_settle(sh);
+    sh.links_seconds = now() - began;
 }
 
 static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
@@ -447,16 +751,31 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
     const i64 ing_base = D.ing_base;
     const u32 day_lead = ING_LEAD_DAYS * 86400;
     DateCache dates;
+#ifndef SS_PL
+#define SS_PL 0                      // measurement builds only: stop the event row handler after step N
+#endif
+    [[maybe_unused]] u64 sink = 0;
     for (;;) {
         size_t at = sh.next_event.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.event_tasks.size()) break;
         const Task& task = sh.event_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
-        scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-            QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3) QUOTED(4) QUOTED(5) QUOTED(6)
-            FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD(3, 4) FIELD(4, 5) FIELD(5, 6) FIELD_LAST(6)
+#if SS_PL == 1
+        for (size_t i = start; i < last; i += 64) sink += buf[i];
+        release_chunk(sh.files[task.file], task);
+        continue;
+#endif
+        line_rows<7>(buf, start, stop, last, line7, [&](const Fields<7>& f) SS_INLINE {
+#if SS_PL == 2
+            sink += size_t(f.s[0] - buf) + size_t(f.e[6] - buf); return;
+#endif
+            const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
+            const u8 *s4 = f.s[4], *e4 = f.e[4], *s5 = f.s[5], *e5 = f.e[5], *s6 = f.s[6], *e6 = f.e[6];
             if (s0 == e0) return;                               // no event_id
+#if SS_PL == 3
+            sink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3) + size_t(e4 - s4) + size_t(e5 - s5) + size_t(e6 - s6); return;
+#endif
             // As in parse_events: is the copy valid and on time, and where does its
             // ingest_ts stand among the copies of its event. Here the ingest time is
             // kept as whole seconds from a little before the window.
@@ -481,6 +800,9 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                     timely = in_window && ingest - ts <= DAY;
                 }
             }
+#if SS_PL == 4
+            sink += u64(ts) + ing + u64(timely) + size_t(e6 - s6); return;
+#endif
             u32 ts32 = DEAD, payload = 0;
             if (timely && s1 != e1 && s5 != e5) {
                 const size_t kind = size_t(e4 - s4);
@@ -505,16 +827,35 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                 }
                 if (ok) ts32 = u32(ts - ws);
             }
+#if SS_PL == 5
+            sink += u64(ts32) + payload + ing; return;
+#endif
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
             u64 number = ~0ULL;
             if (s0[0] == 'e') {
                 const u64 value = b36_value(s0 + 1, n0 - 1);
                 if (value != ~0ULL) number = unscramble40(value, ekey);
             }
+#if SS_PL == 6
+            sink += u64(ts32) + payload + ing + number; return;
+#endif
+#ifndef SS_PX
+#define SS_PX 0                      // measurement builds only: leave one decode of the parse out
+#endif
+#if SS_PX == 2
+            number = (((rd64(s0 + 1) * 0x9E3779B97F4A7C15ULL) >> 32) * nidx) >> 32;
+#endif
             if (__builtin_expect(number < nidx, 1)) {
                 u32 user = 0;
+#if SS_PX == 1
+                user = u32(rd64(s1 + 1) & 0xFFFFF0) | 1;
+                if (false)
+#endif
                 if (ts32 != DEAD && !dense_user(s1, n1, ukey, pmax, user)) user = dense_odd_user(cx, tid, pack_id(s1, n1, 'u'));
                 if (far) dense_bail(1);                         // an ingest time this record cannot hold
+#if SS_PL == 7
+                sink += u64(ts32) + payload + ing + number + user; return;
+#endif
                 lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << ING_SHIFT) | ((number & (DWIDTH - 1)) << 28) | user});
                 return;
             }
@@ -532,6 +873,7 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
         });
         release_chunk(sh.files[task.file], task);
     }
+    if (sink == 1) fprintf(stderr, "sink\n");
 }
 
 static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
@@ -548,9 +890,8 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
-        scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-            QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3)
-            FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD_LAST(3)
+        line_rows<4>(buf, start, stop, last, line4, [&](const Fields<4>& f) SS_INLINE {
+            const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
             if (s0 == e0 || s1 == e1) return;
             const i64 ts = parse_ts(s3, size_t(e3 - s3), dates);
             if (ts == TS_BAD || ts < lo || ts >= hi) return;
@@ -574,27 +915,6 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
 }
 
 // ---------------------------------------------------------------- between the phases
-// After the parse: the links of everyone handed to the general path join the
-// general union-find, and the alias map is built from it.
-static void dense_settle(Shared& sh) {
-    Dense& D = g_dense;
-    Links& links = sh.odd_links;
-    for (DenseCtx& cx : D.ctx)
-        for (u32 person : cx.marked) {
-            if (D.complex[person] == 2) continue;
-            D.complex[person] = 2;
-            const u64 parents = D.ptab[person] ^ IDENT;
-            if (parents == IDENT) continue;
-            for (u32 a = 0; a < 16; a++) {
-                const u32 parent = u32((parents >> (4 * a)) & 15);
-                if (parent != a) links.add(dense_user_key(person, a), dense_user_key(person, parent));
-            }
-        }
-    const double began = now();
-    links.solve(sh.alias);
-    sh.links_union = now() - began;
-}
-
 static inline void dense_hand_event(Shared& sh, DenseCtx& cx, u32 tid, u32 user, u32 ts, u32 payload) {
     u64 person;
     if (user == cx.memo_user) person = cx.memo_person;
@@ -704,32 +1024,78 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     UserWriter& writer = cx.writer;
     u64 rows = 0;
 
-    // This person's clicks.
+    // This person's clicks. A handful are simply scanned for every session. More
+    // are put in time order (at one instant the smallest click_id last) for a
+    // sliding window: ordered as plain numbers (time, then place), with the rare
+    // ties settled afterwards.
     Click* ck = nullptr;
     u32 m = 0;
+#ifndef SS_DX
+#define SS_DX 0                      // measurement builds only: leave one step of the walk out
+#endif
+#if SS_DX == 3
+    cx.rows += n; return;
+#endif
     {
         const u32 part = person >> SS_CW;
         const u32* starts = D.cstart + size_t(part) * (CPER + 1) + (person & (CPER - 1));
+#if SS_DX == 1
+        const u32 all = 0;
+#else
         const u32 all = starts[1] - starts[0];
+#endif
         if (all) {
-            if (cx.clicks.size() < all) cx.clicks.resize(size_t(all) + all / 2 + 64);
+            if (cx.clicks.size() < all) { cx.clicks.resize(size_t(all) + all / 2 + 64); cx.click_keys.resize(cx.clicks.size()); }
             ck = cx.clicks.data();
             const RecK* src = D.cdata[part] + starts[0];
-            for (u32 i = 0; i < all; i++) {
-                ck[m] = Click{u32(src[i].x >> 32), u32(src[i].y >> 48), src[i].y & KEY_MASK};
-                m += (members >> (u32(src[i].x) & 15)) & 1;
+            if (all <= SS_SCANMAX) {
+                for (u32 i = 0; i < all; i++) {
+                    ck[m] = Click{u32(src[i].x >> 32), u32(src[i].y >> 48), src[i].y & KEY_MASK};
+                    m += (members >> (u32(src[i].x) & 15)) & 1;
+                }
+            } else {
+                u64* keys = cx.click_keys.data();
+                for (u32 i = 0; i < all; i++) {
+                    keys[m] = (src[i].x & ~0xFFFFFFFFULL) | i;
+                    m += (members >> (u32(src[i].x) & 15)) & 1;
+                }
+                if (m > SS_RADIXMIN) {
+                    // A heavy user's clicks: three counting passes over the time (the high half of
+                    // the key), which keep the order of equal times and so sort by time, then place.
+                    if (cx.click_tmp.size() < m) cx.click_tmp.resize(size_t(m) + m / 2);
+                    u64* from = keys;
+                    u64* to = cx.click_tmp.data();
+                    for (int shift = 32; shift < 64; shift += 11) {
+                        u32 count[2048] = {0};
+                        for (u32 i = 0; i < m; i++) count[(from[i] >> shift) & 2047]++;
+                        u32 sum = 0;
+                        for (u32 b = 0; b < 2048; b++) { const u32 c = count[b]; count[b] = sum; sum += c; }
+                        for (u32 i = 0; i < m; i++) to[count[(from[i] >> shift) & 2047]++] = from[i];
+                        std::swap(from, to);
+                    }
+                    keys = from;                        // three passes: the result is in the other buffer
+                } else if (m > SS_SCANMAX) std::sort(keys, keys + m);
+                for (u32 i = 0; i < m; i++) {
+                    const RecK& from = src[u32(keys[i])];
+                    ck[i] = Click{u32(from.x >> 32), u32(from.y >> 48), from.y & KEY_MASK};
+                }
+                if (m > SS_SCANMAX)
+                    for (u32 i = 1; i < m; i++) {
+                        if (ck[i].ts != ck[i - 1].ts) continue;
+                        u32 end = i + 1;
+                        while (end < m && ck[end].ts == ck[i].ts) end++;
+                        std::sort(ck + i - 1, ck + end, [](const Click& x, const Click& y) { return dense_click_less(y.key, x.key); });
+                        i = end;
+                    }
             }
         }
     }
-    // A handful of clicks are simply scanned for every session. More are put in
-    // time order (at one instant the smallest click_id last) for a sliding window.
+#if SS_DX == 4
+    if (m > SS_SCANMAX) m = 0;
+#elif SS_DX == 5
+    if (m <= SS_SCANMAX) m = 0;
+#endif
     const bool scan_clicks = m <= SS_SCANMAX;
-    if (!scan_clicks) {
-        auto before = [](const Click& x, const Click& y) {
-            return x.ts < y.ts || (x.ts == y.ts && dense_click_less(y.key, x.key));
-        };
-        std::sort(ck, ck + m, before);
-    }
 
     char name[24];
     name[0] = 'u';
@@ -749,7 +1115,9 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             }
             cat_touched.clear();
         }
+#if SS_DX != 2
         writer.add(name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+#endif
         rows++;
     };
     u32 left = 0, right = 0;
@@ -969,7 +1337,9 @@ static void dense_walk(Shared& sh, u32 tid) {
             }
         if (!any) continue;
         const double step1 = thread_cpu();
-        u32 nruns = 0, count = 0, current = ~0u, last_ts = 0;
+        // The stretch being read keeps its alias set and its order flag in registers;
+        // they are written to its entry when the next stretch begins.
+        u32 nruns = 0, count = 0, current = ~0u, last_ts = 0, amask = 0, flags = 0;
         for (u32 i = 0; i < DWIDTH; i++) {
             const u64 b = slots[i].b;
             if (b == EMPTY_SLOT) continue;
@@ -981,18 +1351,19 @@ static void dense_walk(Shared& sh, u32 tid) {
             const u32 person = user >> 4;
             if (person != current) {
                 if ((user & ODD) || D.complex[person]) { dense_hand_event(sh, cx, tid, user, ts, u32(a)); continue; }
+                if (nruns) { runs[nruns - 1].amask = amask; runs[nruns - 1].flags = flags; }
                 current = person;
                 runs[nruns++] = {person, count, 0, 0};
-                last_ts = 0;
+                last_ts = 0; amask = 0; flags = 0;
             }
-            DenseCtx::Run& run = runs[nruns - 1];
-            run.amask |= 1u << (user & 15);
-            run.flags |= u32(ts < last_ts);
+            amask |= 1u << (user & 15);
+            flags |= u32(ts < last_ts);
             last_ts = ts;
             ev[count] = a;
             al[count] = u8(user & 15);
             count++;
         }
+        if (nruns) { runs[nruns - 1].amask = amask; runs[nruns - 1].flags = flags; }
         runs[nruns].start = count;
         const double step2 = thread_cpu();
         auto keep = [&](u32 r, DenseFrag& frag) {

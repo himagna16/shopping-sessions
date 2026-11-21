@@ -3227,6 +3227,9 @@ int main(int, char** argv) {
 
     const u32 T = cfg.threads;
     bool dense = false;
+#if defined(SS_DENSE_BUILD) && defined(SS_SELFTEST)
+    if (!env("SS_LINETEST", "").empty()) line_selftest(u64(atoll(env("SS_LINETEST", "0").c_str())));
+#endif
 #ifdef SS_DENSE_BUILD
     g_dense.argv = argv;
     dense = dense_setup(sh);
@@ -3286,10 +3289,13 @@ int main(int, char** argv) {
         });
         if (env("SS_DENSE_BAIL", "") == "2") dense_bail(9);
         if (D.bail.load()) dense_restart(sh, false);
-        const double w0 = now();
-        dense_settle(sh);
+        if (!env("SS_STOP", "").empty()) {                    // measurement: the parse alone
+            fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows 0 | links 0\n",
+                    T, 1u << sh.abits, t1 - t0, now() - t1, 0.0, 0.0, 0.0, now() - t0, c1, 0.0, 0.0);
+            _exit(0);
+        }
         t2 = now();
-        D.wall[0] = t2 - w0;
+        D.wall[0] = sh.links_union;
         // Phase 2: the general dedup (few events) and the clicks grouped by person.
         c2 = run_threads(T, [&](u32 tid) {
             DenseCtx& cx = D.ctx[tid];
