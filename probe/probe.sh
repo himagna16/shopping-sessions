@@ -51,6 +51,11 @@ r noloop "$B" /pnl
 r align "$B" /pal
 r nounr "$B" /pnu
 done
+r as150 "$B" /pnv SS_ASPACE=150
+r as125 "$B" /pnv SS_ASPACE=125
+r as300 "$B" /pnv SS_ASPACE=300
+st steps "$B" /pnv
+st as125 "$B" /pnv SS_ASPACE=125
 r a10 "$B" /pnv SS_ABITS=10
 r b10 "$B" /pnv SS_BBITS=10
 r a10b10 "$B" /pnv SS_ABITS=10 SS_BBITS=10
@@ -65,9 +70,10 @@ r 60b11 "$B" /pnv SS_BBITS=11
 r 60b10 "$B" /pnv SS_BBITS=10
 r 60a11b11 "$B" /pnv SS_ABITS=11 SS_BBITS=11
 r 60a11b10 "$B" /pnv SS_ABITS=11 SS_BBITS=10
-r 60a13 "$B" /pnv SS_ABITS=13
+r 60as150 "$B" /pnv SS_ASPACE=150
+r 60as125 "$B" /pnv SS_ASPACE=125
 st 60steps "$B" /pnv
 st 60b10 "$B" /pnv SS_BBITS=10
-st 60a11 "$B" /pnv SS_ABITS=11
+st 60as125 "$B" /pnv SS_ASPACE=125
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
