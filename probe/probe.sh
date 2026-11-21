@@ -65,6 +65,10 @@ st noslice "$B" /pns
 st steps "$B" /p
 st alias1 "$B" /pa1
 st noslice "$B" /pns
+r a12 "$B" /p SS_ABITS=12
+r a10 "$B" /p SS_ABITS=10
+r b12 "$B" /p SS_BBITS=12
+r b10 "$B" /p SS_BBITS=10
 p pdef "$B" /p
 p palias1 "$B" /pa1
 one "$B" /p > /dev/null; grep -E '^user' "$S/err" | cut -c1-60
