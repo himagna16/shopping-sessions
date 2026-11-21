@@ -434,7 +434,10 @@ static u8* slab_alloc() {
 struct BlockAlloc {
     u8* cur = nullptr;
     u8* end = nullptr;
+    std::vector<u8*> spare;
+    void recycle(u8* block) { spare.push_back(block); }
     inline u8* get() {
+        if (!spare.empty()) { u8* out = spare.back(); spare.pop_back(); return out; }
         if (cur == end) { cur = slab_alloc(); end = cur + SLAB; }
         u8* out = cur;
         cur += BLOCK;
@@ -680,6 +683,10 @@ struct AliasMap {
     Slot* slots = nullptr;
     u64 mask = 0;
     int shift = 64;
+    // One bit per hash prefix, about 16 bits an entry: most IDs that are not
+    // aliases are answered from this small table without touching `slots`.
+    u64* filter = nullptr;
+    int filter_shift = 64;
 
     void build(const std::vector<std::pair<u64, u64>>& entries) {
         size_t cap = 16;
@@ -693,22 +700,40 @@ struct AliasMap {
         slots = (Slot*)p;
         mask = cap - 1;
         shift = 64 - __builtin_ctzll(cap);
+        size_t bits = 1 << 16;
+        while (bits < entries.size() * 16) bits <<= 1;
+        filter = (u64*)calloc(bits / 64, 8);
+        if (!filter) die("out of memory for the alias filter");
+        filter_shift = 64 - __builtin_ctzll(bits);
         for (auto& entry : entries) {
-            u64 at = mix64(entry.first) >> shift;
+            u64 h = mix64(entry.first);
+            u64 at = h >> shift;
             while (slots[at].key) at = (at + 1) & mask;
             slots[at] = {entry.first, entry.second};
+            u64 bit = h >> filter_shift;
+            filter[bit >> 6] |= 1ULL << (bit & 63);
         }
     }
-    inline u64 home(u64 key) const { return mix64(key) >> shift; }
-    inline void prefetch(u64 key) const { __builtin_prefetch(&slots[home(key)]); }
-    inline u64 person(u64 key) const {
-        u64 at = home(key);
+    // False means the key is certainly not an alias.
+    inline bool maybe(u64 hash) const {
+        u64 bit = hash >> filter_shift;
+        return (filter[bit >> 6] >> (bit & 63)) & 1;
+    }
+    inline void prefetch_hash(u64 hash) const { __builtin_prefetch(&slots[hash >> shift]); }
+    inline u64 person_hashed(u64 key, u64 hash) const {
+        u64 at = hash >> shift;
         for (;;) {
             u64 k = slots[at].key;
             if (k == key) return slots[at].name;
             if (!k) return key;
             at = (at + 1) & mask;
         }
+    }
+    inline u64 home(u64 key) const { return mix64(key) >> shift; }
+    inline void prefetch(u64 key) const { __builtin_prefetch(&slots[home(key)]); }
+    inline u64 person(u64 key) const {
+        u64 hash = mix64(key);
+        return maybe(hash) ? person_hashed(key, hash) : key;
     }
 };
 
@@ -952,8 +977,9 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     Scatter<RecB>& out = sh.b[tid];
     std::vector<Block*> blocks;
     std::vector<u64> table;                 // (hash tag << 32) | (block << 8 | index) + 1
-    static const u32 BATCH = 32;
+    static const u32 BATCH = 64;
     RecA* pending[BATCH];
+    u64 pending_hash[BATCH];
     for (;;) {
         u32 bucket = u32(sh.next_bucket.fetch_add(1, std::memory_order_relaxed));
         if (bucket >= nbuckets) break;
@@ -995,7 +1021,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         auto flush = [&]() {
             for (u32 k = 0; k < waiting; k++) {
                 RecA* rec = pending[k];
-                RecB row{alias.person(rec->ukey), rec->ts, rec->payload};
+                RecB row{alias.person_hashed(rec->ukey, pending_hash[k]), rec->ts, rec->payload};
                 out.push(u32(mix64(row.person) >> shift), row);
             }
             waiting = 0;
@@ -1004,12 +1030,20 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             RecA* recs = Scatter<RecA>::items(b);
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
-                alias.prefetch(recs[i].ukey);
-                pending[waiting++] = &recs[i];
+                const u64 hash = mix64(recs[i].ukey);
+                if (!alias.maybe(hash)) {                 // not an alias: the ID is the person
+                    out.push(u32(hash >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
+                    continue;
+                }
+                alias.prefetch_hash(hash);
+                pending[waiting] = &recs[i];
+                pending_hash[waiting++] = hash;
                 if (waiting == BATCH) flush();
             }
         }
         flush();
+        // This bucket's blocks are finished with: reuse them for person buckets.
+        for (Block* b : blocks) sh.alloc[tid].recycle((u8*)b);
     }
 }
 
@@ -1266,12 +1300,21 @@ static void process_people(Shared& sh, u32 tid) {
             }
             Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
             const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
-            if (m > 1)
-                // Time ascending; at one instant the smallest click_id comes last, so
-                // the last click at or before a session start is the one to credit.
-                std::sort(ck, ck + m, [](const Click& x, const Click& y) {
-                    return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key));
-                });
+            // Time ascending; at one instant the smallest click_id comes last, so
+            // the last click at or before a session start is the one to credit.
+            auto before = [](const Click& x, const Click& y) {
+                return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key));
+            };
+            if (m <= 32) {
+                for (u32 i = 1; i < m; i++) {
+                    Click v = ck[i];
+                    u32 j = i;
+                    while (j > 0 && before(v, ck[j - 1])) { ck[j] = ck[j - 1]; j--; }
+                    ck[j] = v;
+                }
+            } else {
+                std::sort(ck, ck + m, before);
+            }
 
             char name_buf[16];
             u32 name_len = 0;
