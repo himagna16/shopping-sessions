@@ -58,6 +58,8 @@ st nowalk "$B" /pnw
 st assist1 "$B" /pa1
 st steps "$B" /p
 st assist1 "$B" /pa1
+st scan0 "$B" /ps0
+st scan6 "$B" /ps6
 st d8 "$B" /pd8
 st d32 "$B" /pd32
 st d64 "$B" /pd64
