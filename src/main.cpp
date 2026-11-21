@@ -57,6 +57,11 @@
 #if !defined(SS_ING1) && !defined(SS_ING2)
 #define SS_ING2
 #endif
+// ID keys: the lean form (an ID's bytes as loaded) unless SS_ID1 asks for the
+// 7-bit packed form.
+#if !defined(SS_ID1) && !defined(SS_ID2)
+#define SS_ID2
+#endif
 #ifdef SS_NOFORCEINLINE
 #define SS_INLINE
 #else
@@ -2961,7 +2966,10 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
-    g_release_input = env("SS_RELEASE", "").empty() ? 0 : env("SS_RELEASE", "") == "2" ? 2 : 1;
+    {
+        const std::string mode = env("SS_RELEASE", "2");            // 0 never, 1 chunk by chunk, 2 file by file
+        g_release_input = mode == "0" ? 0 : mode == "1" ? 1 : 2;
+    }
     g_populate_input = !env("SS_POPULATE", "").empty();
 #ifdef __linux__
     if (!env("SS_PIN", "").empty()) {
