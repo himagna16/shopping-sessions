@@ -57,9 +57,17 @@
 #if !defined(SS_ING1) && !defined(SS_ING2)
 #define SS_ING2
 #endif
-// The older people phase expects records that already carry their person.
-#if defined(SS_PEOPLE1) && !defined(SS_ALIAS1)
+// Linked IDs: by default every surviving event and every click has its person
+// looked up when it is routed (SS_ALIAS1). SS_ALIAS2 routes by the ID as written
+// and settles each ID once inside the person buckets, passing the records of
+// people with several IDs on to a second round. On the scoring machine the two
+// tie at 20M events and SS_ALIAS2 is 4% slower at 60M: its second set of lists
+// needs staging memory that no longer fits the cache beside the rest.
+#if !defined(SS_ALIAS1) && !defined(SS_ALIAS2)
 #define SS_ALIAS1
+#endif
+#if defined(SS_PEOPLE1) && !defined(SS_ALIAS1)
+#error "SS_PEOPLE1 needs SS_ALIAS1"
 #endif
 // ID keys: the lean form (an ID's bytes as loaded) unless SS_ID1 asks for the
 // 7-bit packed form.
