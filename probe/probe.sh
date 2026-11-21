@@ -61,6 +61,9 @@ st noalias "$B" /px4
 st nofilt "$B" /pnf
 r nofilt "$B" /pnf
 r popul "$B" /p SS_POPULATE=1
+r thp "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1
+r thp2 "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.top_pad=33554432
+st thp2 "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.top_pad=33554432
 r def "$B" /p
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
@@ -69,5 +72,6 @@ r 60g15 "$B" /p15
 r 60clang "$B" "$CL"
 st 60steps "$B" /p
 r 60popul "$B" /p SS_POPULATE=1
+r 60thp2 "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.top_pad=33554432
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
