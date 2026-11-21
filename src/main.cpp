@@ -2180,10 +2180,21 @@ static void dedup_buckets(Shared& sh, u32 tid) {
 // ---------------------------------------------------------------- phase 3: people
 struct Click { u32 ts; u32 camp; u64 key; };
 
+#ifdef SS_DIGEST
+// Measurement builds only: a sum over every output row of a hash of its values.
+// It does not depend on the order or the files the rows land in, so two runs
+// (dense and general) can be compared on a machine with nothing but a shell.
+static std::atomic<u64> g_digest_users{0}, g_digest_campaigns{0};
+static inline u64 digest_bytes(const char* p, size_t n, u64 h) {
+    for (size_t i = 0; i < n; i++) h = (h ^ u8(p[i])) * 0x100000001B3ULL;
+    return h;
+}
+#endif
+
 struct UserWriter {
 #ifndef SS_GROUP
-#define SS_GROUP (1u << 17)             // rows in a row group
-#endif
+#define SS_GROUP 2048                   // rows in a row group: small, so the column buffers being filled stay in cache
+#endif                                  // (measured on the scoring machine: 2,048 and 8,192 rows beat 131,072 by about 1%)
     static const u32 GROUP = SS_GROUP;
     pq::File file;
     bool opened = false;
@@ -2207,6 +2218,15 @@ struct UserWriter {
                 {"revenue_cents", pq::INT64, pq::NONE, false}, {"top_category", pq::BYTE_ARRAY, pq::UTF8, true}};
     }
     inline void add(const char* id, u32 id_len, i32 day, i32 nsessions, i32 nevents, i64 cents, const std::string* category) {
+#ifdef SS_DIGEST
+        {
+            u64 h = digest_bytes(id, id_len, 0xCBF29CE484222325ULL);
+            h = mix64(h ^ u64(u32(day)) ^ (u64(u32(nsessions)) << 20) ^ (u64(u32(nevents)) << 40));
+            h = mix64(h ^ u64(cents));
+            if (category) h = digest_bytes(category->data(), category->size(), h ^ 0x9E3779B97F4A7C15ULL);
+            g_digest_users.fetch_add(mix64(h), std::memory_order_relaxed);
+        }
+#endif
         if (ids_len + id_len + 4 > ids.size()) ids.resize(std::max(ids.size() * 2, ids_len + id_len + 4));
         memcpy(&ids[ids_len], &id_len, 4);
         memcpy(&ids[ids_len + 4], id, id_len);
@@ -3128,6 +3148,14 @@ static void write_campaigns(Shared& sh) {
             put(channels, c == ncamp ? organic : sh.cat.channels[c]);
             days.push_back(i32(sh.day0 + d));
             sessions.push_back(cell[0]); purchasing.push_back(cell[1]); revenue.push_back(cell[2]);
+#ifdef SS_DIGEST
+            {
+                const std::string& text = c == ncamp ? organic : sh.cat.campaign_ids[c];
+                u64 h = digest_bytes(text.data(), text.size(), 0xCBF29CE484222325ULL);
+                h = mix64(h ^ u64(d)) ^ mix64(u64(cell[0]) * 3 + 1) ^ mix64(u64(cell[1]) * 5 + 2) ^ mix64(u64(cell[2]) * 7 + 3) ^ mix64(u64(c == ncamp ? 0 : cell[3]) * 11 + 4);
+                g_digest_campaigns.fetch_add(mix64(h), std::memory_order_relaxed);
+            }
+#endif
             assisted.push_back(c == ncamp ? 0 : cell[3]);
         }
     pq::File file;
@@ -3407,6 +3435,9 @@ int main(int, char** argv) {
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
+#ifdef SS_DIGEST
+    fprintf(stderr, "digest users %016llx campaigns %016llx rows %llu\n", (unsigned long long)g_digest_users.load(), (unsigned long long)g_digest_campaigns.load(), (unsigned long long)sh.user_rows.load());
+#endif
     fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links parse %.3f union %.3f | links %.3f\n",
             T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_parse, sh.links_union, sh.links_seconds);
     {
