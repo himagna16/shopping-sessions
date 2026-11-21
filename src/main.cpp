@@ -766,6 +766,18 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t, R
 struct InputFile { int fd; size_t size; const u8* map; };
 struct Task { u32 file; size_t begin, end; };
 
+static bool g_release_input = false;        // SS_RELEASE: drop a mapped chunk's page-table entries once it is parsed
+
+// The whole pages inside a finished chunk of a mapped file. The file stays
+// cached; this only spreads the unmapping over the workers instead of leaving
+// it all to the single-threaded exit.
+static inline void release_chunk(const InputFile& f, const Task& task) {
+    if (!g_release_input || !f.map) return;
+    const size_t page = 4096;
+    const size_t from = (task.begin + page - 1) & ~(page - 1), to = task.end & ~(page - 1);
+    if (to > from) madvise((void*)(f.map + from), to - from, MADV_DONTNEED);
+}
+
 // A thread's read buffer. data() has 64 readable bytes before and after.
 struct Reader {
     u8* mem = nullptr;
@@ -825,6 +837,23 @@ struct Reader {
         return start < stop;
     }
 };
+
+// Zero-filled memory straight from the kernel, on 2 MB pages where it will give
+// them: for tables that are probed at random, where small pages would mean a
+// TLB miss on nearly every access, and so that nothing has to be cleared by hand.
+template <class T>
+static T* big_alloc(size_t count) {
+    const size_t huge = 2u << 20;
+    size_t bytes = (count * sizeof(T) + huge - 1) & ~(huge - 1);
+    if (!bytes) bytes = huge;
+    void* p = mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) die("mmap failed for a table");
+    void* aligned = (void*)((uintptr_t(p) + huge - 1) & ~(uintptr_t(huge) - 1));
+#ifdef MADV_HUGEPAGE
+    if (!getenv("SS_NOHUGE")) madvise(aligned, bytes, MADV_HUGEPAGE);
+#endif
+    return (T*)aligned;
+}
 
 // ---------------------------------------------------------------- arena and scatter lists
 static const size_t SLAB = 2u << 20;
@@ -900,12 +929,14 @@ struct Scatter {
     void init(u32 n, BlockAlloc* a) {
         buckets = n;
         alloc = a;
-        if (posix_memalign((void**)&stage, 64, size_t(n) * UNIT)) die("out of memory for scatter staging");
-        fill = (u8*)calloc(n, 1);
-        cur = (T**)calloc(n, sizeof(T*));
-        head = (Block**)calloc(n, sizeof(Block*));
-        nblocks = (u32*)calloc(n, sizeof(u32));
-        if (!fill || !cur || !head || !nblocks) die("out of memory for scatter state");
+        // One allocation: staging units first (64-byte aligned), then the small per-bucket arrays.
+        const size_t stage_bytes = size_t(n) * UNIT;
+        u8* base = big_alloc<u8>(stage_bytes + size_t(n) * (1 + sizeof(T*) + sizeof(Block*) + sizeof(u32)) + 64);
+        stage = base;
+        cur = (T**)(base + stage_bytes);
+        head = (Block**)(cur + n);
+        nblocks = (u32*)(head + n);
+        fill = (u8*)(nblocks + n);
     }
     inline void push(u32 b, const T& v) {
         T* unit = (T*)(stage + size_t(b) * UNIT);
@@ -953,8 +984,6 @@ struct Scatter {
 #if defined(__AVX2__)
         _mm_sfence();
 #endif
-        free(stage);
-        stage = nullptr;
     }
 };
 
@@ -1195,9 +1224,9 @@ struct AliasMap {
     u64* filter = nullptr;
     int filter_shift = 64;
 
-    void build(const std::vector<std::pair<u64, u64>>& entries) {
+    void build(const std::pair<u64, u64>* entries, size_t count) {
         size_t cap = 16;
-        while (cap < entries.size() * 2) cap <<= 1;
+        while (cap < count * 2) cap <<= 1;
         size_t bytes = cap * sizeof(Slot);
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) die("mmap failed for the alias map");
@@ -1208,15 +1237,14 @@ struct AliasMap {
         mask = cap - 1;
         shift = 64 - __builtin_ctzll(cap);
         size_t bits = 1 << 16;
-        while (bits < entries.size() * 16) bits <<= 1;
-        filter = (u64*)calloc(bits / 64, 8);
-        if (!filter) die("out of memory for the alias filter");
+        while (bits < count * 16) bits <<= 1;
+        filter = big_alloc<u64>(bits / 64);
         filter_shift = 64 - __builtin_ctzll(bits);
         // Inserts land all over a table far larger than the cache, so the
         // slots are requested a batch ahead of being written.
         const size_t AHEAD = 32;
-        for (size_t i = 0; i < entries.size(); i++) {
-            if (i + AHEAD < entries.size()) {
+        for (size_t i = 0; i < count; i++) {
+            if (i + AHEAD < count) {
                 u64 ahead = hash64(entries[i + AHEAD].first);
                 __builtin_prefetch(&slots[ahead >> shift], 1);
                 __builtin_prefetch(&filter[(ahead >> filter_shift) >> 6], 1);
@@ -1295,6 +1323,7 @@ struct Resolver {
 
 struct Links {
     std::vector<std::pair<u64, u64>> pairs;
+    double solved_at = 0;
 
     void add(u64 a, u64 b) { pairs.emplace_back(a, b); }
 
@@ -1303,9 +1332,9 @@ struct Links {
         while (cap < pairs.size() * 4) cap <<= 1;
         struct Slot { u64 key; u32 index; u32 used; };
         struct Node { u64 key; u32 parent; u32 pad; };      // an ID and its union-find parent, on one cache line
-        std::vector<Slot> table(cap);                       // zero-initialised: used == 0 means empty
-        std::vector<Node> nodes;
-        nodes.reserve(pairs.size() * 2);
+        Slot* table = big_alloc<Slot>(cap);                  // zero-filled: used == 0 means empty
+        Node* nodes = big_alloc<Node>(pairs.size() * 2 + 1);
+        u32 nnodes = 0;
         const u64 mask = cap - 1;
         const int top = 64 - __builtin_ctzll(cap);
         auto index_of = [&](u64 key) -> u32 {
@@ -1313,9 +1342,9 @@ struct Links {
             for (;;) {
                 Slot& slot = table[at];
                 if (!slot.used) {
-                    slot = {key, u32(nodes.size()), 1};
-                    nodes.push_back({key, slot.index, 0});
-                    return slot.index;
+                    slot = {key, nnodes, 1};
+                    nodes[nnodes] = {key, nnodes, 0};
+                    return nnodes++;
                 }
                 if (slot.key == key) return slot.index;
                 at = (at + 1) & mask;
@@ -1330,7 +1359,7 @@ struct Links {
         // pair i + 2*GAP, number the IDs of pair i + GAP and request their
         // nodes, join pair i.
         const size_t GAP = 12, total = pairs.size();
-        std::vector<std::pair<u32, u32>> numbered(total);
+        std::pair<u32, u32>* numbered = big_alloc<std::pair<u32, u32>>(total + 1);
         for (size_t i = 0; i < total + GAP; i++) {
             if (i + GAP < total) {
                 __builtin_prefetch(&table[hash64(pairs[i + GAP].first) >> top], 1);
@@ -1350,13 +1379,14 @@ struct Links {
                 nodes[b].parent = a;
             }
         }
-        std::vector<std::pair<u64, u64>> entries;
-        entries.reserve(nodes.size());
-        for (u32 i = 0; i < nodes.size(); i++) {
+        solved_at = now();
+        std::pair<u64, u64>* entries = big_alloc<std::pair<u64, u64>>(nnodes + 1);
+        size_t nentries = 0;
+        for (u32 i = 0; i < nnodes; i++) {
             u32 root = find(i);
-            if (root != i) entries.emplace_back(nodes[i].key, nodes[root].key);
+            if (root != i) entries[nentries++] = {nodes[i].key, nodes[root].key};
         }
-        out.build(entries);
+        out.build(entries, nentries);
     }
 };
 
@@ -1396,7 +1426,7 @@ struct Shared {
     struct Totals { std::vector<u32> sessions, assisted, purchasing; std::vector<i64> revenue; };
     std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
-    double links_seconds = 0;
+    double links_seconds = 0, links_parse = 0, links_union = 0;
 };
 
 static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& tasks) {
@@ -1434,6 +1464,7 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
 static void parse_links(Shared& sh, Reader& reader) {
     const double began = now();
     Links links;
+    links.pairs.reserve(1 << 16);
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
@@ -1449,9 +1480,13 @@ static void parse_links(Shared& sh, Reader& reader) {
             if (s0 == e0 || s1 == e1) return;
             links.add(pack_id(s0, size_t(e0 - s0), 'u'), pack_id(s1, size_t(e1 - s1), 'u'));
         });
+        release_chunk(sh.files[task.file], task);
     }
+    const double parsed = now();
     links.solve(sh.alias);
     sh.links_seconds = now() - began;
+    sh.links_parse = parsed - began;
+    sh.links_union = links.solved_at - parsed;
     sh.links_ready.store(true, std::memory_order_release);
 }
 
@@ -1588,6 +1623,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #endif
             lists.push(u32(hash64(rec.ekey) >> shift), rec);
         });
+        release_chunk(sh.files[task.file], task);
     }
     if (sink == 1) fprintf(stderr, "sink\n");
 }
@@ -1635,6 +1671,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             // the credited campaign nor the set of assisting campaigns: no dedup.
             resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
         });
+        release_chunk(sh.files[task.file], task);
     }
     resolver.finish();
 }
@@ -1832,7 +1869,7 @@ struct UserWriter {
 struct Cell { u64 person; u32 bin; u32 count; u32 first; u32 last; u32 purchases; u32 pad; };
 struct Purchase { u32 payload; u32 next; };
 
-static void process_people(Shared& sh, u32 tid) {
+[[maybe_unused]] static void process_people_v1(Shared& sh, u32 tid) {
     const u32 nthreads = sh.cfg.threads;
     const u32 ncamp = u32(sh.cat.campaign_ids.size());
     const u32 organic = ncamp;
@@ -2144,6 +2181,310 @@ static void process_people(Shared& sh, u32 tid) {
     sh.user_rows.fetch_add(rows);
 }
 
+// The people phase. Per bucket: every person gets a local number; each event
+// becomes one 64-bit key (person number, 30-minute slice, time within the
+// slice); two counting passes order the keys by person and slice with no
+// comparisons. Events in one slice are under 30 minutes apart, so they always
+// share a session and a session boundary can only fall between two slices:
+// walking a person's slices in order gives the sessions without sorting events.
+#ifndef SS_PEOPLE1
+static void process_people(Shared& sh, u32 tid) {
+    const u32 nthreads = sh.cfg.threads;
+    const u32 ncamp = u32(sh.cat.campaign_ids.size());
+    const u32 organic = ncamp;
+    const u32 ndays = sh.ndays;
+    const i64 ws = sh.ws, day0 = sh.day0;
+    const u32 ncat = u32(sh.cat.categories.size());
+    const u32 bbits = sh.bbits;
+    const u32 SLICE = u32(SESSION_GAP);
+    const u32 nslices = u32((sh.we - sh.ws) / SESSION_GAP) + 2;
+    Shared::Totals& totals = sh.campaign_totals[tid];
+    totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.revenue.assign(size_t(ncamp + 1) * ndays, 0);
+
+    UserWriter writer;
+    char name[64];
+    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid);
+    writer.init(sh.cfg.out + name);
+
+    struct Local { u64 key; u32 index; u32 used; };          // a person's number within the bucket
+    struct Bought { u64 key; u32 payload; u32 pad; };        // key = person number << 32 | ts
+    struct Found { u32 person; Click click; };
+    std::vector<Local> table;
+    std::vector<u64> persons, keys, sorted;
+    std::vector<u32> per_person, per_slice(nslices + 1), person_start, click_start, cursor;
+    std::vector<Bought> bought;
+    std::vector<Found> found;
+    std::vector<Click> clicks;
+    std::vector<i64> cat_cents(ncat, 0);
+    std::vector<u32> cat_touched;
+    std::vector<u32> camp_count(ncamp + 1, 0), camp_slot(ncamp + 1, 0), active;
+    std::vector<u32> stamp(ncamp + 1, 0);                     // last session that counted this campaign as an assist
+    u32 session_id = 0;
+    u64 rows = 0;
+
+    for (;;) {
+        size_t turn = sh.next_person.fetch_add(1, std::memory_order_relaxed);
+        if (turn >= sh.person_order.size()) break;
+        u32 bucket = sh.person_order[turn];
+
+        size_t nev = 0;
+        for (u32 t = 0; t < nthreads; t++)
+            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) nev += b->n;
+        if (!nev) continue;
+
+        // 1. Number the people and key the events.
+        size_t cap = 64;
+        while (cap < nev / 8) cap <<= 1;
+        table.assign(cap, Local{0, 0, 0});
+        u64 mask = cap - 1;
+        int shift = 64 - __builtin_ctzll(cap);
+        persons.clear();
+        per_person.clear();
+        bought.clear();
+        keys.resize(nev);
+        memset(per_slice.data(), 0, per_slice.size() * sizeof(u32));
+        auto number = [&](u64 person) -> u32 {
+            u64 at = (hash64(person) << bbits) >> shift;
+            for (;;) {
+                const Local& slot = table[at];
+                if (!slot.used) break;
+                if (slot.key == person) return slot.index;
+                at = (at + 1) & mask;
+            }
+            if ((persons.size() + 1) * 2 > cap) {                 // keep the table at most half full
+                cap <<= 1;
+                mask = cap - 1;
+                shift--;
+                table.assign(cap, Local{0, 0, 0});
+                for (u32 i = 0; i < persons.size(); i++) {
+                    u64 h = (hash64(persons[i]) << bbits) >> shift;
+                    while (table[h].used) h = (h + 1) & mask;
+                    table[h] = {persons[i], i, 1};
+                }
+                at = (hash64(person) << bbits) >> shift;
+                while (table[at].used) at = (at + 1) & mask;
+            }
+            const u32 index = u32(persons.size());
+            table[at] = {person, index, 1};
+            persons.push_back(person);
+            per_person.push_back(0);
+            return index;
+        };
+        size_t j = 0;
+        for (u32 t = 0; t < nthreads; t++)
+            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) {
+                const RecB* recs = Scatter<RecB>::items(b);
+                for (u32 i = 0; i < b->n; i++) {
+                    const u32 who = number(recs[i].person);
+                    const u32 ts = recs[i].ts;
+                    const u32 slice = ts / SLICE;
+                    keys[j++] = (u64(who) << 33) | (u64(slice) << 21) | (ts - slice * SLICE);
+                    per_slice[slice]++;
+                    per_person[who]++;
+                    if (recs[i].payload) bought.push_back({(u64(who) << 32) | ts, recs[i].payload, 0});
+                }
+            }
+        const u32 npeople = u32(persons.size());
+
+        // 2. Order the keys by slice, then (keeping that order) by person.
+        sorted.resize(nev);
+        for (u32 k = 0, sum = 0; k < per_slice.size(); k++) { u32 n = per_slice[k]; per_slice[k] = sum; sum += n; }
+        for (size_t k = 0; k < nev; k++) sorted[per_slice[(keys[k] >> 21) & 0xFFF]++] = keys[k];
+        person_start.resize(npeople + 1);
+        for (u32 k = 0, sum = 0; k < npeople; k++) { person_start[k] = sum; sum += per_person[k]; }
+        person_start[npeople] = u32(nev);
+        cursor.assign(person_start.begin(), person_start.end() - 1);
+        for (size_t k = 0; k < nev; k++) keys[cursor[sorted[k] >> 33]++] = sorted[k];
+        if (bought.size() > 1) std::sort(bought.begin(), bought.end(), [](const Bought& x, const Bought& y) { return x.key < y.key; });
+        bought.push_back({~0ULL, 0, 0});                          // sentinel
+
+        // 3. Clicks of people who have events, grouped by person.
+        auto lookup = [&](u64 person) -> i64 {
+            u64 at = (hash64(person) << bbits) >> shift;
+            for (;;) {
+                const Local& slot = table[at];
+                if (!slot.used) return -1;
+                if (slot.key == person) return slot.index;
+                at = (at + 1) & mask;
+            }
+        };
+        click_start.assign(npeople + 1, 0);
+        found.clear();
+        for (u32 t = 0; t < nthreads; t++)
+            for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
+                const RecC* recs = Scatter<RecC>::items(b);
+                for (u32 i = 0; i < b->n; i++) {
+                    i64 id = lookup(recs[i].person);
+                    if (id >= 0) {
+                        click_start[size_t(id)]++;
+                        found.push_back({u32(id), {recs[i].ts, recs[i].camp, recs[i].ckey}});
+                    }
+                }
+            }
+        const size_t nclicks = found.size();
+        if (nclicks) {
+            for (u32 p = 0, sum = 0; p <= npeople; p++) { u32 n = click_start[p]; click_start[p] = sum; sum += n; }
+            cursor.assign(click_start.begin(), click_start.end() - 1);
+            clicks.resize(nclicks);
+            for (const Found& f : found) clicks[cursor[f.person]++] = f.click;
+        }
+
+        // 4. Each person: sessions, click credit and assists, daily rows.
+        size_t next_bought = 0;
+        for (u32 p = 0; p < npeople; p++) {
+            const u64* mine = keys.data() + person_start[p];
+            const u32 n = person_start[p + 1] - person_start[p];
+            Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
+            const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
+            // A handful of clicks are simply scanned for every session. More are put in
+            // time order (at one instant the smallest click_id last) for a sliding window.
+            const bool scan_clicks = m <= 16;
+            if (!scan_clicks) {
+                auto before = [](const Click& x, const Click& y) {
+                    return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key, 'k'));
+                };
+                std::sort(ck, ck + m, before);
+            }
+
+            char name_buf[16];
+            u32 name_len = 0;
+            std::string name_long;
+            const char* person_name = name_buf;
+            if (persons[p] & INTERN_BIT) {
+                name_long = id_string(persons[p], 'u');
+                person_name = name_long.data();
+                name_len = u32(name_long.size());
+            } else {
+#ifdef SS_ID2
+                name_buf[name_len++] = 'u';
+                for (u64 key = persons[p]; key; key >>= 8) name_buf[name_len++] = char(key & 0xFF);
+#else
+                for (int sh7 = 56; sh7 >= 0; sh7 -= 7) {
+                    char c = char((persons[p] >> sh7) & 0x7F);
+                    if (!c) break;
+                    name_buf[name_len++] = c;
+                }
+#endif
+            }
+            i64 cur_day = -1;
+            i32 d_sessions = 0, d_events = 0;
+            i64 d_revenue = 0;
+            auto emit = [&]() {
+                const std::string* top = nullptr;
+                if (!cat_touched.empty()) {
+                    std::sort(cat_touched.begin(), cat_touched.end());   // categories are numbered in byte order
+                    i64 best = 0;
+                    for (u32 c : cat_touched) {
+                        if (cat_cents[c] > best) { best = cat_cents[c]; top = &sh.cat.categories[c]; }
+                        cat_cents[c] = 0;
+                    }
+                    cat_touched.clear();
+                }
+#if SS_X != 6
+                writer.add(person_name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+#endif
+                rows++;
+            };
+            u32 left = 0, right = 0;
+            // One session: first event at `start`, last at `last` (ms from window_start).
+            auto session = [&](u32 start, u32 last, u32 nevents) {
+                const i64 day = floor_div(ws + start, DAY) - day0;
+                if (day != cur_day) {
+                    if (cur_day >= 0) emit();
+                    cur_day = day; d_sessions = 0; d_events = 0; d_revenue = 0;
+                }
+                i64 cents = 0;
+                const u64 upto = (u64(p) << 32) | last;
+                while (bought[next_bought].key <= upto) {         // this person's purchases up to the session's end
+                    const u32 payload = bought[next_bought++].payload;
+                    const u32 c = payload & 0xFF;
+                    const i64 price = payload >> 8;
+                    if (!cat_cents[c]) cat_touched.push_back(c);
+                    cat_cents[c] += price;
+                    cents += price;
+                }
+                // purchases have a price of at least 1, so cents > 0 means "has a purchase"
+                d_sessions++; d_events += i32(nevents); d_revenue += cents;
+
+                u32 credited = organic;
+                // Click times count from window_start - 7 days, event times from
+                // window_start, so the clicks in reach are those in [start, start + 7 days].
+                if (scan_clicks) {
+                    session_id++;
+                    i64 best = -1;
+                    for (u32 k = 0; k < m; k++) {
+                        const u32 t = ck[k].ts;
+                        if (u32(t - start) > u32(REACH)) continue;            // before start, or over 7 days back
+                        const u32 c = ck[k].camp;
+                        if (stamp[c] != session_id) { stamp[c] = session_id; totals.assisted[size_t(c) * ndays + size_t(day)]++; }
+                        if (best < 0 || t > ck[best].ts || (t == ck[best].ts && id_less(ck[k].key, ck[best].key, 'k'))) best = k;
+                    }
+                    if (best >= 0) credited = ck[best].camp;
+                } else {
+                    const u64 hi = u64(start) + u64(REACH);
+                    while (right < m && ck[right].ts <= hi) {
+                        u32 c = ck[right++].camp;
+                        if (camp_count[c]++ == 0) { camp_slot[c] = u32(active.size()); active.push_back(c); }
+                    }
+                    while (left < right && ck[left].ts < start) {
+                        u32 c = ck[left++].camp;
+                        if (--camp_count[c] == 0) {
+                            u32 tail = active.back();
+                            active[camp_slot[c]] = tail;
+                            camp_slot[tail] = camp_slot[c];
+                            active.pop_back();
+                        }
+                    }
+                    if (right > left) credited = ck[right - 1].camp;
+                    for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
+                }
+                const size_t slot = size_t(credited) * ndays + size_t(day);
+                totals.sessions[slot]++;
+                if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
+            };
+
+            // Walk the slices. Within a slice the keys are in no order, so take min and max.
+            u32 i = 0;
+            u32 start = 0, last = 0, nevents = 0, prev_slice = 0;
+            bool open = false;
+            while (i < n) {
+                const u32 slice = u32(mine[i] >> 21) & 0xFFF;
+                const u32 base = slice * SLICE;
+                u32 lo = u32(mine[i]) & 0x1FFFFF, hi = lo, count = 1;
+                for (i++; i < n && (u32(mine[i] >> 21) & 0xFFF) == slice; i++) {
+                    const u32 v = u32(mine[i]) & 0x1FFFFF;
+                    lo = v < lo ? v : lo;
+                    hi = v > hi ? v : hi;
+                    count++;
+                }
+                // A later slice continues the session only if it is the very next
+                // slice and its first event is within 30 minutes of the last one.
+                if (open && slice == prev_slice + 1 && i64(base + lo) - i64(last) <= SESSION_GAP) {
+                    last = base + hi;
+                    nevents += count;
+                } else {
+                    if (open) session(start, last, nevents);
+                    start = base + lo; last = base + hi; nevents = count;
+                    open = true;
+                }
+                prev_slice = slice;
+            }
+            if (open) session(start, last, nevents);
+            if (cur_day >= 0) emit();
+            for (u32 c : active) camp_count[c] = 0;
+            active.clear();
+        }
+    }
+    writer.finish();
+    sh.user_rows.fetch_add(rows);
+}
+#else
+static void process_people(Shared& sh, u32 tid) { process_people_v1(sh, tid); }
+#endif
+
 // ---------------------------------------------------------------- main
 static double thread_cpu() {
     timespec t;
@@ -2257,6 +2598,7 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
+    g_release_input = !env("SS_RELEASE", "").empty();
 #ifdef __linux__
     if (!env("SS_PIN", "").empty()) {
         cpu_set_t allowed;
@@ -2367,8 +2709,8 @@ int main() {
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links %.3f\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_seconds);
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links parse %.3f union %.3f | links %.3f\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_parse, sh.links_union, sh.links_seconds);
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
