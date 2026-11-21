@@ -57,6 +57,9 @@ st steps "$B" /p
 st noclk "$B" /px5
 st nowr "$B" /px6
 st nosess "$B" /px9
+st noalias "$B" /px4
+st nofilt "$B" /pnf
+r nofilt "$B" /pnf
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
 grep -E '^user' "$S/err" | cut -c1-70
