@@ -21,6 +21,10 @@ CONFIGS = {  # name -> env overrides; "tiny" configs set SS_CHUNK
     "t1": {"SS_THREADS": "1"},
     "t3c4096": {"SS_THREADS": "3", "SS_CHUNK": "4096"},
     "t8c777": {"SS_THREADS": "8", "SS_CHUNK": "777"},
+    # the dense path switched off; abandoned after the parse; abandoned after its output was written
+    "nodense": {"SS_DENSE": "0"},
+    "bail2": {"SS_DENSE_BAIL": "2", "SS_THREADS": "3"},
+    "bail1": {"SS_DENSE_BAIL": "1", "SS_THREADS": "5", "SS_CHUNK": "65536"},
 }
 BIG_BYTES = 100 * 1024 * 1024
 
