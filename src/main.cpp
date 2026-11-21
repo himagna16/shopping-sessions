@@ -32,6 +32,9 @@
 #include <sys/vfs.h>
 #endif
 #include <time.h>
+#ifdef __linux__
+#include <sched.h>
+#endif
 #include <unistd.h>
 
 #if defined(__AVX2__)
@@ -1994,12 +1997,24 @@ static double thread_cpu() {
     return double(t.tv_sec) + double(t.tv_nsec) * 1e-9;
 }
 
+static std::vector<int> g_pin;              // SS_PIN: the CPUs worker t is tied to, in order
+
+static void pin_thread(u32 t) {
+#ifdef __linux__
+    if (g_pin.empty()) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(g_pin[t % g_pin.size()], &set);
+    sched_setaffinity(0, sizeof set, &set);
+#endif
+}
+
 // Runs body(0..n-1) on n threads and returns the CPU seconds they used.
 template <class F>
 static double run_threads(u32 n, F&& body) {
     std::vector<std::thread> threads;
     std::vector<double> cpu(n, 0);
-    auto timed = [&](u32 t) { double c0 = thread_cpu(); body(t); cpu[t] = thread_cpu() - c0; };
+    auto timed = [&](u32 t) { pin_thread(t); double c0 = thread_cpu(); body(t); cpu[t] = thread_cpu() - c0; };
     for (u32 t = 1; t < n; t++) threads.emplace_back([&timed, t] { timed(t); });
     timed(0);
     for (auto& th : threads) th.join();
@@ -2088,6 +2103,13 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
+#ifdef __linux__
+    if (!env("SS_PIN", "").empty()) {
+        cpu_set_t allowed;
+        if (sched_getaffinity(0, sizeof allowed, &allowed) == 0)
+            for (int c = 0; c < CPU_SETSIZE; c++) if (CPU_ISSET(c, &allowed)) g_pin.push_back(c);
+    }
+#endif
 
     {
         std::string text;
