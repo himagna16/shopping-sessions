@@ -1057,7 +1057,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.event_tasks[at];
         const u8* buf; size_t start, stop;
         if (!reader.load(sh.files[task.file], task, buf, start, stop)) continue;
-#if SS_PROBE == 1
+#if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
         scan_rows<7>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
@@ -1124,7 +1124,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
                     }
                 }
             }
-#if SS_PROBE == 3
+#if SS_PROBE == 3 || SS_LVL == 7
             sink += rec.ekey + rec.ukey + rec.ts + rec.payload + u64(rec.ingest); return;
 #endif
             lists.push(u32(mix64(rec.ekey) >> shift), rec);
