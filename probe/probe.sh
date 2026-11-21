@@ -55,16 +55,17 @@ B="$S/b"
 r batch "$B" /p
 dl " "
 r chain "$B" /pc
+r stage "$B" /ps
 r table "$B" /pt
 r a512 "$B" /p512
 r dw15 "$B" /p15
 r batch "$B" /p
 r chain "$B" /pc
+r stage "$B" /ps
 r a512 "$B" /p512
 r c512k "$B" /p SS_CHUNK=524288
-r c128k "$B" /p SS_CHUNK=131072
-echo "parse: wall cpu (touch line fields ts type +event +user all chain table a512 noclicks nolinks)"
-for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pc pt p512 pnc pnl; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+echo "parse: wall cpu (touch line fields ts type +event +user all chain stage table a512 noclicks nolinks)"
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pc ps pt p512 pnc pnl; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
 w noclick "$B" /dx1
@@ -79,7 +80,7 @@ E3=$(( E * 3 ))
 B="$S/c"
 r 60batch "$B" /p
 dl " "
-r 60chain "$B" /pc
+r 60stage "$B" /ps
 r 60a512 "$B" /p512
 r 60dw15 "$B" /p15
 r 60batch "$B" /p
