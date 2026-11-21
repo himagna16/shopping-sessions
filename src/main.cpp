@@ -766,6 +766,18 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t, R
 struct InputFile { int fd; size_t size; const u8* map; };
 struct Task { u32 file; size_t begin, end; };
 
+static bool g_release_input = false;        // SS_RELEASE: drop a mapped chunk's page-table entries once it is parsed
+
+// The whole pages inside a finished chunk of a mapped file. The file stays
+// cached; this only spreads the unmapping over the workers instead of leaving
+// it all to the single-threaded exit.
+static inline void release_chunk(const InputFile& f, const Task& task) {
+    if (!g_release_input || !f.map) return;
+    const size_t page = 4096;
+    const size_t from = (task.begin + page - 1) & ~(page - 1), to = task.end & ~(page - 1);
+    if (to > from) madvise((void*)(f.map + from), to - from, MADV_DONTNEED);
+}
+
 // A thread's read buffer. data() has 64 readable bytes before and after.
 struct Reader {
     u8* mem = nullptr;
@@ -825,6 +837,23 @@ struct Reader {
         return start < stop;
     }
 };
+
+// Zero-filled memory straight from the kernel, on 2 MB pages where it will give
+// them: for tables that are probed at random, where small pages would mean a
+// TLB miss on nearly every access, and so that nothing has to be cleared by hand.
+template <class T>
+static T* big_alloc(size_t count) {
+    const size_t huge = 2u << 20;
+    size_t bytes = (count * sizeof(T) + huge - 1) & ~(huge - 1);
+    if (!bytes) bytes = huge;
+    void* p = mmap(nullptr, bytes + huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) die("mmap failed for a table");
+    void* aligned = (void*)((uintptr_t(p) + huge - 1) & ~(uintptr_t(huge) - 1));
+#ifdef MADV_HUGEPAGE
+    if (!getenv("SS_NOHUGE")) madvise(aligned, bytes, MADV_HUGEPAGE);
+#endif
+    return (T*)aligned;
+}
 
 // ---------------------------------------------------------------- arena and scatter lists
 static const size_t SLAB = 2u << 20;
@@ -900,12 +929,14 @@ struct Scatter {
     void init(u32 n, BlockAlloc* a) {
         buckets = n;
         alloc = a;
-        if (posix_memalign((void**)&stage, 64, size_t(n) * UNIT)) die("out of memory for scatter staging");
-        fill = (u8*)calloc(n, 1);
-        cur = (T**)calloc(n, sizeof(T*));
-        head = (Block**)calloc(n, sizeof(Block*));
-        nblocks = (u32*)calloc(n, sizeof(u32));
-        if (!fill || !cur || !head || !nblocks) die("out of memory for scatter state");
+        // One allocation: staging units first (64-byte aligned), then the small per-bucket arrays.
+        const size_t stage_bytes = size_t(n) * UNIT;
+        u8* base = big_alloc<u8>(stage_bytes + size_t(n) * (1 + sizeof(T*) + sizeof(Block*) + sizeof(u32)) + 64);
+        stage = base;
+        cur = (T**)(base + stage_bytes);
+        head = (Block**)(cur + n);
+        nblocks = (u32*)(head + n);
+        fill = (u8*)(nblocks + n);
     }
     inline void push(u32 b, const T& v) {
         T* unit = (T*)(stage + size_t(b) * UNIT);
@@ -953,8 +984,6 @@ struct Scatter {
 #if defined(__AVX2__)
         _mm_sfence();
 #endif
-        free(stage);
-        stage = nullptr;
     }
 };
 
@@ -1195,9 +1224,9 @@ struct AliasMap {
     u64* filter = nullptr;
     int filter_shift = 64;
 
-    void build(const std::vector<std::pair<u64, u64>>& entries) {
+    void build(const std::pair<u64, u64>* entries, size_t count) {
         size_t cap = 16;
-        while (cap < entries.size() * 2) cap <<= 1;
+        while (cap < count * 2) cap <<= 1;
         size_t bytes = cap * sizeof(Slot);
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) die("mmap failed for the alias map");
@@ -1208,15 +1237,14 @@ struct AliasMap {
         mask = cap - 1;
         shift = 64 - __builtin_ctzll(cap);
         size_t bits = 1 << 16;
-        while (bits < entries.size() * 16) bits <<= 1;
-        filter = (u64*)calloc(bits / 64, 8);
-        if (!filter) die("out of memory for the alias filter");
+        while (bits < count * 16) bits <<= 1;
+        filter = big_alloc<u64>(bits / 64);
         filter_shift = 64 - __builtin_ctzll(bits);
         // Inserts land all over a table far larger than the cache, so the
         // slots are requested a batch ahead of being written.
         const size_t AHEAD = 32;
-        for (size_t i = 0; i < entries.size(); i++) {
-            if (i + AHEAD < entries.size()) {
+        for (size_t i = 0; i < count; i++) {
+            if (i + AHEAD < count) {
                 u64 ahead = hash64(entries[i + AHEAD].first);
                 __builtin_prefetch(&slots[ahead >> shift], 1);
                 __builtin_prefetch(&filter[(ahead >> filter_shift) >> 6], 1);
@@ -1295,6 +1323,7 @@ struct Resolver {
 
 struct Links {
     std::vector<std::pair<u64, u64>> pairs;
+    double solved_at = 0;
 
     void add(u64 a, u64 b) { pairs.emplace_back(a, b); }
 
@@ -1303,9 +1332,9 @@ struct Links {
         while (cap < pairs.size() * 4) cap <<= 1;
         struct Slot { u64 key; u32 index; u32 used; };
         struct Node { u64 key; u32 parent; u32 pad; };      // an ID and its union-find parent, on one cache line
-        std::vector<Slot> table(cap);                       // zero-initialised: used == 0 means empty
-        std::vector<Node> nodes;
-        nodes.reserve(pairs.size() * 2);
+        Slot* table = big_alloc<Slot>(cap);                  // zero-filled: used == 0 means empty
+        Node* nodes = big_alloc<Node>(pairs.size() * 2 + 1);
+        u32 nnodes = 0;
         const u64 mask = cap - 1;
         const int top = 64 - __builtin_ctzll(cap);
         auto index_of = [&](u64 key) -> u32 {
@@ -1313,9 +1342,9 @@ struct Links {
             for (;;) {
                 Slot& slot = table[at];
                 if (!slot.used) {
-                    slot = {key, u32(nodes.size()), 1};
-                    nodes.push_back({key, slot.index, 0});
-                    return slot.index;
+                    slot = {key, nnodes, 1};
+                    nodes[nnodes] = {key, nnodes, 0};
+                    return nnodes++;
                 }
                 if (slot.key == key) return slot.index;
                 at = (at + 1) & mask;
@@ -1330,7 +1359,7 @@ struct Links {
         // pair i + 2*GAP, number the IDs of pair i + GAP and request their
         // nodes, join pair i.
         const size_t GAP = 12, total = pairs.size();
-        std::vector<std::pair<u32, u32>> numbered(total);
+        std::pair<u32, u32>* numbered = big_alloc<std::pair<u32, u32>>(total + 1);
         for (size_t i = 0; i < total + GAP; i++) {
             if (i + GAP < total) {
                 __builtin_prefetch(&table[hash64(pairs[i + GAP].first) >> top], 1);
@@ -1350,13 +1379,14 @@ struct Links {
                 nodes[b].parent = a;
             }
         }
-        std::vector<std::pair<u64, u64>> entries;
-        entries.reserve(nodes.size());
-        for (u32 i = 0; i < nodes.size(); i++) {
+        solved_at = now();
+        std::pair<u64, u64>* entries = big_alloc<std::pair<u64, u64>>(nnodes + 1);
+        size_t nentries = 0;
+        for (u32 i = 0; i < nnodes; i++) {
             u32 root = find(i);
-            if (root != i) entries.emplace_back(nodes[i].key, nodes[root].key);
+            if (root != i) entries[nentries++] = {nodes[i].key, nodes[root].key};
         }
-        out.build(entries);
+        out.build(entries, nentries);
     }
 };
 
@@ -1396,7 +1426,7 @@ struct Shared {
     struct Totals { std::vector<u32> sessions, assisted, purchasing; std::vector<i64> revenue; };
     std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
-    double links_seconds = 0;
+    double links_seconds = 0, links_parse = 0, links_union = 0;
 };
 
 static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& tasks) {
@@ -1434,6 +1464,7 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
 static void parse_links(Shared& sh, Reader& reader) {
     const double began = now();
     Links links;
+    links.pairs.reserve(1 << 16);
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
@@ -1449,9 +1480,13 @@ static void parse_links(Shared& sh, Reader& reader) {
             if (s0 == e0 || s1 == e1) return;
             links.add(pack_id(s0, size_t(e0 - s0), 'u'), pack_id(s1, size_t(e1 - s1), 'u'));
         });
+        release_chunk(sh.files[task.file], task);
     }
+    const double parsed = now();
     links.solve(sh.alias);
     sh.links_seconds = now() - began;
+    sh.links_parse = parsed - began;
+    sh.links_union = links.solved_at - parsed;
     sh.links_ready.store(true, std::memory_order_release);
 }
 
@@ -1588,6 +1623,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #endif
             lists.push(u32(hash64(rec.ekey) >> shift), rec);
         });
+        release_chunk(sh.files[task.file], task);
     }
     if (sink == 1) fprintf(stderr, "sink\n");
 }
@@ -1635,6 +1671,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             // the credited campaign nor the set of assisting campaigns: no dedup.
             resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
         });
+        release_chunk(sh.files[task.file], task);
     }
     resolver.finish();
 }
@@ -2561,6 +2598,7 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
+    g_release_input = !env("SS_RELEASE", "").empty();
 #ifdef __linux__
     if (!env("SS_PIN", "").empty()) {
         cpu_set_t allowed;
@@ -2671,8 +2709,8 @@ int main() {
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links %.3f\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_seconds);
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links parse %.3f union %.3f | links %.3f\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_parse, sh.links_union, sh.links_seconds);
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
