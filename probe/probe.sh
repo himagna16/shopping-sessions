@@ -1,50 +1,58 @@
 #!/bin/sh
-# Diagnostic run (never scored): compares build variants on the scoring
-# machine. Output stays under ~1,900 characters.
+# Diagnostic run (never scored): where the parse time goes, and the same
+# source under other compilers. Output stays under ~1,900 characters.
 exec 1>&2
 D="${DATA_DIR:-/data}"; S="${SCRATCH_DIR:-/scratch}"
 START=$(date +%s)
-elapsed() { echo $(( $(date +%s) - START )); }
-one() {   # one run -> "wall total parse dedup people parse_cpu links linkparse linkunion"
+one() {   # one run -> "wall total parse dedup people parse_cpu links user sys"
   data="$1"; bin="$2"; shift 2
   rm -rf "$S/out"; mkdir -p "$S/out"
   t0=$(date +%s%N)
   env SS_MMAP=2 "$@" DATA_DIR="$data" OUTPUT_DIR="$S/out" "$bin" 2> "$S/err"; rc=$?
   t1=$(date +%s%N)
-  awk -v w=$(( (t1 - t0) / 1000000 )) -v rc=$rc '/^threads/{printf "%d %d %d %d %d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000, $23*1000, $NF*1000, $(NF-5)*1000, $(NF-3)*1000} END{if (rc) printf " rc%d", rc}' "$S/err"
+  awk -v w=$(( (t1 - t0) / 1000000 )) -v rc=$rc '/^user/{u=$2*1000; s=$4*1000} /^threads/{printf "%d %d %d %d %d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000, $23*1000, $NF*1000, u, s} END{if (rc) printf " rc%d", rc}' "$S/err"
 }
 r() {     # best of 3 by wall
   label="$1"; shift
   best=""; bw=999999
   for i in 1 2 3; do
     line=$(one "$@"); w=${line%% *}
-    if [ "$w" -lt "$bw" ]; then bw=$w; best="$line"; fi
+    if [ -n "$w" ] && [ "$w" -lt "$bw" ]; then bw=$w; best="$line"; fi
   done
   echo "$label $best"
 }
-w3() {    # three runs, wall/total each: shows what happens outside the timed phases
+p() {     # parse only: best of 3 by parse cpu -> "parse parse_cpu user sys"
   label="$1"; shift
-  out="$label"
-  for i in 1 2 3; do line=$(one "$@"); out="$out $(echo "$line" | awk '{print $1"/"$2}')"; done
-  echo "$out"
+  best=""; bc=999999
+  for i in 1 2 3; do
+    line=$(one "$@"); c=$(echo "$line" | awk '{print $6}')
+    if [ -n "$c" ] && [ "$c" -lt "$bc" ]; then bc=$c; best=$(echo "$line" | awk '{print $3, $6, $8, $9}'); fi
+  done
+  echo "$label $best"
 }
-/expand "$D" "$S/b" 20
+/expand "$D" "$S/b" "${PROBE_A:-20}"
 B="$S/b"
-r new "$B" /p
-r people1 "$B" /pp1
-r scan4 "$B" /ps4
-r nohugetab "$B" /p SS_NOHUGE=1
-r release "$B" /p SS_RELEASE=1
-r scan4 "$B" /ps4
-r new "$B" /p
-w3 20new "$B" /p
-w3 20rel+zap "$B" /p SS_RELEASE=1 SS_ZAP=1
-rm -rf "$S/b"; /expand "$D" "$S/c" 60; B="$S/c"
-r 60new "$B" /p
-r 60scan4 "$B" /ps4
-w3 60new "$B" /p
-w3 60rel "$B" /p SS_RELEASE=1
-w3 60zap "$B" /p SS_ZAP=1
-w3 60rel+zap "$B" /p SS_RELEASE=1 SS_ZAP=1
-echo "t=$(elapsed)s"
+CL=/pcl
+if [ "$(wc -c < /pcl)" -lt 1000 ]; then echo "clang missing"; CL=/p; fi
+r def "$B" /p
+grep -E '^user' "$S/err" | cut -c1-70
+r g15 "$B" /p15
+r clang "$B" "$CL"
+r def "$B" /p
+r g15 "$B" /p15
+r clang "$B" "$CL"
+p scan "$B" /pl2
+p fields "$B" /pl3
+p ekey "$B" /pl4
+p times "$B" /pl5
+p rest "$B" /pl7
+p noclicks "$B" /pnc
+p full "$B" /p
+r t8c1m "$B" /p SS_CHUNK=1048576
+rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
+r 60def "$B" /p
+grep -E '^user' "$S/err" | cut -c1-70
+r 60g15 "$B" /p15
+r 60clang "$B" "$CL"
+echo "t=$(( $(date +%s) - START ))s"
 exit 1
