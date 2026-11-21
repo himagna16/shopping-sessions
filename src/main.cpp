@@ -57,6 +57,11 @@
 #if !defined(SS_ING1) && !defined(SS_ING2)
 #define SS_ING2
 #endif
+#ifdef SS_NOFORCEINLINE
+#define SS_INLINE
+#else
+#define SS_INLINE __attribute__((always_inline))
+#endif
 #ifndef SS_X
 #define SS_X 0            // measurement builds only: skip one step (see probe branch)
 #endif
@@ -101,11 +106,21 @@ static inline u64 rd64(const u8* p) { u64 v; memcpy(&v, p, 8); return v; }
 static inline u32 rd32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
 static inline u16 rd16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
 
-static inline u64 mix64(u64 x) {
+[[maybe_unused]] static inline u64 mix64(u64 x) {
     x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
     x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
     x ^= x >> 33;
     return x;
+}
+
+// The hash used for every table and bucket choice: one multiply. Only its high
+// bits are well mixed, so indexes are always taken from the top down.
+static inline u64 hash64(u64 x) {
+#ifdef SS_MIXHASH
+    return mix64(x);
+#else
+    return x * 0x9E3779B97F4A7C15ULL;
+#endif
 }
 
 static inline i64 floor_div(i64 a, i64 b) { i64 q = a / b; return q - ((a % b != 0) && ((a < 0) != (b < 0))); }
@@ -436,7 +451,7 @@ static inline u64 pdep64(u64 value, u64 mask) {
 // together. Those conditions are bit tests on the block; any line they flag is
 // re-examined byte by byte, so the result is exact.
 template <int NF, class Row>
-static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
+static inline SS_INLINE void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
     if (start >= stop) return;
     enum { BLOCKS = 16, CAP = BLOCKS * 64 + NF + 48 };
     // Entry 0 always describes the delimiter just before the unfinished line.
@@ -457,6 +472,9 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t la
     for (;;) {
         u32 newlines = 0;
         for (u32 done = 0; done < BLOCKS && block <= last; done++, block += 64) {
+#ifndef SS_NOSCANPF
+            __builtin_prefetch(buf + block + 1024);
+#endif
             const Masks next = block + 64 <= last ? classify(buf + block + 64) : none;
             const u64 Q = cur.quote, D = cur.comma | cur.nl;
             const u64 next_delim = (next.comma | next.nl) & 1, next_quote = next.quote & 1;
@@ -567,7 +585,7 @@ static inline u32 tz64(u64 x) {
 // more only when a block holds more), and each newline notes how many
 // delimiters and quotes came before it; then the rows are walked from that.
 template <int NF, class Row>
-static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
+static inline SS_INLINE void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
     if (start >= stop) return;
     static const u32 BLOCKS = 16;
     u32 pos[BLOCKS * 64 + NF + 32];
@@ -792,6 +810,7 @@ struct Scatter {
     u8* fill = nullptr;
     T** cur = nullptr;
     Block** head = nullptr;
+    u32* nblocks = nullptr;                 // blocks handed to each bucket
     BlockAlloc* alloc = nullptr;
 
     static T* items(Block* b) { return (T*)((u8*)b + HDR); }
@@ -803,7 +822,8 @@ struct Scatter {
         fill = (u8*)calloc(n, 1);
         cur = (T**)calloc(n, sizeof(T*));
         head = (Block**)calloc(n, sizeof(Block*));
-        if (!fill || !cur || !head) die("out of memory for scatter state");
+        nblocks = (u32*)calloc(n, sizeof(u32));
+        if (!fill || !cur || !head || !nblocks) die("out of memory for scatter state");
     }
     inline void push(u32 b, const T& v) {
         T* unit = (T*)(stage + size_t(b) * UNIT);
@@ -816,6 +836,7 @@ struct Scatter {
         Block* fresh = (Block*)alloc->get();
         fresh->next = nullptr;
         fresh->n = CAP;
+        nblocks[b]++;
         if (c) ((Block*)((uintptr_t(c) - 1) & ~(uintptr_t(BLOCK) - 1)))->next = fresh;
         else head[b] = fresh;
         return items(fresh);
@@ -1082,11 +1103,11 @@ struct AliasMap {
         const size_t AHEAD = 32;
         for (size_t i = 0; i < entries.size(); i++) {
             if (i + AHEAD < entries.size()) {
-                u64 ahead = mix64(entries[i + AHEAD].first);
+                u64 ahead = hash64(entries[i + AHEAD].first);
                 __builtin_prefetch(&slots[ahead >> shift], 1);
                 __builtin_prefetch(&filter[(ahead >> filter_shift) >> 6], 1);
             }
-            u64 h = mix64(entries[i].first);
+            u64 h = hash64(entries[i].first);
             u64 at = h >> shift;
             while (slots[at].key) at = (at + 1) & mask;
             slots[at] = {entries[i].first, entries[i].second};
@@ -1110,10 +1131,10 @@ struct AliasMap {
             at = (at + 1) & mask;
         }
     }
-    inline u64 home(u64 key) const { return mix64(key) >> shift; }
+    inline u64 home(u64 key) const { return hash64(key) >> shift; }
     inline void prefetch(u64 key) const { __builtin_prefetch(&slots[home(key)]); }
     inline u64 person(u64 key) const {
-        u64 hash = mix64(key);
+        u64 hash = hash64(key);
         return maybe(hash) ? person_hashed(key, hash) : key;
     }
 };
@@ -1126,7 +1147,7 @@ template <class T, class Emit>
 struct Resolver {
     static const u32 DIST = 16, SIZE = 64;          // SIZE is a power of two above DIST
     const AliasMap& alias;
-    Emit emit;                                       // emit(person, mix64(person), item)
+    Emit emit;                                       // emit(person, hash64(person), item)
     T a_item[SIZE]; u64 a_hash[SIZE]; u64 a_key[SIZE];
     T b_item[SIZE]; u64 b_hash[SIZE]; u64 b_key[SIZE];
     u32 a_in = 0, a_out = 0, b_in = 0, b_out = 0;
@@ -1135,7 +1156,7 @@ struct Resolver {
     inline void step_b() {
         u32 i = b_out++ & (SIZE - 1);
         const u64 person = alias.person_hashed(b_key[i], b_hash[i]);
-        emit(person, person == b_key[i] ? b_hash[i] : mix64(person), b_item[i]);
+        emit(person, person == b_key[i] ? b_hash[i] : hash64(person), b_item[i]);
     }
     inline void step_a() {
         u32 i = a_out++ & (SIZE - 1);
@@ -1146,7 +1167,7 @@ struct Resolver {
         if (b_in - b_out > DIST) step_b();
     }
     inline void push(u64 key, const T& item) {
-        const u64 hash = mix64(key);
+        const u64 hash = hash64(key);
         alias.prefetch_filter(hash);
         u32 i = a_in++ & (SIZE - 1);
         a_item[i] = item; a_hash[i] = hash; a_key[i] = key;
@@ -1167,20 +1188,19 @@ struct Links {
         size_t cap = 16;
         while (cap < pairs.size() * 4) cap <<= 1;
         struct Slot { u64 key; u32 index; u32 used; };
-        std::vector<Slot> table(cap);              // zero-initialised: used == 0 means empty
-        std::vector<u64> ids;
-        std::vector<u32> parent;
-        ids.reserve(pairs.size() * 2);
-        parent.reserve(pairs.size() * 2);
+        struct Node { u64 key; u32 parent; u32 pad; };      // an ID and its union-find parent, on one cache line
+        std::vector<Slot> table(cap);                       // zero-initialised: used == 0 means empty
+        std::vector<Node> nodes;
+        nodes.reserve(pairs.size() * 2);
         const u64 mask = cap - 1;
+        const int top = 64 - __builtin_ctzll(cap);
         auto index_of = [&](u64 key) -> u32 {
-            u64 at = mix64(key) & mask;
+            u64 at = hash64(key) >> top;
             for (;;) {
                 Slot& slot = table[at];
                 if (!slot.used) {
-                    slot = {key, u32(ids.size()), 1};
-                    ids.push_back(key);
-                    parent.push_back(slot.index);
+                    slot = {key, u32(nodes.size()), 1};
+                    nodes.push_back({key, slot.index, 0});
                     return slot.index;
                 }
                 if (slot.key == key) return slot.index;
@@ -1188,26 +1208,39 @@ struct Links {
             }
         };
         auto find = [&](u32 x) -> u32 {
-            while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+            while (nodes[x].parent != x) { nodes[x].parent = nodes[nodes[x].parent].parent; x = nodes[x].parent; }
             return x;
         };
-        const size_t AHEAD = 16;
-        for (size_t i = 0; i < pairs.size(); i++) {
-            if (i + AHEAD < pairs.size()) {
-                __builtin_prefetch(&table[mix64(pairs[i + AHEAD].first) & mask], 1);
-                __builtin_prefetch(&table[mix64(pairs[i + AHEAD].second) & mask], 1);
+        // Three steps a fixed distance apart, so the table slots and the nodes
+        // are already on their way when they are needed: request the slots of
+        // pair i + 2*GAP, number the IDs of pair i + GAP and request their
+        // nodes, join pair i.
+        const size_t GAP = 12, total = pairs.size();
+        std::vector<std::pair<u32, u32>> numbered(total);
+        for (size_t i = 0; i < total + GAP; i++) {
+            if (i + GAP < total) {
+                __builtin_prefetch(&table[hash64(pairs[i + GAP].first) >> top], 1);
+                __builtin_prefetch(&table[hash64(pairs[i + GAP].second) >> top], 1);
             }
-            u32 a = find(index_of(pairs[i].first)), b = find(index_of(pairs[i].second));
-            if (a == b) continue;
-            // The root is always the byte-wise smallest ID, so it is the person's name.
-            if (id_less(ids[b], ids[a], 'u')) std::swap(a, b);
-            parent[b] = a;
+            if (i < total) {
+                const u32 a = index_of(pairs[i].first), b = index_of(pairs[i].second);
+                numbered[i] = {a, b};
+                __builtin_prefetch(&nodes[a], 1);
+                __builtin_prefetch(&nodes[b], 1);
+            }
+            if (i >= GAP) {
+                u32 a = find(numbered[i - GAP].first), b = find(numbered[i - GAP].second);
+                if (a == b) continue;
+                // The root is always the byte-wise smallest ID, so it is the person's name.
+                if (id_less(nodes[b].key, nodes[a].key, 'u')) std::swap(a, b);
+                nodes[b].parent = a;
+            }
         }
         std::vector<std::pair<u64, u64>> entries;
-        entries.reserve(ids.size());
-        for (u32 i = 0; i < ids.size(); i++) {
+        entries.reserve(nodes.size());
+        for (u32 i = 0; i < nodes.size(); i++) {
             u32 root = find(i);
-            if (root != i) entries.emplace_back(ids[i], ids[root]);
+            if (root != i) entries.emplace_back(nodes[i].key, nodes[root].key);
         }
         out.build(entries);
     }
@@ -1291,7 +1324,7 @@ static void parse_links(Shared& sh, Reader& reader) {
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
-        scan_rows<2>(buf, start, stop, last, [&](ROW_PARAMS) {
+        scan_rows<2>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #ifdef SS_SCAN3
             FIELD(0) FIELD(1)
 #else
@@ -1327,7 +1360,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
-        scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) {
+        scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #ifdef SS_SCAN3
 #if SS_LVL == 2
             sink += fs[0] + fe[6]; return;
@@ -1440,7 +1473,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #if SS_PROBE == 3 || SS_LVL == 7
             sink += rec.ekey + rec.ukey + rec.ts + rec.payload + u64(rec.ingest); return;
 #endif
-            lists.push(u32(mix64(rec.ekey) >> shift), rec);
+            lists.push(u32(hash64(rec.ekey) >> shift), rec);
         });
     }
     if (sink == 1) fprintf(stderr, "sink\n");
@@ -1468,7 +1501,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
-        scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) {
+        scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #ifdef SS_SCAN3
             FIELD(0) FIELD(1) FIELD(2) FIELD(3)
 #else
@@ -1496,6 +1529,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
 // ---------------------------------------------------------------- phase 2: dedup
 static void dedup_buckets(Shared& sh, u32 tid) {
     const u32 nbuckets = 1u << sh.abits;
+    const u32 abits = sh.abits;
     const int shift = 64 - int(sh.bbits);
     const AliasMap& alias = sh.alias;
     Scatter<RecB>& out = sh.b[tid];
@@ -1527,13 +1561,14 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             while (cap * 2 < total * 3) cap <<= 1;
             small.assign(cap, 0);
             const u64 mask = cap - 1;
+            const int index_shift = 64 - __builtin_ctzll(cap), tag_shift = int(abits) + __builtin_ctzll(cap);
             for (u32 bi = 0; bi < blocks.size(); bi++) {
                 RecA* recs = Scatter<RecA>::items(blocks[bi]);
                 for (u32 i = 0; i < blocks[bi]->n; i++) {
                     RecA& rec = recs[i];
-                    const u64 m = mix64(rec.ekey);
-                    const u32 mine = (u32(m >> 20) << 16) | ((bi << 8 | i) + 1);
-                    u64 at = m & mask;
+                    const u64 m = hash64(rec.ekey);
+                    const u32 mine = (u32((m << tag_shift) >> 48) << 16) | ((bi << 8 | i) + 1);
+                    u64 at = (m << abits) >> index_shift;
                     for (;;) {
                         u32 slot = small[at];
                         if (!slot) { small[at] = mine; break; }
@@ -1558,13 +1593,14 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             while (cap < total * 2) cap <<= 1;
             table.assign(cap, 0);
             const u64 mask = cap - 1;
+            const int index_shift = 64 - __builtin_ctzll(cap), tag_shift = int(abits) + __builtin_ctzll(cap);
             for (u32 bi = 0; bi < blocks.size(); bi++) {
                 RecA* recs = Scatter<RecA>::items(blocks[bi]);
                 for (u32 i = 0; i < blocks[bi]->n; i++) {
                     RecA& rec = recs[i];
-                    const u64 m = mix64(rec.ekey);
-                    const u64 mine = (m >> 20 << 32) | ((bi << 8 | i) + 1);
-                    u64 at = m & mask;
+                    const u64 m = hash64(rec.ekey);
+                    const u64 mine = ((m << tag_shift) >> 32 << 32) | ((bi << 8 | i) + 1);
+                    u64 at = (m << abits) >> index_shift;
                     for (;;) {
                         u64 slot = table[at];
                         if (!slot) { table[at] = mine; break; }
@@ -1594,7 +1630,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
 #if SS_X == 4
-                out.push(u32(mix64(recs[i].ukey) >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
+                out.push(u32(hash64(recs[i].ukey) >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
 #else
                 resolver.push(recs[i].ukey, Survivor{recs[i].ts, recs[i].payload});
 #endif
@@ -1690,6 +1726,7 @@ static void process_people(Shared& sh, u32 tid) {
     const u32 ndays = sh.ndays;
     const i64 ws = sh.ws, day0 = sh.day0;
     const u32 ncat = u32(sh.cat.categories.size());
+    const u32 bbits = sh.bbits;
     Shared::Totals& totals = sh.campaign_totals[tid];
     totals.credit.assign(size_t(ncamp + 1) * ndays, Shared::Credit{0, 0, 0});
     totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
@@ -1726,11 +1763,12 @@ static void process_people(Shared& sh, u32 tid) {
         while (cap < nev) cap <<= 1;
         cell_table.assign(cap, 0);
         u64 mask = cap - 1;
+        int cell_shift = 64 - __builtin_ctzll(cap);
         cells.clear();
         purchases.clear();
         purchases.push_back({0, 0});                              // index 0 means "none"
         auto cell_home = [&](u64 person, u32 bin) -> u64 {
-            return ((mix64(person) ^ (u64(bin) * 0x9E3779B97F4A7C15ULL)) >> 24) & mask;
+            return (((hash64(person) << bbits) >> cell_shift) ^ (u64(bin) * 0x9E3779B1ULL)) & mask;
         };
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = sh.b[t].head[bucket]; b; b = b->next) {
@@ -1747,6 +1785,7 @@ static void process_people(Shared& sh, u32 tid) {
                             if ((cells.size() + 1) * 2 > cap) {            // keep the table at most half full
                                 cap <<= 1;
                                 mask = cap - 1;
+                                cell_shift--;
                                 cell_table.assign(cap, 0);
                                 for (u32 k = 0; k < cells.size(); k++) {
                                     u64 h = cell_home(cells[k].person, cells[k].bin);
@@ -1784,13 +1823,14 @@ static void process_people(Shared& sh, u32 tid) {
         size_t pcap = 64;
         while (pcap < size_t(ncells) * 2) pcap <<= 1;
         const u64 pmask = pcap - 1;
+        const int person_shift = 64 - __builtin_ctzll(pcap);
         person_table.assign(pcap, 0);
         persons.clear();
         person_cells.clear();
         cell_person.resize(ncells);
         for (u32 k = 0; k < ncells; k++) {
             const u64 person = cells[k].person;
-            u64 at = mix64(person) & pmask;
+            u64 at = (hash64(person) << bbits) >> person_shift;
             u32 id;
             for (;;) {
                 u32 slot = person_table[at];
@@ -1816,7 +1856,7 @@ static void process_people(Shared& sh, u32 tid) {
 
         // 3. Clicks of people who have events, grouped the same way.
         auto lookup = [&](u64 person) -> i64 {
-            u64 at = mix64(person) & pmask;
+            u64 at = (hash64(person) << bbits) >> person_shift;
             for (;;) {
                 u32 slot = person_table[at];
                 if (!slot) return -1;
@@ -2190,7 +2230,7 @@ int main() {
         std::vector<u64> size(nb, 0);
         for (u32 t = 0; t < T; t++)
             for (u32 k = 0; k < nb; k++)
-                for (Block* b = sh.b[t].head[k]; b; b = b->next) size[k] += b->n;
+                size[k] += sh.b[t].nblocks[k];
         sh.person_order.resize(nb);
         for (u32 k = 0; k < nb; k++) sh.person_order[k] = k;
         std::sort(sh.person_order.begin(), sh.person_order.end(), [&](u32 x, u32 y) { return size[x] > size[y]; });
