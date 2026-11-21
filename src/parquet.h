@@ -77,7 +77,7 @@ struct File {
     static void fail(const char* what) { perror(what); _exit(4); }
 
     void write_all(const struct iovec* iov_in, int count) {
-        struct iovec iov[8];
+        struct iovec iov[40];
         memcpy(iov, iov_in, sizeof(struct iovec) * count);
         int at = 0;
         while (at < count) {
@@ -97,16 +97,23 @@ struct File {
         write_all(&iov, 1);
     }
 
-    // parts[i] holds column i's bytes for `n` rows.
+    // parts[i] holds column i's bytes for `n` rows. The whole row group goes out in one write.
     void row_group(uint64_t n, const Part* parts) {
+        enum { MAX_COLS = 8 };
+        if (cols.size() > MAX_COLS) fail("too many columns");
         Group group;
         group.rows = n;
         group.bytes = 0;
+        Thrift headers[MAX_COLS];
+        uint32_t level_len[MAX_COLS];
+        struct iovec iov[MAX_COLS * 4];
+        int k = 0;
+        uint64_t at = pos;
         for (size_t c = 0; c < cols.size(); c++) {
             const Part& part = parts[c];
-            uint32_t level_len = uint32_t(part.levels_len);
+            level_len[c] = uint32_t(part.levels_len);
             size_t body = part.values_len + (cols[c].optional ? 4 + part.levels_len : 0);
-            Thrift h;
+            Thrift& h = headers[c];
             h.i32(1, 0);                       // DATA_PAGE
             h.i32(2, int32_t(body));           // uncompressed size
             h.i32(3, int32_t(body));           // compressed size
@@ -117,19 +124,18 @@ struct File {
             h.i32(4, 3);                       // repetition levels: RLE
             h.end_struct();
             h.b.push_back(0);
-            Chunk chunk{pos, h.b.size() + body, n};
-            struct iovec iov[4];
-            int k = 0;
+            Chunk chunk{at, h.b.size() + body, n};
             iov[k++] = {h.b.data(), h.b.size()};
             if (cols[c].optional) {
-                iov[k++] = {&level_len, 4};
+                iov[k++] = {&level_len[c], 4};
                 if (part.levels_len) iov[k++] = {(void*)part.levels, part.levels_len};
             }
             if (part.values_len) iov[k++] = {(void*)part.values, part.values_len};
-            write_all(iov, k);
+            at += chunk.size;
             group.bytes += chunk.size;
             group.chunks.push_back(chunk);
         }
+        write_all(iov, k);
         rows += n;
         groups.push_back(std::move(group));
     }
