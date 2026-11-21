@@ -913,8 +913,9 @@ struct Shared {
     std::vector<Scatter<RecC>> c;
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
-    // per thread: [(campaign * ndays + day) * 4 + {sessions, purchasing, revenue, assisted}]
-    std::vector<std::vector<i64>> campaign_totals;
+    // per thread, indexed campaign * ndays + day
+    struct Totals { std::vector<u32> sessions, purchasing, assisted; std::vector<i64> revenue; };
+    std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
 };
 
@@ -1085,7 +1086,8 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     const AliasMap& alias = sh.alias;
     Scatter<RecB>& out = sh.b[tid];
     std::vector<Block*> blocks;
-    std::vector<u64> table;                 // (hash tag << 32) | (block << 8 | index) + 1
+    std::vector<u64> table;                 // wide slots: (hash tag << 32) | reference
+    std::vector<u32> small;                 // narrow slots: (hash tag << 16) | reference
     static const u32 BATCH = 64;
     RecA* pending[BATCH];
     u64 pending_hash[BATCH];
@@ -1097,31 +1099,63 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         for (u32 t = 0; t < sh.cfg.threads; t++)
             for (Block* b = sh.a[t].head[bucket]; b; b = b->next) { blocks.push_back(b); total += b->n; }
         if (!total) continue;
-        size_t cap = 16;
-        while (cap < total * 2) cap <<= 1;
-        table.assign(cap, 0);
-        const u64 mask = cap - 1;
         // Smallest ingest_ts wins; equal ingest_ts means identical copies.
-        for (u32 bi = 0; bi < blocks.size(); bi++) {
-            RecA* recs = Scatter<RecA>::items(blocks[bi]);
-            for (u32 i = 0; i < blocks[bi]->n; i++) {
-                RecA& rec = recs[i];
-                const u64 m = mix64(rec.ekey);
-                const u64 mine = (m >> 20 << 32) | ((bi << 8 | i) + 1);
-                u64 at = m & mask;
-                for (;;) {
-                    u64 slot = table[at];
-                    if (!slot) { table[at] = mine; break; }
-                    if ((slot ^ mine) >> 32 == 0) {
-                        u32 ref = u32(slot) - 1;
-                        RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
-                        if (best.ekey == rec.ekey) {
-                            if (rec.ingest < best.ingest) { best.ts = DEAD; table[at] = mine; }
-                            else rec.ts = DEAD;
-                            break;
+        // A slot is a hash tag plus (block << 8 | index) + 1. With at most 256
+        // blocks the reference fits 16 bits and the whole slot 4 bytes.
+        if (blocks.size() <= 256) {
+            size_t cap = 16;
+            while (cap * 2 < total * 3) cap <<= 1;
+            small.assign(cap, 0);
+            const u64 mask = cap - 1;
+            for (u32 bi = 0; bi < blocks.size(); bi++) {
+                RecA* recs = Scatter<RecA>::items(blocks[bi]);
+                for (u32 i = 0; i < blocks[bi]->n; i++) {
+                    RecA& rec = recs[i];
+                    const u64 m = mix64(rec.ekey);
+                    const u32 mine = (u32(m >> 20) << 16) | ((bi << 8 | i) + 1);
+                    u64 at = m & mask;
+                    for (;;) {
+                        u32 slot = small[at];
+                        if (!slot) { small[at] = mine; break; }
+                        if ((slot ^ mine) >> 16 == 0) {
+                            u32 ref = (slot & 0xFFFF) - 1;
+                            RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
+                            if (best.ekey == rec.ekey) {
+                                if (rec.ingest < best.ingest) { best.ts = DEAD; small[at] = mine; }
+                                else rec.ts = DEAD;
+                                break;
+                            }
                         }
+                        at = (at + 1) & mask;
                     }
-                    at = (at + 1) & mask;
+                }
+            }
+        } else {
+            size_t cap = 16;
+            while (cap < total * 2) cap <<= 1;
+            table.assign(cap, 0);
+            const u64 mask = cap - 1;
+            for (u32 bi = 0; bi < blocks.size(); bi++) {
+                RecA* recs = Scatter<RecA>::items(blocks[bi]);
+                for (u32 i = 0; i < blocks[bi]->n; i++) {
+                    RecA& rec = recs[i];
+                    const u64 m = mix64(rec.ekey);
+                    const u64 mine = (m >> 20 << 32) | ((bi << 8 | i) + 1);
+                    u64 at = m & mask;
+                    for (;;) {
+                        u64 slot = table[at];
+                        if (!slot) { table[at] = mine; break; }
+                        if ((slot ^ mine) >> 32 == 0) {
+                            u32 ref = u32(slot) - 1;
+                            RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
+                            if (best.ekey == rec.ekey) {
+                                if (rec.ingest < best.ingest) { best.ts = DEAD; table[at] = mine; }
+                                else rec.ts = DEAD;
+                                break;
+                            }
+                        }
+                        at = (at + 1) & mask;
+                    }
                 }
             }
         }
@@ -1240,8 +1274,11 @@ static void process_people(Shared& sh, u32 tid) {
     const u32 ndays = sh.ndays;
     const i64 ws = sh.ws, day0 = sh.day0;
     const u32 ncat = u32(sh.cat.categories.size());
-    std::vector<i64>& totals = sh.campaign_totals[tid];
-    totals.assign(size_t(ncamp + 1) * ndays * 4, 0);
+    Shared::Totals& totals = sh.campaign_totals[tid];
+    totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.revenue.assign(size_t(ncamp + 1) * ndays, 0);
 
     UserWriter writer;
     char name[64];
@@ -1252,6 +1289,8 @@ static void process_people(Shared& sh, u32 tid) {
     std::vector<Cell> cells;
     std::vector<Purchase> purchases;
     std::vector<u64> persons;
+    struct Found { u32 person; Click click; };
+    std::vector<Found> found;
     std::vector<Click> clicks;
     std::vector<i64> cat_cents(ncat, 0);
     std::vector<u32> cat_touched;
@@ -1369,27 +1408,24 @@ static void process_people(Shared& sh, u32 tid) {
             }
         };
         click_start.assign(npeople + 1, 0);
-        size_t nclicks = 0;
+        found.clear();
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
                 const RecC* recs = Scatter<RecC>::items(b);
                 for (u32 i = 0; i < b->n; i++) {
                     i64 id = lookup(recs[i].person);
-                    if (id >= 0) { click_start[size_t(id)]++; nclicks++; }
+                    if (id >= 0) {
+                        click_start[size_t(id)]++;
+                        found.push_back({u32(id), {recs[i].ts, recs[i].camp, recs[i].ckey}});
+                    }
                 }
             }
+        const size_t nclicks = found.size();
         if (nclicks) {
             for (u32 p = 0, sum = 0; p <= npeople; p++) { u32 n = click_start[p]; click_start[p] = sum; sum += n; }
             cursor.assign(click_start.begin(), click_start.end() - 1);
             clicks.resize(nclicks);
-            for (u32 t = 0; t < nthreads; t++)
-                for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
-                    const RecC* recs = Scatter<RecC>::items(b);
-                    for (u32 i = 0; i < b->n; i++) {
-                        i64 id = lookup(recs[i].person);
-                        if (id >= 0) clicks[cursor[size_t(id)]++] = {recs[i].ts, recs[i].camp, recs[i].ckey};
-                    }
-                }
+            for (const Found& f : found) clicks[cursor[f.person]++] = f.click;
         }
 
         // 4. Each person: sessions, click credit and assists, daily rows.
@@ -1512,12 +1548,12 @@ static void process_people(Shared& sh, u32 tid) {
                         }
                     }
                     if (right > left) credited = ck[right - 1].camp;
-                    for (u32 c : active) totals[(size_t(c) * ndays + size_t(day)) * 4 + 3]++;
+                    for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
                 }
-                i64* cell_total = &totals[(size_t(credited) * ndays + size_t(day)) * 4];
-                cell_total[0]++;
-                cell_total[1] += cents > 0;
-                cell_total[2] += cents;
+                const size_t slot = size_t(credited) * ndays + size_t(day);
+                totals.sessions[slot]++;
+                totals.purchasing[slot] += cents > 0;
+                totals.revenue[slot] += cents;
             }
             if (cur_day >= 0) emit();
             for (u32 c : active) camp_count[c] = 0;
@@ -1569,7 +1605,12 @@ static void write_campaigns(Shared& sh) {
     const u32 ndays = sh.ndays;
     std::vector<i64> total(size_t(ncamp + 1) * ndays * 4, 0);
     for (auto& part : sh.campaign_totals)
-        for (size_t i = 0; i < part.size(); i++) total[i] += part[i];
+        for (size_t i = 0; i < part.sessions.size(); i++) {
+            total[i * 4] += part.sessions[i];
+            total[i * 4 + 1] += part.purchasing[i];
+            total[i * 4 + 2] += part.revenue[i];
+            total[i * 4 + 3] += part.assisted[i];
+        }
     std::vector<u8> ids, channels;
     std::vector<i32> days;
     std::vector<i64> sessions, purchasing, revenue, assisted;
