@@ -55,6 +55,9 @@ r g15 "$B" /p15
 r id2 "$B" /pid2
 st steps "$B" /p
 st nowalk "$B" /pnw
+st assist1 "$B" /pa1
+st steps "$B" /p
+st assist1 "$B" /pa1
 st d8 "$B" /pd8
 st d32 "$B" /pd32
 st d64 "$B" /pd64
