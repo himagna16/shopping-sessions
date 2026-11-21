@@ -62,11 +62,27 @@
 #else
 #define SS_INLINE __attribute__((always_inline))
 #endif
+// The per-row helpers (ID packing, timestamps). Left to itself GCC keeps them
+// as separate functions, called several times for every row.
+#ifdef SS_NOHOTINLINE
+#define SS_HOT
+#else
+#define SS_HOT __attribute__((always_inline))
+#endif
+// The per-session and per-row steps of the people phase, likewise.
+#ifdef SS_NOWALKINLINE
+#define SS_WALK
+#else
+#define SS_WALK __attribute__((always_inline))
+#endif
 #ifndef SS_X
 #define SS_X 0            // measurement builds only: skip one step (see probe branch)
 #endif
 #ifndef SS_LVL
 #define SS_LVL 0          // measurement builds only: stop the event row handler after step N
+#endif
+#ifndef SS_CLVL
+#define SS_CLVL 0         // measurement builds only: stop the click row handler after step N
 #endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
@@ -146,7 +162,7 @@ static u64 intern_id(const u8* p, size_t n) {
     return key;
 }
 
-[[maybe_unused]] static inline u64 compact7(u64 x) {
+[[maybe_unused]] static inline SS_HOT u64 compact7(u64 x) {
 #if defined(__BMI2__)
     return _pext_u64(x, 0x7F7F7F7F7F7F7F7FULL);
 #else
@@ -194,7 +210,7 @@ static inline bool id_less(u64 a, u64 b, u8 prefix) {
     return id_less_slow(a, b, prefix);
 }
 #else
-static inline u64 pack_id(const u8* p, size_t n, u8) {
+static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8) {
 #ifdef SS_FORCE_SLOW
     return intern_id(p, n);
 #endif
@@ -296,7 +312,7 @@ static inline i64 parse_tod(const u8* p) {
 }
 
 // `HH:MM:SS` at p -> a code that orders times of day (under 2^24), or -1.
-[[maybe_unused]] static inline i64 tod_code(const u8* p) {
+[[maybe_unused]] static inline SS_HOT i64 tod_code(const u8* p) {
 #if defined(__BMI2__)
     const u64 raw = rd64(p);
     const u64 x = raw ^ 0x30303A30303A3030ULL;
@@ -319,7 +335,7 @@ static inline i64 parse_f1(const u8* p, DateCache& cache) {
     return date + tod;
 }
 
-static inline bool parse8(const u8* p, u64& out) {
+static inline SS_HOT bool parse8(const u8* p, u64& out) {
     u64 v = rd64(p);
     u64 x = v ^ 0x3030303030303030ULL;
     if (((x + 0x7676767676767676ULL) | x) & 0x8080808080808080ULL) return false;
@@ -395,7 +411,7 @@ static DateTable g_dates;
 
 // `HH:MM:SS` at p -> seconds since midnight, or -1. One add checks every digit,
 // both colons and the tens ranges; one multiply forms the three numbers.
-static inline i32 tod_seconds(const u8* p) {
+static inline SS_HOT i32 tod_seconds(const u8* p) {
     const u64 w = rd64(p) ^ 0x30303A30303A3030ULL;
     if (((w + 0x060A0F060A0F060DULL) | w) & 0xF0F0F0F0F0F0F0F0ULL) return -1;
     const u64 t = w * 2561;
@@ -405,7 +421,7 @@ static inline i32 tod_seconds(const u8* p) {
 }
 
 // Any `ts`: F1, F2 or F3 -> epoch ms, or TS_BAD. p readable for n + 8 bytes.
-static inline i64 parse_ts(const u8* p, size_t n, DateCache& cache) {
+static inline SS_HOT i64 parse_ts(const u8* p, size_t n, DateCache& cache) {
 #ifndef SS_FORCE_SLOW
     if (n == 20) {
         if (p[19] == 'Z') {
@@ -1476,7 +1492,10 @@ struct AliasMap {
 // after that. Both memory accesses are thus under way long before they are needed.
 template <class T, class Emit>
 struct Resolver {
-    static const u32 DIST = 16, SIZE = 64;          // SIZE is a power of two above DIST
+#ifndef SS_DIST
+#define SS_DIST 16
+#endif
+    static const u32 DIST = SS_DIST, SIZE = SS_DIST < 48 ? 64 : 256;    // SIZE is a power of two above DIST
     const AliasMap& alias;
     Emit emit;                                       // emit(person, hash64(person), item)
     T a_item[SIZE]; u64 a_hash[SIZE]; u64 a_key[SIZE];
@@ -1861,6 +1880,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         lists.push(u32(hash >> shift), RecC{person, click.ckey, click.ts, click.camp});
     };
     Resolver<Pending, decltype(emit)> resolver(alias, emit);
+    [[maybe_unused]] u64 sink = 0;
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
@@ -1869,6 +1889,9 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
         scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #if defined(SS_SCAN4)
+#if SS_CLVL == 2
+            sink += a[0] + a[3] + nlpos; return;
+#endif
             QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3)
             FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD_LAST(3)
 #elif defined(SS_SCAN3)
@@ -1885,8 +1908,19 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             if (s0 == e0 || s1 == e1) return;
             i64 ts = parse_ts(s3, size_t(e3 - s3), dates);
             if (ts == TS_BAD || ts < lo || ts >= hi) return;
+#if SS_CLVL == 3
+            sink += u64(ts); return;
+#endif
             i32 campaign = cat.campaign(s2, e2);
             if (campaign < 0) return;
+#if SS_CLVL == 4
+            sink += u64(ts) + u64(campaign); return;
+#elif SS_CLVL == 5
+            sink += u64(ts) + u64(campaign) + pack_id(s1, size_t(e1 - s1), 'u') + pack_id(s0, size_t(e0 - s0), 'k'); return;
+#elif SS_CLVL == 6
+            { const u64 who = pack_id(s1, size_t(e1 - s1), 'u');       // no alias lookup: the ID stands for the person
+              emit(who, hash64(who), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)}); return; }
+#endif
             // Copies of a click are identical (rules.md), so they change neither
             // the credited campaign nor the set of assisting campaigns: no dedup.
             resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
@@ -1894,6 +1928,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         release_chunk(sh.files[task.file], task);
     }
     resolver.finish();
+    if (sink == 1) fprintf(stderr, "sink\n");
 }
 
 // Where the time inside phases 2 and 3 goes: CPU seconds per step, per thread.
@@ -2611,7 +2646,7 @@ static void process_people(Shared& sh, u32 tid) {
             i64 cur_day = -1;
             i32 d_sessions = 0, d_events = 0;
             i64 d_revenue = 0;
-            auto emit = [&]() {
+            auto emit = [&]() SS_WALK {
                 const std::string* top = nullptr;
                 if (!cat_touched.empty()) {
                     std::sort(cat_touched.begin(), cat_touched.end());   // categories are numbered in byte order
@@ -2629,7 +2664,7 @@ static void process_people(Shared& sh, u32 tid) {
             };
             u32 left = 0, right = 0;
             // One session: first event at `start`, last at `last` (ms from window_start).
-            auto session = [&](u32 start, u32 last, u32 nevents) {
+            auto session = [&](u32 start, u32 last, u32 nevents) SS_WALK {
 #if SS_X == 9
                 rows += start + last + nevents; return;
 #endif
@@ -2689,32 +2724,40 @@ static void process_people(Shared& sh, u32 tid) {
             };
 
             // Walk the slices. Within a slice the keys are in no order, so take min and max.
+            // The loop takes one more turn after the last slice, to close the last
+            // session at the same place as every other one.
             u32 i = 0;
             u32 start = 0, last = 0, nevents = 0, prev_slice = 0;
             bool open = false;
-            while (i < n) {
-                const u32 slice = u32(mine[i] >> 21) & 0xFFF;
-                const u32 base = slice * SLICE;
-                u32 lo = u32(mine[i]) & 0x1FFFFF, hi = lo, count = 1;
-                for (i++; i < n && (u32(mine[i] >> 21) & 0xFFF) == slice; i++) {
-                    const u32 v = u32(mine[i]) & 0x1FFFFF;
-                    lo = v < lo ? v : lo;
-                    hi = v > hi ? v : hi;
-                    count++;
+            for (;;) {
+                const bool more = i < n;
+                u32 slice = 0, base = 0, lo = 0, hi = 0, count = 0;
+                bool joins = false;
+                if (more) {
+                    slice = u32(mine[i] >> 21) & 0xFFF;
+                    base = slice * SLICE;
+                    lo = u32(mine[i]) & 0x1FFFFF; hi = lo; count = 1;
+                    for (i++; i < n && (u32(mine[i] >> 21) & 0xFFF) == slice; i++) {
+                        const u32 v = u32(mine[i]) & 0x1FFFFF;
+                        lo = v < lo ? v : lo;
+                        hi = v > hi ? v : hi;
+                        count++;
+                    }
+                    // A later slice continues the session only if it is the very next
+                    // slice and its first event is within 30 minutes of the last one.
+                    joins = open && slice == prev_slice + 1 && i64(base + lo) - i64(last) <= SESSION_GAP;
                 }
-                // A later slice continues the session only if it is the very next
-                // slice and its first event is within 30 minutes of the last one.
-                if (open && slice == prev_slice + 1 && i64(base + lo) - i64(last) <= SESSION_GAP) {
+                if (open && !joins) session(start, last, nevents);
+                if (!more) break;
+                if (joins) {
                     last = base + hi;
                     nevents += count;
                 } else {
-                    if (open) session(start, last, nevents);
                     start = base + lo; last = base + hi; nevents = count;
                     open = true;
                 }
                 prev_slice = slice;
             }
-            if (open) session(start, last, nevents);
             if (cur_day >= 0) emit();
             for (u32 c : active) camp_count[c] = 0;
             active.clear();
@@ -2724,6 +2767,7 @@ static void process_people(Shared& sh, u32 tid) {
         steps[3] += step2 - step1;
         steps[4] += step3 - step2;
         steps[5] += step4 - step3;
+        steps[7] += double(npeople);
     }
     const double step5 = now();
     writer.finish();
@@ -2964,8 +3008,8 @@ int main() {
     {
         double sum[8] = {};
         for (u32 t = 0; t < T && t < 256; t++) for (int k = 0; k < 8; k++) sum[k] += g_steps[t][k];
-        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f\n",
-                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6]);
+        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f | people %.0f\n",
+                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
     }
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
