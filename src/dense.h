@@ -208,6 +208,7 @@ struct DenseCtx {
     hvec<u64> click_keys, click_tmp;
     hvec<i64> cat_cents;
     hvec<u32> cat_touched, camp_count, camp_slot, stamp, run_day, run_first;
+    hvec<u16> hot;                                  // per campaign and day: sessions, assists (see dense_sessions)
     u32 session_id = 0;
     u32 memo_user = ~0u;
     u64 memo_person = 0;
@@ -589,9 +590,9 @@ static inline SS_HOT bool line2(const u8* p, Fields<2>& f, const u8*& next) {
     return true;
 }
 
-// The same three readers for a line whose newline is already known (the usual
-// way in: line_rows finds the newlines of a batch of lines first, so reading one
-// line does not wait on the line before it). Only commas and quotes are looked for.
+// The same three readers for a line whose newline is already known (used by the
+// batched variants, which find the newlines of a group of lines first). Only
+// commas and quotes are looked for.
 struct CommaQuote { u64 comma, quote; };
 static inline SS_HOT CommaQuote comma_quote(const u8* p) {
 #if defined(__AVX2__)
@@ -738,9 +739,10 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
         }
         row(f);
     });
-#elif !defined(SS_LINE1)
-    // The newlines of a batch of lines first, 64 bytes at a time; then each line
-    // of the batch on its own, its end already known.
+#elif defined(SS_LINE2)
+    // Measurement: the newlines of a batch of lines first, 64 bytes at a time; then
+    // each line of the batch on its own, its end already known. On the scoring
+    // machine this is slower than reading line after line (the default below).
     (void)fast;
     enum { BATCH = 64 };
     u32 ends[BATCH + 72];
@@ -773,7 +775,12 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
     const u8* const stop_at = buf + stop;
     const u8* const last_nl = buf + last;
     while (p < stop_at) {
-        __builtin_prefetch(p + 1024);
+#ifndef SS_LPF
+#define SS_LPF 1024                  // how far ahead of the line being read the input is asked for
+#endif
+#if SS_LPF > 0
+        __builtin_prefetch(p + SS_LPF);
+#endif
         Fields<NF> f;
         const u8* next;
         if (__builtin_expect(!fast(p, f, next), 0)) {
@@ -1438,6 +1445,11 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     hvec<u32>& run_day = cx.run_day;
     hvec<u32>& run_first = cx.run_first;
     UserWriter& writer = cx.writer;
+    // Sessions and assists are counted in 16 bits first, two counters side by side
+    // for each campaign and day: a quarter of the memory of the full counters, so
+    // the counts a thread is adding to stay in its cache. A counter that fills
+    // carries into the full one; the rest is added when the thread is done.
+    [[maybe_unused]] u16* hot = cx.hot.data();
     u64 rows = 0;
 
     // This person's clicks. A handful are simply scanned for every session. More
@@ -1586,7 +1598,17 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             acc1 = acc0;
         }
 #endif
-        for (u32 k = 0; k < m; k++) { totals.assisted[size_t(lcamp[k]) * ndays + size_t(cur_day)] += lacc[k]; lacc[k] = 0; }
+        for (u32 k = 0; k < m; k++) {
+            const size_t slot = size_t(lcamp[k]) * ndays + size_t(cur_day);
+#ifndef SS_NOHOT16
+            const u32 sum = u32(hot[slot * 2 + 1]) + lacc[k];
+            hot[slot * 2 + 1] = u16(sum);
+            if (__builtin_expect(sum > 0xFFFF, 0)) totals.assisted[slot] += sum & ~0xFFFFu;
+#else
+            totals.assisted[slot] += lacc[k];
+#endif
+            lacc[k] = 0;
+        }
     };
     u32 left = 0, right = 0;
     // The same span counting of assists as in process_people.
@@ -1688,7 +1710,11 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             ord++;
         }
         const size_t slot = size_t(credited) * ndays + size_t(day);
+#ifndef SS_NOHOT16
+        if (__builtin_expect(++hot[slot * 2] == 0, 0)) totals.sessions[slot] += 65536;
+#else
         totals.sessions[slot]++;
+#endif
         if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
     }
     if (cur_day >= 0) {
@@ -1798,11 +1824,24 @@ static void dense_ctx_init(Shared& sh, DenseCtx& cx, u32 part) {
     cx.al.resize(DWIDTH);
     cx.runs.resize(DWIDTH + 1);
     cx.cat_cents.assign(sh.cat.categories.size(), 0);
+    cx.hot.assign(size_t(ncamp + 1) * ndays * 2, 0);
     cx.camp_count.assign(ncamp + 1, 0);
     cx.camp_slot.assign(ncamp + 1, 0);
     cx.stamp.assign(ncamp + 1, 0);
     cx.run_day.assign(ndays + 2, 0);
     cx.run_first.assign(ndays + 2, 0);
+}
+
+// A thread's walk is over: its 16-bit counts join the full ones and its file is closed.
+static void dense_ctx_finish(Shared& sh, DenseCtx& cx) {
+    if (!cx.ready) return;
+    Shared::Totals& totals = *cx.totals;
+    for (size_t slot = 0; slot * 2 < cx.hot.size(); slot++) {
+        totals.sessions[slot] += cx.hot[slot * 2];
+        totals.assisted[slot] += cx.hot[slot * 2 + 1];
+    }
+    cx.writer.finish();
+    sh.user_rows.fetch_add(cx.rows);
 }
 
 // Phase 3: one partition of event numbers at a time. Copies go to their slot
@@ -1960,10 +1999,7 @@ static void dense_leftovers(Shared& sh) {
         if (!cx.ready) dense_ctx_init(sh, cx, 2 * T);
         dense_person(sh, cx, person, nullptr, nullptr, 0, 0, 0);
     }
-    if (cx.ready) {
-        cx.writer.finish();
-        sh.user_rows.fetch_add(cx.rows);
-    }
+    dense_ctx_finish(sh, cx);
 }
 
 // Starts the program again with the dense path switched off.
