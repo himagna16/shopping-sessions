@@ -60,11 +60,14 @@ st nosess "$B" /px9
 st noalias "$B" /px4
 st nofilt "$B" /pnf
 r nofilt "$B" /pnf
+r popul "$B" /p SS_POPULATE=1
+r def "$B" /p
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
 grep -E '^user' "$S/err" | cut -c1-70
 r 60g15 "$B" /p15
 r 60clang "$B" "$CL"
 st 60steps "$B" /p
+r 60popul "$B" /p SS_POPULATE=1
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
