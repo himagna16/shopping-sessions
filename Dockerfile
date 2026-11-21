@@ -4,7 +4,7 @@
 FROM gcc:15-bookworm AS build
 COPY src/ /src/
 RUN if [ "$(uname -m)" = "x86_64" ]; then ARCH="-march=x86-64-v3 -mtune=skylake-avx512 -Wa,-mbranches-within-32B-boundaries"; else ARCH=""; fi \
- && g++ -std=c++20 -O3 $ARCH -fno-plt -static -pthread -o /pipeline /src/main.cpp \
+ && g++ -std=c++20 -O3 -fno-tree-vectorize $ARCH -fno-plt -static -pthread -o /pipeline /src/main.cpp \
  && strip /pipeline
 
 FROM scratch
