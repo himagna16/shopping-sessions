@@ -48,11 +48,11 @@
 #ifndef SS_UNIT
 #define SS_UNIT 128         // bytes staged per bucket before they are moved to its block chain
 #endif
-// Build variants kept for measurement. Defaults: the block-level quote scanner
-// and the sortable ingest key. SS_SCAN1 / SS_SCAN2 select the older scanners,
-// SS_ING1 the full ingest_ts conversion.
+// Build variants kept for measurement. Defaults: the carry-add field-start
+// scanner and the sortable ingest key. SS_SCAN1 / SS_SCAN2 / SS_SCAN3 select
+// the older scanners, SS_ING1 the full ingest_ts conversion.
 #if !defined(SS_SCAN1) && !defined(SS_SCAN2) && !defined(SS_SCAN3) && !defined(SS_SCAN4)
-#define SS_SCAN3
+#define SS_SCAN4
 #endif
 #if !defined(SS_ING1) && !defined(SS_ING2)
 #define SS_ING2
@@ -1437,6 +1437,24 @@ struct Resolver {
         b_item[j] = a_item[i]; b_hash[j] = a_hash[i]; b_key[j] = a_key[i];
         if (b_in - b_out > DIST) step_b();
     }
+#ifdef SS_NOFILTER
+    // Variant: no filter. The table slot is requested on arrival and read DIST items later.
+    inline void step_direct() {
+        u32 i = a_out++ & (SIZE - 1);
+        const u64 person = alias.person_hashed(a_key[i], a_hash[i]);
+        emit(person, person == a_key[i] ? a_hash[i] : hash64(person), a_item[i]);
+    }
+    inline void push(u64 key, const T& item) {
+        const u64 hash = hash64(key);
+        alias.prefetch_hash(hash);
+        u32 i = a_in++ & (SIZE - 1);
+        a_item[i] = item; a_hash[i] = hash; a_key[i] = key;
+        if (a_in - a_out > DIST) step_direct();
+    }
+    void finish() {
+        while (a_out != a_in) step_direct();
+    }
+#else
     inline void push(u64 key, const T& item) {
         const u64 hash = hash64(key);
         alias.prefetch_filter(hash);
@@ -1448,6 +1466,7 @@ struct Resolver {
         while (a_out != a_in) step_a();
         while (b_out != b_in) step_b();
     }
+#endif
 };
 
 struct Links {
