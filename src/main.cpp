@@ -40,7 +40,7 @@
 #include "parquet.h"
 
 #ifndef SS_UNIT
-#define SS_UNIT 64          // bytes staged per bucket before they are moved to its block chain
+#define SS_UNIT 128         // bytes staged per bucket before they are moved to its block chain
 #endif
 #ifndef SS_X
 #define SS_X 0            // measurement builds only: skip one step (see probe branch)
@@ -897,7 +897,7 @@ struct Config {
     std::string data, out;
     u32 threads = 8;
     size_t chunk = 256 << 10;
-    bool use_mmap = false;
+    bool use_mmap = true;       // map inputs and parse in place; SS_MMAP=0 reads them into buffers instead
 };
 
 struct Shared {
@@ -1704,7 +1704,7 @@ int main() {
     if (cfg.threads > 256) cfg.threads = 256;
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
-    cfg.use_mmap = !env("SS_MMAP", "").empty();
+    cfg.use_mmap = env("SS_MMAP", "1") != "0";
 
     {
         std::string text;
