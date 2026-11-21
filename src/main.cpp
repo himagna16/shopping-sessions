@@ -442,31 +442,86 @@ struct BlockAlloc {
     }
 };
 
-struct Block { Block* next; u32 n; u32 pad; };
+struct Block { Block* next; u32 n; };
 
+// Records headed for many buckets are staged one cache-line unit per bucket
+// and moved to the bucket's block chain a whole unit at a time with streaming
+// stores, so the scatter touches each destination line once and never reads it.
+// Blocks are BLOCK-aligned and their header is sized so the records end exactly
+// at the block's end: a cursor on a BLOCK boundary means "needs a new block".
 template <class T>
-struct List {
-    static const u32 CAP = u32((BLOCK - sizeof(Block)) / sizeof(T));
-    T* cur = nullptr;
-    T* end = nullptr;
-    Block* head = nullptr;
-    Block* tail = nullptr;
+struct Scatter {
+    static constexpr size_t PER = sizeof(T) == 24 ? 8 : 64 / sizeof(T);
+    static constexpr size_t UNIT = PER * sizeof(T);
+    static constexpr size_t HDR = BLOCK - ((BLOCK - 64) / UNIT) * UNIT;
+    static constexpr u32 CAP = u32((BLOCK - HDR) / sizeof(T));
 
-    static T* items(Block* b) { return (T*)(b + 1); }
-    inline void push(const T& v, BlockAlloc& alloc) {
-        if (cur == end) grow(alloc);
-        *cur++ = v;
+    u32 buckets = 0;
+    u8* stage = nullptr;
+    u8* fill = nullptr;
+    T** cur = nullptr;
+    Block** head = nullptr;
+    BlockAlloc* alloc = nullptr;
+
+    static T* items(Block* b) { return (T*)((u8*)b + HDR); }
+
+    void init(u32 n, BlockAlloc* a) {
+        buckets = n;
+        alloc = a;
+        if (posix_memalign((void**)&stage, 64, size_t(n) * UNIT)) die("out of memory for scatter staging");
+        fill = (u8*)calloc(n, 1);
+        cur = (T**)calloc(n, sizeof(T*));
+        head = (Block**)calloc(n, sizeof(Block*));
+        if (!fill || !cur || !head) die("out of memory for scatter state");
     }
-    void grow(BlockAlloc& alloc) {
-        Block* b = (Block*)alloc.get();
-        b->next = nullptr;
-        b->n = CAP;
-        if (tail) tail->next = b; else head = b;
-        tail = b;
-        cur = items(b);
-        end = cur + CAP;
+    inline void push(u32 b, const T& v) {
+        T* unit = (T*)(stage + size_t(b) * UNIT);
+        u32 f = fill[b];
+        unit[f] = v;
+        if (++f == PER) { flush_unit(b); f = 0; }
+        fill[b] = u8(f);
     }
-    void finish() { if (tail) tail->n = u32(cur - items(tail)); }
+    T* grow(u32 b, T* c) {
+        Block* fresh = (Block*)alloc->get();
+        fresh->next = nullptr;
+        fresh->n = CAP;
+        if (c) ((Block*)((uintptr_t(c) - 1) & ~(uintptr_t(BLOCK) - 1)))->next = fresh;
+        else head[b] = fresh;
+        return items(fresh);
+    }
+    inline void flush_unit(u32 b) {
+        T* c = cur[b];
+        if (!(uintptr_t(c) & (BLOCK - 1))) c = grow(b, c);
+        const u8* src = stage + size_t(b) * UNIT;
+#if defined(__AVX2__)
+        for (size_t k = 0; k < UNIT; k += 32)
+            _mm256_stream_si256((__m256i*)((u8*)c + k), _mm256_load_si256((const __m256i*)(src + k)));
+#else
+        memcpy((void*)c, src, UNIT);
+#endif
+        cur[b] = c + PER;
+    }
+    void finish() {
+        for (u32 b = 0; b < buckets; b++) {
+            u32 f = fill[b];
+            if (f) {
+                T* c = cur[b];
+                if (!(uintptr_t(c) & (BLOCK - 1))) c = grow(b, c);
+                memcpy((void*)c, stage + size_t(b) * UNIT, f * sizeof(T));
+                cur[b] = c + f;
+                fill[b] = 0;
+            }
+            if (cur[b]) {
+                Block* tail = (Block*)((uintptr_t(cur[b]) - 1) & ~(uintptr_t(BLOCK) - 1));
+                tail->n = u32(cur[b] - items(tail));
+            }
+        }
+#if defined(__AVX2__)
+        _mm_sfence();
+#endif
+        free(stage);
+        stage = nullptr;
+    }
 };
 
 struct RecA { u64 ekey; u64 ukey; i64 ingest; u32 ts; u32 payload; };      // one event copy, 32 bytes
@@ -723,10 +778,10 @@ struct Shared {
     std::atomic<size_t> next_event{0}, next_click{0}, next_bucket{0}, next_person{0};
     std::atomic<bool> links_ready{false};
     AliasMap alias;
-    // [thread][bucket]
-    std::vector<std::vector<List<RecA>>> a;
-    std::vector<std::vector<List<RecB>>> b;
-    std::vector<std::vector<List<RecC>>> c;
+    // one per thread
+    std::vector<Scatter<RecA>> a;
+    std::vector<Scatter<RecB>> b;
+    std::vector<Scatter<RecC>> c;
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
     // per thread: [(campaign * ndays + day) * 4 + {sessions, purchasing, revenue, assisted}]
@@ -778,8 +833,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
     const i64 ws = sh.ws, we = sh.we;
     const int shift = 64 - int(sh.abits);
     const Catalogs& cat = sh.cat;
-    List<RecA>* lists = sh.a[tid].data();
-    BlockAlloc& alloc = sh.alloc[tid];
+    Scatter<RecA>& lists = sh.a[tid];
     DateCache dates;
     u64 sink = 0;
     for (;;) {
@@ -793,7 +847,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #endif
         scan_rows<7>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
 #if SS_PROBE == 2
-            lists[0].cur += (commas[0] + nl + quotes + line) & 0; return;
+            sink += (commas[0] + nl + quotes + line) & 0; return;
 #endif
             const u8 *s0 = buf + line, *e0 = buf + commas[0];
             const u8 *s1 = e0 + 1, *e1 = buf + commas[1];
@@ -846,7 +900,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #if SS_PROBE == 3
             sink += rec.ekey + rec.ukey + rec.ts + rec.payload + u64(rec.ingest); return;
 #endif
-            lists[mix64(rec.ekey) >> shift].push(rec, alloc);
+            lists.push(u32(mix64(rec.ekey) >> shift), rec);
         });
     }
     if (sink == 1) fprintf(stderr, "sink\n");
@@ -858,8 +912,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     const int shift = 64 - int(sh.bbits);
     const Catalogs& cat = sh.cat;
     const AliasMap& alias = sh.alias;
-    List<RecC>* lists = sh.c[tid].data();
-    BlockAlloc& alloc = sh.alloc[tid];
+    Scatter<RecC>& lists = sh.c[tid];
     DateCache dates;
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
@@ -886,7 +939,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             rec.ckey = pack_id(s0, size_t(e0 - s0));
             rec.ts = u32(ts - lo);
             rec.camp = u32(campaign);
-            lists[mix64(rec.person) >> shift].push(rec, alloc);
+            lists.push(u32(mix64(rec.person) >> shift), rec);
         });
     }
 }
@@ -896,10 +949,9 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     const u32 nbuckets = 1u << sh.abits;
     const int shift = 64 - int(sh.bbits);
     const AliasMap& alias = sh.alias;
-    List<RecB>* out = sh.b[tid].data();
-    BlockAlloc& alloc = sh.alloc[tid];
+    Scatter<RecB>& out = sh.b[tid];
     std::vector<Block*> blocks;
-    std::vector<u32> table;
+    std::vector<u64> table;                 // (hash tag << 32) | (block << 8 | index) + 1
     static const u32 BATCH = 32;
     RecA* pending[BATCH];
     for (;;) {
@@ -908,7 +960,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         blocks.clear();
         size_t total = 0;
         for (u32 t = 0; t < sh.cfg.threads; t++)
-            for (Block* b = sh.a[t][bucket].head; b; b = b->next) { blocks.push_back(b); total += b->n; }
+            for (Block* b = sh.a[t].head[bucket]; b; b = b->next) { blocks.push_back(b); total += b->n; }
         if (!total) continue;
         size_t cap = 16;
         while (cap < total * 2) cap <<= 1;
@@ -916,18 +968,23 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         const u64 mask = cap - 1;
         // Smallest ingest_ts wins; equal ingest_ts means identical copies.
         for (u32 bi = 0; bi < blocks.size(); bi++) {
-            RecA* recs = List<RecA>::items(blocks[bi]);
+            RecA* recs = Scatter<RecA>::items(blocks[bi]);
             for (u32 i = 0; i < blocks[bi]->n; i++) {
                 RecA& rec = recs[i];
-                u64 at = mix64(rec.ekey) & mask;
+                const u64 m = mix64(rec.ekey);
+                const u64 mine = (m >> 20 << 32) | ((bi << 8 | i) + 1);
+                u64 at = m & mask;
                 for (;;) {
-                    u32 slot = table[at];
-                    if (!slot) { table[at] = (bi << 8 | i) + 1; break; }
-                    RecA& best = List<RecA>::items(blocks[(slot - 1) >> 8])[(slot - 1) & 255];
-                    if (best.ekey == rec.ekey) {
-                        if (rec.ingest < best.ingest) { best.ts = DEAD; table[at] = (bi << 8 | i) + 1; }
-                        else rec.ts = DEAD;
-                        break;
+                    u64 slot = table[at];
+                    if (!slot) { table[at] = mine; break; }
+                    if ((slot ^ mine) >> 32 == 0) {
+                        u32 ref = u32(slot) - 1;
+                        RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
+                        if (best.ekey == rec.ekey) {
+                            if (rec.ingest < best.ingest) { best.ts = DEAD; table[at] = mine; }
+                            else rec.ts = DEAD;
+                            break;
+                        }
                     }
                     at = (at + 1) & mask;
                 }
@@ -939,12 +996,12 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             for (u32 k = 0; k < waiting; k++) {
                 RecA* rec = pending[k];
                 RecB row{alias.person(rec->ukey), rec->ts, rec->payload};
-                out[mix64(row.person) >> shift].push(row, alloc);
+                out.push(u32(mix64(row.person) >> shift), row);
             }
             waiting = 0;
         };
         for (Block* b : blocks) {
-            RecA* recs = List<RecA>::items(b);
+            RecA* recs = Scatter<RecA>::items(b);
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
                 alias.prefetch(recs[i].ukey);
@@ -1026,6 +1083,13 @@ struct UserWriter {
     }
 };
 
+// All of one person's events inside one 30-minute slice of the window. Events
+// in a slice are under 30 minutes apart, so they always share a session, and a
+// session boundary can only fall between two slices: sessions come from
+// walking a person's slices in order, with no sort of the events.
+struct Cell { u64 person; u32 bin; u32 count; u32 first; u32 last; u32 purchases; u32 pad; };
+struct Purchase { u32 payload; u32 next; };
+
 static void process_people(Shared& sh, u32 tid) {
     const u32 nthreads = sh.cfg.threads;
     const u32 ncamp = u32(sh.cat.campaign_ids.size());
@@ -1041,8 +1105,10 @@ static void process_people(Shared& sh, u32 tid) {
     snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid);
     writer.init(sh.cfg.out + name);
 
-    std::vector<u32> table, local, counts, click_counts, click_local;
-    std::vector<u64> persons, events;
+    std::vector<u32> cell_table, person_table, cell_person, person_cells, order, cursor, click_start;
+    std::vector<Cell> cells;
+    std::vector<Purchase> purchases;
+    std::vector<u64> persons;
     std::vector<Click> clicks;
     std::vector<i64> cat_cents(ncat, 0);
     std::vector<u32> cat_touched;
@@ -1056,119 +1122,150 @@ static void process_people(Shared& sh, u32 tid) {
 
         size_t nev = 0;
         for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.b[t][bucket].head; b; b = b->next) nev += b->n;
+            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) nev += b->n;
         if (!nev) continue;
 
-        // Number the bucket's people and count their events.
+        // 1. Fold the bucket's events into (person, slice) cells.
         size_t cap = 64;
-        while (cap < nev / 2) cap <<= 1;
-        table.assign(cap, 0);
+        while (cap < nev) cap <<= 1;
+        cell_table.assign(cap, 0);
         u64 mask = cap - 1;
-        persons.clear();
-        counts.clear();
-        local.resize(nev);
-        size_t at_event = 0;
-        auto number = [&](u64 person) -> u32 {
-            u64 at = mix64(person) & mask;
-            for (;;) {
-                u32 slot = table[at];
-                if (!slot) break;
-                if (persons[slot - 1] == person) return slot - 1;
-                at = (at + 1) & mask;
-            }
-            if ((persons.size() + 1) * 2 > cap) {                 // keep the table at most half full
-                cap <<= 1;
-                mask = cap - 1;
-                table.assign(cap, 0);
-                for (u32 i = 0; i < persons.size(); i++) {
-                    u64 h = mix64(persons[i]) & mask;
-                    while (table[h]) h = (h + 1) & mask;
-                    table[h] = i + 1;
-                }
-                at = mix64(person) & mask;
-                while (table[at]) at = (at + 1) & mask;
-            }
-            persons.push_back(person);
-            counts.push_back(0);
-            table[at] = u32(persons.size());
-            return u32(persons.size() - 1);
+        cells.clear();
+        purchases.clear();
+        purchases.push_back({0, 0});                              // index 0 means "none"
+        auto cell_home = [&](u64 person, u32 bin) -> u64 {
+            return ((mix64(person) ^ (u64(bin) * 0x9E3779B97F4A7C15ULL)) >> 24) & mask;
         };
         for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.b[t][bucket].head; b; b = b->next) {
-                RecB* recs = List<RecB>::items(b);
+            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) {
+                const RecB* recs = Scatter<RecB>::items(b);
                 for (u32 i = 0; i < b->n; i++) {
-                    u32 id = number(recs[i].person);
-                    counts[id]++;
-                    local[at_event++] = id;
+                    const u64 person = recs[i].person;
+                    const u32 ts = recs[i].ts;
+                    const u32 bin = ts / u32(SESSION_GAP);
+                    u64 at = cell_home(person, bin);
+                    u32 id;
+                    for (;;) {
+                        u32 slot = cell_table[at];
+                        if (!slot) {
+                            if ((cells.size() + 1) * 2 > cap) {            // keep the table at most half full
+                                cap <<= 1;
+                                mask = cap - 1;
+                                cell_table.assign(cap, 0);
+                                for (u32 k = 0; k < cells.size(); k++) {
+                                    u64 h = cell_home(cells[k].person, cells[k].bin);
+                                    while (cell_table[h]) h = (h + 1) & mask;
+                                    cell_table[h] = k + 1;
+                                }
+                                at = cell_home(person, bin);
+                                while (cell_table[at]) at = (at + 1) & mask;
+                            }
+                            id = u32(cells.size());
+                            cells.push_back({person, bin, 0, ts, ts, 0, 0});
+                            cell_table[at] = id + 1;
+                            break;
+                        }
+                        const Cell& seen = cells[slot - 1];
+                        if (seen.person == person && seen.bin == bin) { id = slot - 1; break; }
+                        at = (at + 1) & mask;
+                    }
+                    Cell& cell = cells[id];
+                    cell.count++;
+                    if (ts < cell.first) cell.first = ts;
+                    if (ts > cell.last) cell.last = ts;
+                    if (recs[i].payload) {
+                        purchases.push_back({recs[i].payload, cell.purchases});
+                        cell.purchases = u32(purchases.size() - 1);
+                    }
                 }
             }
-        const u32 npeople = u32(persons.size());
+        const u32 ncells = u32(cells.size());
 
-        // Events grouped by person, then ordered by time.
-        std::vector<u32>& offset = click_local;                   // reused as scratch for offsets
-        offset.assign(npeople + 1, 0);
-        for (u32 i = 0; i < npeople; i++) offset[i + 1] = offset[i] + counts[i];
-        std::vector<u32> cursor(offset.begin(), offset.end() - 1);
-        events.resize(nev);
-        at_event = 0;
-        for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.b[t][bucket].head; b; b = b->next) {
-                RecB* recs = List<RecB>::items(b);
-                for (u32 i = 0; i < b->n; i++)
-                    events[cursor[local[at_event++]]++] = (u64(recs[i].ts) << 32) | recs[i].payload;
-            }
-        std::vector<u32> event_offset(offset);
-
-        // Clicks of people who have events, grouped the same way.
-        click_counts.assign(npeople + 1, 0);
-        size_t nclicks = 0;
-        auto lookup = [&](u64 person) -> i64 {
-            u64 at = mix64(person) & mask;
+        // 2. Number the people and list each one's cells in slice order.
+        size_t pcap = 64;
+        while (pcap < size_t(ncells) * 2) pcap <<= 1;
+        const u64 pmask = pcap - 1;
+        person_table.assign(pcap, 0);
+        persons.clear();
+        person_cells.clear();
+        cell_person.resize(ncells);
+        for (u32 k = 0; k < ncells; k++) {
+            const u64 person = cells[k].person;
+            u64 at = mix64(person) & pmask;
+            u32 id;
             for (;;) {
-                u32 slot = table[at];
+                u32 slot = person_table[at];
+                if (!slot) {
+                    id = u32(persons.size());
+                    persons.push_back(person);
+                    person_cells.push_back(0);
+                    person_table[at] = id + 1;
+                    break;
+                }
+                if (persons[slot - 1] == person) { id = slot - 1; break; }
+                at = (at + 1) & pmask;
+            }
+            person_cells[id]++;
+            cell_person[k] = id;
+        }
+        const u32 npeople = u32(persons.size());
+        person_cells.push_back(0);
+        for (u32 p = 0, sum = 0; p <= npeople; p++) { u32 n = person_cells[p]; person_cells[p] = sum; sum += n; }
+        cursor.assign(person_cells.begin(), person_cells.end() - 1);
+        order.resize(ncells);
+        for (u32 k = 0; k < ncells; k++) order[cursor[cell_person[k]]++] = k;
+
+        // 3. Clicks of people who have events, grouped the same way.
+        auto lookup = [&](u64 person) -> i64 {
+            u64 at = mix64(person) & pmask;
+            for (;;) {
+                u32 slot = person_table[at];
                 if (!slot) return -1;
                 if (persons[slot - 1] == person) return slot - 1;
-                at = (at + 1) & mask;
+                at = (at + 1) & pmask;
             }
         };
+        click_start.assign(npeople + 1, 0);
+        size_t nclicks = 0;
         for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.c[t][bucket].head; b; b = b->next) {
-                RecC* recs = List<RecC>::items(b);
+            for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
+                const RecC* recs = Scatter<RecC>::items(b);
                 for (u32 i = 0; i < b->n; i++) {
                     i64 id = lookup(recs[i].person);
-                    if (id >= 0) { click_counts[size_t(id)]++; nclicks++; }
+                    if (id >= 0) { click_start[size_t(id)]++; nclicks++; }
                 }
             }
-        std::vector<u32> click_offset(npeople + 1, 0);
         if (nclicks) {
-            for (u32 i = 0; i < npeople; i++) click_offset[i + 1] = click_offset[i] + click_counts[i];
-            std::vector<u32> at(click_offset.begin(), click_offset.end() - 1);
+            for (u32 p = 0, sum = 0; p <= npeople; p++) { u32 n = click_start[p]; click_start[p] = sum; sum += n; }
+            cursor.assign(click_start.begin(), click_start.end() - 1);
             clicks.resize(nclicks);
             for (u32 t = 0; t < nthreads; t++)
-                for (Block* b = sh.c[t][bucket].head; b; b = b->next) {
-                    RecC* recs = List<RecC>::items(b);
+                for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
+                    const RecC* recs = Scatter<RecC>::items(b);
                     for (u32 i = 0; i < b->n; i++) {
                         i64 id = lookup(recs[i].person);
-                        if (id >= 0) clicks[at[size_t(id)]++] = {recs[i].ts, recs[i].camp, recs[i].ckey};
+                        if (id >= 0) clicks[cursor[size_t(id)]++] = {recs[i].ts, recs[i].camp, recs[i].ckey};
                     }
                 }
         }
 
+        // 4. Each person: sessions, click credit and assists, daily rows.
         for (u32 p = 0; p < npeople; p++) {
-            u64* ev = events.data() + event_offset[p];
-            const u32 n = event_offset[p + 1] - event_offset[p];
-            if (n <= 24) {
+            u32* mine = order.data() + person_cells[p];
+            const u32 n = person_cells[p + 1] - person_cells[p];
+            if (n <= 32) {
                 for (u32 i = 1; i < n; i++) {
-                    u64 v = ev[i];
+                    u32 v = mine[i];
+                    u32 bin = cells[v].bin;
                     u32 j = i;
-                    while (j > 0 && ev[j - 1] > v) { ev[j] = ev[j - 1]; j--; }
-                    ev[j] = v;
+                    while (j > 0 && cells[mine[j - 1]].bin > bin) { mine[j] = mine[j - 1]; j--; }
+                    mine[j] = v;
                 }
             } else {
-                std::sort(ev, ev + n);
+                std::sort(mine, mine + n, [&](u32 x, u32 y) { return cells[x].bin < cells[y].bin; });
             }
-            Click* ck = nclicks ? clicks.data() + click_offset[p] : nullptr;
-            const u32 m = nclicks ? click_offset[p + 1] - click_offset[p] : 0;
+            Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
+            const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
             if (m > 1)
                 // Time ascending; at one instant the smallest click_id comes last, so
                 // the last click at or before a session start is the one to credit.
@@ -1176,7 +1273,21 @@ static void process_people(Shared& sh, u32 tid) {
                     return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key));
                 });
 
-            std::string person_name = id_string(persons[p]);
+            char name_buf[16];
+            u32 name_len = 0;
+            std::string name_long;
+            const char* person_name = name_buf;
+            if (persons[p] & INTERN_BIT) {
+                name_long = id_string(persons[p]);
+                person_name = name_long.data();
+                name_len = u32(name_long.size());
+            } else {
+                for (int shift = 56; shift >= 0; shift -= 7) {
+                    char c = char((persons[p] >> shift) & 0x7F);
+                    if (!c) break;
+                    name_buf[name_len++] = c;
+                }
+            }
             i64 cur_day = -1;
             i32 d_sessions = 0, d_events = 0;
             i64 d_revenue = 0;
@@ -1191,36 +1302,39 @@ static void process_people(Shared& sh, u32 tid) {
                     }
                     cat_touched.clear();
                 }
-                writer.add(person_name.data(), u32(person_name.size()), i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+                writer.add(person_name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
                 rows++;
             };
             u32 left = 0, right = 0;
             u32 i = 0;
             while (i < n) {
-                const u32 start = u32(ev[i] >> 32);
+                const Cell* cell = &cells[mine[i]];
+                const u32 start = cell->first;
                 const i64 day = floor_div(ws + start, DAY) - day0;
                 if (day != cur_day) {
                     if (cur_day >= 0) emit();
                     cur_day = day; d_sessions = 0; d_events = 0; d_revenue = 0;
                 }
                 i64 cents = 0;
-                u32 prev = start;
-                u32 j = i;
-                for (; j < n; j++) {
-                    u32 ts = u32(ev[j] >> 32);
-                    if (i64(ts) - i64(prev) > SESSION_GAP) break;
-                    prev = ts;
-                    u32 payload = u32(ev[j]);
-                    if (payload) {
-                        u32 c = payload & 0xFF;
-                        i64 price = payload >> 8;
+                u32 nevents = 0;
+                for (;;) {
+                    nevents += cell->count;
+                    for (u32 k = cell->purchases; k; k = purchases[k].next) {
+                        u32 c = purchases[k].payload & 0xFF;
+                        i64 price = purchases[k].payload >> 8;
                         if (!cat_cents[c]) cat_touched.push_back(c);
                         cat_cents[c] += price;
                         cents += price;
                     }
+                    if (++i == n) break;
+                    const Cell* next = &cells[mine[i]];
+                    // A later slice continues the session only if it is the very next
+                    // slice and its first event is within 30 minutes of the last one.
+                    if (next->bin != cell->bin + 1 || i64(next->first) - i64(cell->last) > SESSION_GAP) break;
+                    cell = next;
                 }
                 // purchases have a price of at least 1, so cents > 0 means "has a purchase"
-                d_sessions++; d_events += i32(j - i); d_revenue += cents;
+                d_sessions++; d_events += i32(nevents); d_revenue += cents;
 
                 u32 credited = organic;
                 if (m) {
@@ -1243,11 +1357,10 @@ static void process_people(Shared& sh, u32 tid) {
                     if (right > left) credited = ck[right - 1].camp;
                     for (u32 c : active) totals[(size_t(c) * ndays + size_t(day)) * 4 + 3]++;
                 }
-                i64* cell = &totals[(size_t(credited) * ndays + size_t(day)) * 4];
-                cell[0]++;
-                cell[1] += cents > 0;
-                cell[2] += cents;
-                i = j;
+                i64* cell_total = &totals[(size_t(credited) * ndays + size_t(day)) * 4];
+                cell_total[0]++;
+                cell_total[1] += cents > 0;
+                cell_total[2] += cents;
             }
             if (cur_day >= 0) emit();
             for (u32 c : active) camp_count[c] = 0;
@@ -1259,12 +1372,24 @@ static void process_people(Shared& sh, u32 tid) {
 }
 
 // ---------------------------------------------------------------- main
+static double thread_cpu() {
+    timespec t;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t);
+    return double(t.tv_sec) + double(t.tv_nsec) * 1e-9;
+}
+
+// Runs body(0..n-1) on n threads and returns the CPU seconds they used.
 template <class F>
-static void run_threads(u32 n, F&& body) {
+static double run_threads(u32 n, F&& body) {
     std::vector<std::thread> threads;
-    for (u32 t = 1; t < n; t++) threads.emplace_back([&body, t] { body(t); });
-    body(0);
+    std::vector<double> cpu(n, 0);
+    auto timed = [&](u32 t) { double c0 = thread_cpu(); body(t); cpu[t] = thread_cpu() - c0; };
+    for (u32 t = 1; t < n; t++) threads.emplace_back([&timed, t] { timed(t); });
+    timed(0);
     for (auto& th : threads) th.join();
+    double sum = 0;
+    for (double c : cpu) sum += c;
+    return sum;
 }
 
 static i64 manifest_time(const std::string& text, const char* key) {
@@ -1371,9 +1496,9 @@ int main() {
     g_arena_region = (g_arena_region + SLAB - 1) & ~(SLAB - 1);
 
     const u32 T = cfg.threads;
-    sh.a.assign(T, std::vector<List<RecA>>(size_t(1) << sh.abits));
-    sh.b.assign(T, std::vector<List<RecB>>(size_t(1) << sh.bbits));
-    sh.c.assign(T, std::vector<List<RecC>>(size_t(1) << sh.bbits));
+    sh.a.resize(T);
+    sh.b.resize(T);
+    sh.c.resize(T);
     sh.alloc.resize(T);
     sh.campaign_totals.resize(T);
     mkdir(cfg.out.c_str(), 0777);
@@ -1381,19 +1506,22 @@ int main() {
     mkdir((cfg.out + "/campaign_daily").c_str(), 0777);
     double t1 = now();
 
-    run_threads(T, [&](u32 tid) {
+    double c1 = run_threads(T, [&](u32 tid) {
         Reader reader;
+        sh.a[tid].init(1u << sh.abits, &sh.alloc[tid]);
         if (tid == 0) parse_links(sh, reader);
         parse_events(sh, tid, reader);
+        sh.a[tid].finish();
+        sh.c[tid].init(1u << sh.bbits, &sh.alloc[tid]);
         parse_clicks(sh, tid, reader);
-        for (auto& list : sh.a[tid]) list.finish();
-        for (auto& list : sh.c[tid]) list.finish();
+        sh.c[tid].finish();
     });
     double t2 = now();
 
-    run_threads(T, [&](u32 tid) {
+    double c2 = run_threads(T, [&](u32 tid) {
+        sh.b[tid].init(1u << sh.bbits, &sh.alloc[tid]);
         dedup_buckets(sh, tid);
-        for (auto& list : sh.b[tid]) list.finish();
+        sh.b[tid].finish();
     });
     double t3 = now();
 
@@ -1403,12 +1531,12 @@ int main() {
         std::vector<u64> size(nb, 0);
         for (u32 t = 0; t < T; t++)
             for (u32 k = 0; k < nb; k++)
-                for (Block* b = sh.b[t][k].head; b; b = b->next) size[k] += b->n;
+                for (Block* b = sh.b[t].head[k]; b; b = b->next) size[k] += b->n;
         sh.person_order.resize(nb);
         for (u32 k = 0; k < nb; k++) sh.person_order[k] = k;
         std::sort(sh.person_order.begin(), sh.person_order.end(), [&](u32 x, u32 y) { return size[x] > size[y]; });
     }
-    run_threads(T, [&](u32 tid) { process_people(sh, tid); });
+    double c3 = run_threads(T, [&](u32 tid) { process_people(sh, tid); });
     double t4 = now();
 
     write_campaigns(sh);
@@ -1418,7 +1546,7 @@ int main() {
         file.close();
     }
     double t5 = now();
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | user rows %llu\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, (unsigned long long)sh.user_rows.load());
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load());
     _exit(0);
 }
