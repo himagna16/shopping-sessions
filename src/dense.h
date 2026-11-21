@@ -1515,6 +1515,9 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             }
         }
     }
+#if SS_DX == 9
+    m = 0;                              // the clicks were read and ordered, then left out
+#endif
 #if SS_DX == 4
     if (m > SS_SCANMAX) m = 0;
 #elif SS_DX == 5
@@ -1597,6 +1600,10 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             acc0 = _mm256_setzero_si256();
             acc1 = acc0;
         }
+#endif
+#if SS_DX == 7
+        for (u32 k = 0; k < m; k++) lacc[k] = 0;
+        return;
 #endif
         for (u32 k = 0; k < m; k++) {
             const size_t slot = size_t(lcamp[k]) * ndays + size_t(cur_day);
@@ -1709,6 +1716,9 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             if (nruns == 0 || run_day[nruns - 1] != u32(day)) { run_day[nruns] = u32(day); run_first[nruns] = ord; nruns++; }
             ord++;
         }
+#if SS_DX == 8
+        credited = organic;
+#endif
         const size_t slot = size_t(credited) * ndays + size_t(day);
 #ifndef SS_NOHOT16
         if (__builtin_expect(++hot[slot * 2] == 0, 0)) totals.sessions[slot] += 65536;
