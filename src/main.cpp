@@ -59,6 +59,10 @@ static const i64 REACH = 7 * DAY;
 static const i64 TS_BAD = INT64_MIN;
 static const u32 DEAD = 0xFFFFFFFFu;        // RecA.ts: invalid copy, or a copy that lost dedup
 
+#ifdef SS_PGO_GEN
+extern "C" void __gcov_dump(void);          // _exit skips the normal profile write-out
+#endif
+
 [[noreturn]] static void die(const char* what) {
     fprintf(stderr, "fatal: %s\n", what);
     _exit(3);
@@ -1677,5 +1681,8 @@ int main() {
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
     fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu\n",
             T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load());
+#ifdef SS_PGO_GEN
+    __gcov_dump();
+#endif
     _exit(0);
 }
