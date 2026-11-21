@@ -3286,6 +3286,11 @@ int main(int, char** argv) {
         });
         if (env("SS_DENSE_BAIL", "") == "2") dense_bail(9);
         if (D.bail.load()) dense_restart(sh, false);
+        if (!env("SS_STOP", "").empty()) {                    // measurement: the parse alone
+            fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows 0 | links 0\n",
+                    T, 1u << sh.abits, t1 - t0, now() - t1, 0.0, 0.0, 0.0, now() - t0, c1, 0.0, 0.0);
+            _exit(0);
+        }
         const double w0 = now();
         dense_settle(sh);
         t2 = now();
