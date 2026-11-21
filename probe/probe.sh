@@ -1,14 +1,12 @@
 #!/bin/sh
-# Diagnostic run: times the pipeline on enlarged copies of the dev set under
-# many settings, prints one short line each, then exits 1 so the run is
-# reported with its log and never scored. The scorer shows only the last
-# ~2,000 characters of stderr, so everything is kept compact.
+# Diagnostic run (never scored): times builds that each skip one step, to see
+# where the time goes on the scoring machine. Output is kept under ~1,900
+# characters because only the end of stderr is shown.
 exec 1>&2
 D="${DATA_DIR:-/data}"; S="${SCRATCH_DIR:-/scratch}"
 START=$(date +%s)
 elapsed() { echo $(( $(date +%s) - START )); }
-
-# r LABEL DATA BIN [VAR=VALUE ...] -> "LABEL wall total parse dedup people setup cpu" (ms; cpu in s), best of 2
+# r LABEL DATA BIN [VAR=VALUE ...] -> "LABEL wall total parse dedup people cpu links" (ms; cpu in s), best of 2
 r() {
   label="$1"; data="$2"; bin="$3"; shift 3
   best=""; bw=999999
@@ -18,48 +16,37 @@ r() {
     env "$@" DATA_DIR="$data" OUTPUT_DIR="$S/out" "$bin" 2> "$S/err"; rc=$?
     t1=$(date +%s%N)
     w=$(( (t1 - t0) / 1000000 ))
-    line=$(awk -v w=$w -v rc=$rc '/^user/{c=$2+$4} /^threads/{printf "%d %d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000, $7*1000} END{printf " %.1f", c; if (rc) printf " rc%d", rc}' "$S/err")
+    line=$(awk -v w=$w -v rc=$rc '/^user/{c=$2+$4} /^threads/{printf "%d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000; l=$NF*1000} END{printf " %.1f %d", c, l; if (rc) printf " rc%d", rc}' "$S/err")
     if [ "$w" -lt "$bw" ]; then bw=$w; best="$line"; fi
   done
   echo "$label $best"
 }
-
 /expand "$D" "$S/b" 20
 B="$S/b"
 r base "$B" /p
 r mmap "$B" /p SS_MMAP=1
-r c64k "$B" /p SS_CHUNK=65536
-r c512k "$B" /p SS_CHUNK=524288
-r c1m "$B" /p SS_CHUNK=1048576
-r c4m "$B" /p SS_CHUNK=4194304
-r mm1m "$B" /p SS_MMAP=1 SS_CHUNK=1048576
-r mm4m "$B" /p SS_MMAP=1 SS_CHUNK=4194304
-r a9 "$B" /p SS_ABITS=9
-r a10 "$B" /p SS_ABITS=10
-r a12 "$B" /p SS_ABITS=12
-r a13 "$B" /p SS_ABITS=13
-r b8 "$B" /p SS_BBITS=8
-r b9 "$B" /p SS_BBITS=9
-r b10 "$B" /p SS_BBITS=10
-r b12 "$B" /p SS_BBITS=12
-r u128 "$B" /p128
-r nostr "$B" /pns
-r jcc "$B" /pjcc
-r o2 "$B" /po2
-r 512 "$B" /p512
-r id2 "$B" /pid2
-r combo "$B" /pc
-r pgo "$B" /ppgo
-r cpgo "$B" /pcpgo
-r combo-mm "$B" /pc SS_MMAP=1
-r combo-1m "$B" /pc SS_CHUNK=1048576
-r t10 "$B" /p SS_THREADS=10
+r read "$B" /q1
+r readmm "$B" /q1 SS_MMAP=1
+r scan "$B" /q2
+r scanmm "$B" /q2 SS_MMAP=1
+r conv "$B" /q3
+r convmm "$B" /q3 SS_MMAP=1
+r noclk "$B" /q5
+r d1only "$B" /x3
+r dnotab "$B" /x7
+r dnoali "$B" /x4
+r pcells "$B" /x2
+r pno4 "$B" /x1
+r pnoclk "$B" /x5
+r pnowr "$B" /x6
+r zap "$B" /p SS_ZAP=1
+r t1 "$B" /p SS_THREADS=1
+r t1mm "$B" /p SS_THREADS=1 SS_MMAP=1
 r base "$B" /p
-if [ "$(elapsed)" -lt 100 ]; then
-  rm -rf "$S/b"; /expand "$D" "$S/c" 60; B="$S/c"
-  r 60base "$B" /p
-  [ "$(elapsed)" -lt 140 ] && r 60mmap "$B" /p SS_MMAP=1
-  [ "$(elapsed)" -lt 150 ] && r 60combo "$B" /pc
-fi
-echo "t=$(elapsed)s $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | cut -c1-40) cpus $(grep Cpus_allowed_list /proc/self/status | cut -f2) max $(cat /sys/fs/cgroup/cpu.max 2>&1) thp $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>&1 | tr -d ' ' | cut -c1-24) $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>&1 | sed 's/.*\[\(.*\)\].*/\1/') fs $(awk '$5=="/data"||$5=="/output"||$5=="/scratch"{printf "%s=%s ", $5, $(NF-2)}' /proc/self/mountinfo) vbmi $(grep -c -m1 avx512_vbmi2 /proc/cpuinfo)"
+rm -rf "$S/b"; /expand "$D" "$S/c" 60; B="$S/c"
+r 60base "$B" /p
+r 60zap "$B" /p SS_ZAP=1
+[ "$(elapsed)" -lt 140 ] && r 60mm "$B" /p SS_MMAP=1
+[ "$(elapsed)" -lt 150 ] && r 60mmzap "$B" /p SS_MMAP=1 SS_ZAP=1
+echo "t=$(elapsed)s"
 exit 1
