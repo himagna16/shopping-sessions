@@ -93,14 +93,15 @@ static inline u64 b36_order(u64 v) {
 }
 
 // RecD.a = ts << 32 | payload (as RecB); ts == DEAD for a copy that is not valid.
-// RecD.b = ingest << 42 | number within the partition << 28 | user.
+// RecD.b = ingest << ING_SHIFT | number within the partition << 28 | user.
 //   ingest: whole seconds from Dense::ing_base, ING_NONE for an unreadable one.
 //   user:   person << 4 | alias, or ODD | thread << 21 | index into that thread's odd_users.
 // RecK.x = ts << 32 | person << 4 | alias.
 // RecK.y = campaign << 48 | click key; the key is the value a canonical click ID
 //          spells, or KODD | thread << 40 | index into that thread's odd_clicks.
 static const u32 DWIDTH = 1u << SS_DW;
-static const u32 ING_BITS = 36 - SS_DW;
+static const u32 ING_SHIFT = 28 + SS_DW;
+static const u32 ING_BITS = 64 - ING_SHIFT;
 static const u32 ING_NONE = (1u << ING_BITS) - 1;
 static const u32 ING_LEAD_DAYS = SS_DW <= 14 ? 12 : 2;      // how far before the window's first day ingest times can be held
 static const u32 ODD = 1u << 27, USER_MASK = (1u << 28) - 1;
@@ -237,6 +238,7 @@ static bool dense_setup(Shared& sh) {
     }
     const u32 T = sh.cfg.threads;
     if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
+    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
 
     size_t total_bytes = 0, best_size = 0;
     i64 best = -1;
@@ -513,7 +515,7 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                 u32 user = 0;
                 if (ts32 != DEAD && !dense_user(s1, n1, ukey, pmax, user)) user = dense_odd_user(cx, tid, pack_id(s1, n1, 'u'));
                 if (far) dense_bail(1);                         // an ingest time this record cannot hold
-                lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << 42) | ((number & (DWIDTH - 1)) << 28) | user});
+                lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << ING_SHIFT) | ((number & (DWIDTH - 1)) << 28) | user});
                 return;
             }
             // An event ID that does not decode: the general dedup, exactly as parse_events
@@ -962,7 +964,7 @@ static void dense_walk(Shared& sh, u32 tid) {
                 for (u32 i = 0; i < b->n; i++) {
                     RecD& slot = slots[(recs[i].b >> 28) & (DWIDTH - 1)];
                     // Smallest ingest_ts wins; equal ingest_ts means identical copies.
-                    if (slot.b == EMPTY_SLOT || (recs[i].b >> 42) < (slot.b >> 42)) slot = recs[i];
+                    if (slot.b == EMPTY_SLOT || (recs[i].b >> ING_SHIFT) < (slot.b >> ING_SHIFT)) slot = recs[i];
                 }
             }
         if (!any) continue;
