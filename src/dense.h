@@ -596,6 +596,73 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
 #endif
 }
 
+#ifdef SS_SELFTEST
+// Test builds only (SS_LINETEST=N): random lines, mostly well-formed, some
+// broken; whenever a fast line reader accepts a line, the byte-by-byte reader
+// must accept it too and give the same fields and the same next line.
+template <int NF, class Fast>
+static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) {
+    auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+    std::vector<u8> buf;
+    u64 failures = 0;
+    for (u64 done = 0; done < lines;) {
+        buf.clear();
+        std::vector<size_t> starts;
+        for (int k = 0; k < 64; k++) {
+            starts.push_back(buf.size());
+            const int nf = rnd() % 10 < 9 ? NF : int(rnd() % 10) + 1;
+            for (int i = 0; i < nf; i++) {
+                if (i) buf.push_back(',');
+                size_t len = rnd() % 14;
+                if (rnd() % 40 == 0) len = rnd() % 90;
+                const bool quote = rnd() % 4 == 0;
+                if (quote) buf.push_back('"');
+                for (size_t j = 0; j < len; j++) buf.push_back(u8("abcxyz0189 :-TZ"[rnd() % 15]));
+                if (quote) buf.push_back('"');
+            }
+            const size_t from = starts.back();
+            if (rnd() % 6 == 0 && buf.size() > from) {
+                const size_t at = from + rnd() % (buf.size() - from);
+                switch (rnd() % 5) {
+                    case 0: buf[at] = '"'; break;
+                    case 1: buf[at] = ','; break;
+                    case 2: buf.insert(buf.begin() + long(at), '"'); break;
+                    case 3: buf.erase(buf.begin() + long(at)); break;
+                    default: buf[at] = '\r'; break;
+                }
+            }
+            buf.push_back('\n');
+        }
+        const size_t last = buf.size() - 1;
+        buf.resize(buf.size() + 256, 'x');
+        for (size_t line : starts) {
+            const u8* p = buf.data() + line;
+            const u8* nl = (const u8*)memchr(p, '\n', last - line + 1);
+            Fields<NF> exact, quick;
+            const bool exact_ok = split_exact<NF>(p, nl, exact);
+            const u8* next = nullptr;
+            const bool quick_ok = fast(p, quick, next);
+            done++;
+            if (!quick_ok) continue;
+            accepted++;
+            bool same = exact_ok && next == nl + 1;
+            for (int i = 0; same && i < NF; i++) same = exact.s[i] == quick.s[i] && exact.e[i] == quick.e[i];
+            if (!same) {
+                if (failures++ < 5) fprintf(stderr, "line test: %d fields, mismatch on [%.*s]\n", NF, int(nl - p), (const char*)p);
+            }
+        }
+    }
+    return failures;
+}
+static void line_selftest(u64 lines) {
+    u64 state = 0x9E3779B97F4A7C15ULL ^ lines, a7 = 0, a4 = 0, a2 = 0;
+    const u64 bad = line_selftest_one<7>(state, lines, line7, a7) + line_selftest_one<4>(state, lines, line4, a4) + line_selftest_one<2>(state, lines, line2, a2);
+    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
+            (unsigned long long)a7, (unsigned long long)a4, (unsigned long long)a2, (unsigned long long)bad);
+    _exit(bad ? 1 : 0);
+}
+#endif
+
 // After the links are read: the links of everyone handed to the general path
 // join the general union-find, and the alias map is built from it. Only links
 // hand people over, so this runs on the links thread while the others parse.

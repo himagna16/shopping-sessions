@@ -3227,6 +3227,9 @@ int main(int, char** argv) {
 
     const u32 T = cfg.threads;
     bool dense = false;
+#if defined(SS_DENSE_BUILD) && defined(SS_SELFTEST)
+    if (!env("SS_LINETEST", "").empty()) line_selftest(u64(atoll(env("SS_LINETEST", "0").c_str())));
+#endif
 #ifdef SS_DENSE_BUILD
     g_dense.argv = argv;
     dense = dense_setup(sh);
