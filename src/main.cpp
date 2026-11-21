@@ -2597,6 +2597,7 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
     struct Local { u64 key; u32 index; u32 used; };
     hvec<u64> met_key, link_root;                             // everything in the table, to rebuild it when it grows
     hvec<u32> met_code;
+    hvec<RecB> passing(Scatter<RecB>::CAP + 1);               // a block's events on their way to the linked lists
     struct Bought { u64 key; u32 payload; u32 pad; };        // key = person number << 32 | ts
     struct Found { u32 person; Click click; };
     hvec<Local> table;
@@ -2643,8 +2644,9 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
         met_key.clear();
         met_code.clear();
         link_root.clear();
+        link_root.push_back(0);                                   // number 0 is never given out: see the event loop
         bought.clear();
-        keys.resize(nev);
+        keys.resize(nev + 1);                                     // one spare place for a write that is not kept
         memset(per_slice.data(), 0, per_slice.size() * sizeof(u32));
         auto remember = [&](u64 id, u32 code) {
             if ((met_key.size() + 1) * 2 > cap) {                 // keep the table at most half full
@@ -2692,6 +2694,33 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
             for (Block* b = src_b[t].head[bucket]; b; b = b->next) {
                 const RecB* recs = Scatter<RecB>::items(b);
                 prefetch_block(b->next);
+#if !defined(SS_ALIAS1) && !defined(SS_ROUTE1)
+                if (route) {
+                    // Whether an event stays or is passed on is close to a coin toss, so
+                    // nothing branches on it: both forms are written and only the right
+                    // cursor moves. The events passed on leave after the block is read.
+                    RecB* out = passing.data();
+                    u32 m = 0;
+                    for (u32 i = 0; i < b->n; i++) {
+                        const u32 who = number(recs[i].person);
+                        const u32 linked = who >> 31, stays = linked ^ 1;
+                        const u32 ts = recs[i].ts;
+                        const u32 slice = ts / SLICE;
+                        out[m] = RecB{link_root[linked ? (who & ~LINKED) : 0], ts, recs[i].payload};
+                        m += linked;
+                        keys[j] = (u64(who) << 33) | (u64(slice) << 21) | (ts - slice * SLICE);
+                        j += stays;
+                        per_slice[slice] += stays;
+                        u32 nowhere = 0;
+                        u32* count = linked ? &nowhere : per_person.data() + who;
+                        *count += 1;
+                        if (recs[i].payload && stays) bought.push_back({(u64(who) << 32) | ts, recs[i].payload, 0});
+                    }
+                    for (u32 k = 0; k < m; k++) sh.lb[tid].push(u32(hash64(out[k].person) >> person_shift), out[k]);
+                    passed_on += m;
+                    continue;
+                }
+#endif
                 for (u32 i = 0; i < b->n; i++) {
                     const u32 who = number(recs[i].person);
                     if (who & LINKED) {
@@ -2986,7 +3015,7 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
         steps[5] += step4 - step3;
         steps[7] += double(npeople);
         steps[8] += double(passed_on);
-        steps[9] += double(link_root.size());
+        steps[9] += double(link_root.size() - 1);
     }
     const double step5 = now();
     writer.finish();
