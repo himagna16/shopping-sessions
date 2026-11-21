@@ -3291,10 +3291,8 @@ int main(int, char** argv) {
                     T, 1u << sh.abits, t1 - t0, now() - t1, 0.0, 0.0, 0.0, now() - t0, c1, 0.0, 0.0);
             _exit(0);
         }
-        const double w0 = now();
-        dense_settle(sh);
         t2 = now();
-        D.wall[0] = t2 - w0;
+        D.wall[0] = sh.links_union;
         // Phase 2: the general dedup (few events) and the clicks grouped by person.
         c2 = run_threads(T, [&](u32 tid) {
             DenseCtx& cx = D.ctx[tid];

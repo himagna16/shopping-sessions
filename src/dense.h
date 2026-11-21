@@ -30,6 +30,9 @@
 #ifndef SS_DW
 #define SS_DW 14                    // log2 of the event numbers in one partition
 #endif
+#ifndef SS_RADIXMIN
+#define SS_RADIXMIN 4096           // a person with more clicks than this has them ordered by counting passes
+#endif
 #ifndef SS_CW
 #define SS_CW 10                    // log2 of the people in one click partition
 #endif
@@ -172,7 +175,7 @@ struct DenseCtx {
     struct Run { u32 person, start, amask, flags; };
     hvec<Run> runs;
     hvec<Click> clicks;
-    hvec<u64> click_keys;
+    hvec<u64> click_keys, click_tmp;
     hvec<i64> cat_cents;
     hvec<u32> cat_touched, camp_count, camp_slot, stamp, run_day, run_first;
     u32 session_id = 0;
@@ -412,6 +415,28 @@ static bool dense_setup(Shared& sh) {
     return true;
 }
 
+// After the links are read: the links of everyone handed to the general path
+// join the general union-find, and the alias map is built from it. Only links
+// hand people over, so this runs on the links thread while the others parse.
+static void dense_settle(Shared& sh) {
+    Dense& D = g_dense;
+    Links& links = sh.odd_links;
+    for (DenseCtx& cx : D.ctx)
+        for (u32 person : cx.marked) {
+            if (D.complex[person] == 2) continue;
+            D.complex[person] = 2;
+            const u64 parents = D.ptab[person] ^ IDENT;
+            if (parents == IDENT) continue;
+            for (u32 a = 0; a < 16; a++) {
+                const u32 parent = u32((parents >> (4 * a)) & 15);
+                if (parent != a) links.add(dense_user_key(person, a), dense_user_key(person, parent));
+            }
+        }
+    const double began = now();
+    links.solve(sh.alias);
+    sh.links_union = now() - began;
+}
+
 // ---------------------------------------------------------------- parse
 // Links whose two IDs are among one person's first 16 are joined in that
 // person's own little table; any other link goes to the general union-find and
@@ -461,6 +486,8 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     }
     while (out != in) apply(ring[out++ & 63]);
     sh.links_parse = now() - began;
+    dense_settle(sh);
+    sh.links_seconds = now() - began;
 }
 
 static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
@@ -642,27 +669,6 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
 }
 
 // ---------------------------------------------------------------- between the phases
-// After the parse: the links of everyone handed to the general path join the
-// general union-find, and the alias map is built from it.
-static void dense_settle(Shared& sh) {
-    Dense& D = g_dense;
-    Links& links = sh.odd_links;
-    for (DenseCtx& cx : D.ctx)
-        for (u32 person : cx.marked) {
-            if (D.complex[person] == 2) continue;
-            D.complex[person] = 2;
-            const u64 parents = D.ptab[person] ^ IDENT;
-            if (parents == IDENT) continue;
-            for (u32 a = 0; a < 16; a++) {
-                const u32 parent = u32((parents >> (4 * a)) & 15);
-                if (parent != a) links.add(dense_user_key(person, a), dense_user_key(person, parent));
-            }
-        }
-    const double began = now();
-    links.solve(sh.alias);
-    sh.links_union = now() - began;
-}
-
 static inline void dense_hand_event(Shared& sh, DenseCtx& cx, u32 tid, u32 user, u32 ts, u32 payload) {
     u64 person;
     if (user == cx.memo_user) person = cx.memo_person;
@@ -807,7 +813,22 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
                     keys[m] = (src[i].x & ~0xFFFFFFFFULL) | i;
                     m += (members >> (u32(src[i].x) & 15)) & 1;
                 }
-                if (m > SS_SCANMAX) std::sort(keys, keys + m);
+                if (m > SS_RADIXMIN) {
+                    // A heavy user's clicks: three counting passes over the time (the high half of
+                    // the key), which keep the order of equal times and so sort by time, then place.
+                    if (cx.click_tmp.size() < m) cx.click_tmp.resize(size_t(m) + m / 2);
+                    u64* from = keys;
+                    u64* to = cx.click_tmp.data();
+                    for (int shift = 32; shift < 64; shift += 11) {
+                        u32 count[2048] = {0};
+                        for (u32 i = 0; i < m; i++) count[(from[i] >> shift) & 2047]++;
+                        u32 sum = 0;
+                        for (u32 b = 0; b < 2048; b++) { const u32 c = count[b]; count[b] = sum; sum += c; }
+                        for (u32 i = 0; i < m; i++) to[count[(from[i] >> shift) & 2047]++] = from[i];
+                        std::swap(from, to);
+                    }
+                    keys = from;                        // three passes: the result is in the other buffer
+                } else if (m > SS_SCANMAX) std::sort(keys, keys + m);
                 for (u32 i = 0; i < m; i++) {
                     const RecK& from = src[u32(keys[i])];
                     ck[i] = Click{u32(from.x >> 32), u32(from.y >> 48), from.y & KEY_MASK};
