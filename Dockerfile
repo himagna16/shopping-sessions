@@ -1,19 +1,21 @@
 # Diagnostic image (probe branch): never scored, see probe/probe.sh.
+FROM rust:1-slim-bookworm AS gen
+COPY probe/generator /g
+RUN cd /g && cargo build --release
+
 FROM gcc:15-bookworm AS build
 COPY src/ /src/
-COPY tools/ /tools/
 RUN if [ "$(uname -m)" = "x86_64" ]; then V3="-march=x86-64-v3 -mtune=skylake-avx512 -Wa,-mbranches-within-32B-boundaries"; else V3=""; fi \
- && B="g++ -std=c++20 -fno-plt -static -pthread -O3 $V3 /src/main.cpp" \
+ && B="g++ -std=c++20 -fno-plt -static -pthread -O3 -fno-tree-vectorize $V3 /src/main.cpp" \
  && $B -o /p \
- && $B -fno-tree-vectorize -o /pnv \
- && $B -fno-tree-slp-vectorize -o /pns \
- && $B -fno-tree-loop-vectorize -o /pnl \
- && $B -fno-tree-vectorize -falign-loops=64 -falign-functions=64 -o /pal \
- && $B -fno-tree-vectorize -fno-unroll-loops -fno-peel-loops -o /pnu \
- && g++ -std=c++20 -O2 -static -pthread -o /expand /tools/expand.cpp \
- && strip /p /pnv /pns /pnl /pal /pnu /expand
+ && $B -DSS_DW=13 -o /p13 \
+ && $B -DSS_DW=15 -o /p15 \
+ && $B -DSS_CW=8 -o /pc8 \
+ && $B -DSS_CW=12 -o /pc12 \
+ && strip /p /p13 /p15 /pc8 /pc12
 
 FROM debian:bookworm-slim
-COPY --from=build /p /pnv /pns /pnl /pal /pnu /expand /
+COPY --from=gen /g/target/release/generate /generate
+COPY --from=build /p /p13 /p15 /pc8 /pc12 /
 COPY probe/probe.sh /probe.sh
 CMD ["/bin/sh", "/probe.sh"]

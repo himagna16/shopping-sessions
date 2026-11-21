@@ -1,9 +1,9 @@
 #!/bin/sh
-# Diagnostic run (never scored): vectorization and alignment options, and
-# bucket counts at 60M events. Built with GCC 15.
+# Diagnostic run (never scored): the dense path against the general one on a
+# dataset the organizers' generator writes here, at the practice size.
 # Output stays under ~1,900 characters.
 exec 1>&2
-D="${DATA_DIR:-/data}"; S="${SCRATCH_DIR:-/scratch}"
+S="${SCRATCH_DIR:-/scratch}"
 START=$(date +%s)
 one() {   # one run -> "wall total parse dedup people parse_cpu links user sys"
   data="$1"; bin="$2"; shift 2
@@ -13,67 +13,52 @@ one() {   # one run -> "wall total parse dedup people parse_cpu links user sys"
   t1=$(date +%s%N)
   awk -v w=$(( (t1 - t0) / 1000000 )) -v rc=$rc '/^user/{u=$2*1000; s=$4*1000} /^threads/{printf "%d %d %d %d %d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000, $23*1000, $NF*1000, u, s} END{if (rc) printf " rc%d", rc}' "$S/err"
 }
-r() {     # best of 3 by wall -> "wall total parse dedup people parse_cpu"
+r() {     # best of 3 by wall -> "wall total parse dedup people parse_cpu links user sys"
   label="$1"; shift
   best=""; bw=999999
   for i in 1 2 3; do
     line=$(one "$@"); w=${line%% *}
     if [ -n "$w" ] && [ "$w" -lt "$bw" ]; then bw=$w; best="$line"; fi
   done
-  echo "$label $(echo "$best" | cut -d' ' -f1-6)"
-}
-p() {     # parse only: best of 3 by parse cpu -> "parse parse_cpu"
-  label="$1"; shift
-  best=""; bc=999999
-  for i in 1 2 3; do
-    line=$(one "$@"); c=$(echo "$line" | awk '{print $6}')
-    if [ -n "$c" ] && [ "$c" -lt "$bc" ]; then bc=$c; best=$(echo "$line" | awk '{print $3, $6}'); fi
-  done
   echo "$label $best"
 }
-st() {    # steps inside dedup and people, ms of thread time, from the last of 2 runs
-  label="$1"; shift
-  one "$@" > /dev/null; one "$@" > /dev/null
-  awk -v l="$label" '/^steps/{printf "%s tab %d mov %d | key %d ord %d clk %d walk %d fin %d\n", l, $5*1000, $7*1000, $11*1000, $13*1000, $15*1000, $17*1000, $19*1000}' "$S/err"
+dl() {    # the dense path's own line from the last run, numbers only (ms)
+  awk -v l="$1" '/^dense \|/{printf "%s set %.1f hand %s cpu pl %d sw %d wk %d st %d wall se %.1f wk %.1f jn %.1f st %.1f\n", l, $4*1000, $27, $42*1000, $44*1000, $46*1000, $48*1000, $52*1000, $54*1000, $56*1000, $58*1000}' "$S/err"
 }
 sum() {   # one thread, so the files do not depend on timing: a digest of everything written
   label="$1"; shift
   one "$@" SS_THREADS=1 > /dev/null
   echo "$label $(cd "$S/out" && find . -type f | sort | xargs cat | sha256sum | cut -c1-12) $(find "$S/out" -type f | wc -l)"
 }
-/expand "$D" "$S/b" "${PROBE_A:-20}"
+E="${PROBE_E:-20000000}"
+/generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s $(du -sm "$S/b" | cut -f1)MB"
 B="$S/b"
 for round in 1 2; do
-r def "$B" /p
-r novec "$B" /pnv
-r noslp "$B" /pns
-r noloop "$B" /pnl
-r align "$B" /pal
-r nounr "$B" /pnu
+r dense "$B" /p
+dl " "
+r gen "$B" /p SS_DENSE=0
 done
-r as150 "$B" /pnv SS_ASPACE=150
-r as125 "$B" /pnv SS_ASPACE=125
-r as300 "$B" /pnv SS_ASPACE=300
-st steps "$B" /pnv
-st as125 "$B" /pnv SS_ASPACE=125
-r a10 "$B" /pnv SS_ABITS=10
-r b10 "$B" /pnv SS_BBITS=10
-r a10b10 "$B" /pnv SS_ABITS=10 SS_BBITS=10
+r dw13 "$B" /p13
+dl " "
+r dw15 "$B" /p15
+dl " "
+r cw8 "$B" /pc8
+r cw12 "$B" /pc12
+r pread "$B" /p SS_MMAP=0
+r t7 "$B" /p SS_THREADS=7
+r b8 "$B" /p SS_BBITS=8
 echo "t=$(( $(date +%s) - START ))s"
-rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
-for round in 1 2; do
-r 60def "$B" /p
-r 60novec "$B" /pnv
-done
-r 60a11 "$B" /pnv SS_ABITS=11
-r 60b11 "$B" /pnv SS_BBITS=11
-r 60b10 "$B" /pnv SS_BBITS=10
-r 60a11b11 "$B" /pnv SS_ABITS=11 SS_BBITS=11
-r 60a11b10 "$B" /pnv SS_ABITS=11 SS_BBITS=10
-r 60as150 "$B" /pnv SS_ASPACE=150
-r 60as125 "$B" /pnv SS_ASPACE=125
-st 60steps "$B" /pnv
-st 60b10 "$B" /pnv SS_BBITS=10
-st 60as125 "$B" /pnv SS_ASPACE=125
+rm -rf "$S/b"
+if [ "$G" -le 22 ]; then
+E3=$(( E * 3 ))
+/generate --seed 9 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
+B="$S/c"
+r 60dense "$B" /p
+dl " "
+r 60gen "$B" /p SS_DENSE=0
+r 60dw15 "$B" /p15
+dl " "
+r 60dense "$B" /p
+fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1

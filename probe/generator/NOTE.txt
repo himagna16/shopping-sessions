@@ -1,0 +1,4 @@
+This folder is the organizers' dataset generator (Shopping Sessions track,
+Builders Buildathon), copied unchanged from the track materials. It is used
+only by the diagnostic image on this branch, to write a full-size dataset on
+the scoring machine. It is not part of the entry.
