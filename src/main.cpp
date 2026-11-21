@@ -28,6 +28,9 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -40,10 +43,13 @@
 #include "parquet.h"
 
 #ifndef SS_UNIT
-#define SS_UNIT 64          // bytes staged per bucket before they are moved to its block chain
+#define SS_UNIT 128         // bytes staged per bucket before they are moved to its block chain
 #endif
 #ifndef SS_X
 #define SS_X 0            // measurement builds only: skip one step (see probe branch)
+#endif
+#ifndef SS_LVL
+#define SS_LVL 0          // measurement builds only: stop the event row handler after step N
 #endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
@@ -813,15 +819,24 @@ struct AliasMap {
         filter = (u64*)calloc(bits / 64, 8);
         if (!filter) die("out of memory for the alias filter");
         filter_shift = 64 - __builtin_ctzll(bits);
-        for (auto& entry : entries) {
-            u64 h = mix64(entry.first);
+        // Inserts land all over a table far larger than the cache, so the
+        // slots are requested a batch ahead of being written.
+        const size_t AHEAD = 32;
+        for (size_t i = 0; i < entries.size(); i++) {
+            if (i + AHEAD < entries.size()) {
+                u64 ahead = mix64(entries[i + AHEAD].first);
+                __builtin_prefetch(&slots[ahead >> shift], 1);
+                __builtin_prefetch(&filter[(ahead >> filter_shift) >> 6], 1);
+            }
+            u64 h = mix64(entries[i].first);
             u64 at = h >> shift;
             while (slots[at].key) at = (at + 1) & mask;
-            slots[at] = {entry.first, entry.second};
+            slots[at] = {entries[i].first, entries[i].second};
             u64 bit = h >> filter_shift;
             filter[bit >> 6] |= 1ULL << (bit & 63);
         }
     }
+    inline void prefetch_filter(u64 hash) const { __builtin_prefetch(&filter[(hash >> filter_shift) >> 6]); }
     // False means the key is certainly not an alias.
     inline bool maybe(u64 hash) const {
         u64 bit = hash >> filter_shift;
@@ -845,6 +860,45 @@ struct AliasMap {
     }
 };
 
+// Resolves user IDs to people a fixed distance behind where they were queued:
+// the filter word is requested when an item arrives, tested DIST items later,
+// and for a likely alias the table slot is requested then and read DIST items
+// after that. Both memory accesses are thus under way long before they are needed.
+template <class T, class Emit>
+struct Resolver {
+    static const u32 DIST = 16, SIZE = 64;          // SIZE is a power of two above DIST
+    const AliasMap& alias;
+    Emit emit;                                       // emit(person, item)
+    T a_item[SIZE]; u64 a_hash[SIZE]; u64 a_key[SIZE];
+    T b_item[SIZE]; u64 b_hash[SIZE]; u64 b_key[SIZE];
+    u32 a_in = 0, a_out = 0, b_in = 0, b_out = 0;
+
+    Resolver(const AliasMap& map, Emit e) : alias(map), emit(e) {}
+    inline void step_b() {
+        u32 i = b_out++ & (SIZE - 1);
+        emit(alias.person_hashed(b_key[i], b_hash[i]), b_item[i]);
+    }
+    inline void step_a() {
+        u32 i = a_out++ & (SIZE - 1);
+        if (!alias.maybe(a_hash[i])) { emit(a_key[i], a_item[i]); return; }     // not an alias: the ID is the person
+        alias.prefetch_hash(a_hash[i]);
+        u32 j = b_in++ & (SIZE - 1);
+        b_item[j] = a_item[i]; b_hash[j] = a_hash[i]; b_key[j] = a_key[i];
+        if (b_in - b_out > DIST) step_b();
+    }
+    inline void push(u64 key, const T& item) {
+        const u64 hash = mix64(key);
+        alias.prefetch_filter(hash);
+        u32 i = a_in++ & (SIZE - 1);
+        a_item[i] = item; a_hash[i] = hash; a_key[i] = key;
+        if (a_in - a_out > DIST) step_a();
+    }
+    void finish() {
+        while (a_out != a_in) step_a();
+        while (b_out != b_in) step_b();
+    }
+};
+
 struct Links {
     std::vector<std::pair<u64, u64>> pairs;
 
@@ -853,22 +907,24 @@ struct Links {
     void solve(AliasMap& out) {
         size_t cap = 16;
         while (cap < pairs.size() * 4) cap <<= 1;
-        std::vector<u32> table(cap, 0);            // index + 1 into ids
+        struct Slot { u64 key; u32 index; u32 used; };
+        std::vector<Slot> table(cap);              // zero-initialised: used == 0 means empty
         std::vector<u64> ids;
         std::vector<u32> parent;
         ids.reserve(pairs.size() * 2);
-        u64 mask = cap - 1;
+        parent.reserve(pairs.size() * 2);
+        const u64 mask = cap - 1;
         auto index_of = [&](u64 key) -> u32 {
             u64 at = mix64(key) & mask;
             for (;;) {
-                u32 slot = table[at];
-                if (!slot) {
+                Slot& slot = table[at];
+                if (!slot.used) {
+                    slot = {key, u32(ids.size()), 1};
                     ids.push_back(key);
-                    parent.push_back(u32(ids.size() - 1));
-                    table[at] = u32(ids.size());
-                    return u32(ids.size() - 1);
+                    parent.push_back(slot.index);
+                    return slot.index;
                 }
-                if (ids[slot - 1] == key) return slot - 1;
+                if (slot.key == key) return slot.index;
                 at = (at + 1) & mask;
             }
         };
@@ -876,14 +932,20 @@ struct Links {
             while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
             return x;
         };
-        for (auto& pair : pairs) {
-            u32 a = find(index_of(pair.first)), b = find(index_of(pair.second));
+        const size_t AHEAD = 16;
+        for (size_t i = 0; i < pairs.size(); i++) {
+            if (i + AHEAD < pairs.size()) {
+                __builtin_prefetch(&table[mix64(pairs[i + AHEAD].first) & mask], 1);
+                __builtin_prefetch(&table[mix64(pairs[i + AHEAD].second) & mask], 1);
+            }
+            u32 a = find(index_of(pairs[i].first)), b = find(index_of(pairs[i].second));
             if (a == b) continue;
             // The root is always the byte-wise smallest ID, so it is the person's name.
             if (id_less(ids[b], ids[a], 'u')) std::swap(a, b);
             parent[b] = a;
         }
         std::vector<std::pair<u64, u64>> entries;
+        entries.reserve(ids.size());
         for (u32 i = 0; i < ids.size(); i++) {
             u32 root = find(i);
             if (root != i) entries.emplace_back(ids[i], ids[root]);
@@ -897,7 +959,10 @@ struct Config {
     std::string data, out;
     u32 threads = 8;
     size_t chunk = 256 << 10;
-    bool use_mmap = false;
+    // 1: map an input file and parse it in place when it lives in memory (tmpfs);
+    // files on disk are read into buffers, which copes far better with a cold cache.
+    // 0: always read. 2: always map (tests).
+    int use_mmap = 1;
 };
 
 struct Shared {
@@ -919,7 +984,8 @@ struct Shared {
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
     // per thread, indexed campaign * ndays + day
-    struct Totals { std::vector<u32> sessions, purchasing, assisted; std::vector<i64> revenue; };
+    struct Credit { u32 sessions, purchasing; i64 revenue; };
+    struct Totals { std::vector<Credit> credit; std::vector<u32> assisted; };
     std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
     double links_seconds = 0;
@@ -939,7 +1005,13 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
         if (fd < 0) die("cannot open an input file");
         u32 index = u32(sh.files.size());
         const u8* map = nullptr;
-        if (sh.cfg.use_mmap) {
+        bool in_memory = sh.cfg.use_mmap == 2;
+#ifdef __linux__
+        struct statfs fs;
+        if (sh.cfg.use_mmap == 1 && fstatfs(fd, &fs) == 0)
+            in_memory = fs.f_type == 0x01021994 || fs.f_type == 0x858458f6;      // tmpfs, ramfs
+#endif
+        if (in_memory) {
             void* p = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
             if (p != MAP_FAILED) map = (const u8*)p;
         }
@@ -985,12 +1057,12 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.event_tasks[at];
         const u8* buf; size_t start, stop;
         if (!reader.load(sh.files[task.file], task, buf, start, stop)) continue;
-#if SS_PROBE == 1
+#if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
         scan_rows<7>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
-#if SS_PROBE == 2
-            sink += (commas[0] + nl + quotes + line) & 0; return;
+#if SS_LVL == 2
+            sink += commas[0] + commas[5] + nl + quotes + line; return;
 #endif
             const u8 *s0 = buf + line, *e0 = buf + commas[0];
             const u8 *s1 = e0 + 1, *e1 = buf + commas[1];
@@ -1002,17 +1074,29 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1) UNQUOTE(s2, e2) UNQUOTE(s3, e3) UNQUOTE(s4, e4) UNQUOTE(s5, e5) UNQUOTE(s6, e6)
             if (wrapped != quotes || s0 == e0) return;          // malformed, or no event_id
+#if SS_LVL == 3
+            sink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3) + size_t(e4 - s4) + size_t(e5 - s5) + size_t(e6 - s6); return;
+#endif
 
             RecA rec;
             rec.ekey = pack_id(s0, size_t(e0 - s0), 'e');
+#if SS_LVL == 4
+            sink += rec.ekey + size_t(e6 - s6); return;
+#endif
             // rules.md: ingest_ts is always valid F1. If it is not, the copy can never be kept.
             i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
             rec.ingest = ingest == TS_BAD ? INT64_MAX : ingest;
             rec.ukey = 0;
             rec.ts = DEAD;
             rec.payload = 0;
+#if SS_LVL == 5
+            sink += rec.ekey + u64(rec.ingest) + size_t(e6 - s6); return;
+#endif
             if (ingest != TS_BAD && s1 != e1 && s5 != e5) {
                 i64 ts = parse_ts(s2, size_t(e2 - s2), dates);
+#if SS_LVL == 6
+                sink += rec.ekey + u64(rec.ingest) + u64(ts) + size_t(e6 - s6); return;
+#endif
                 if (ts != TS_BAD && ts >= ws && ts < we && ingest - ts <= DAY) {
                     size_t kind = size_t(e4 - s4);
                     bool ok = false;
@@ -1040,7 +1124,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
                     }
                 }
             }
-#if SS_PROBE == 3
+#if SS_PROBE == 3 || SS_LVL == 7
             sink += rec.ekey + rec.ukey + rec.ts + rec.payload + u64(rec.ingest); return;
 #endif
             lists.push(u32(mix64(rec.ekey) >> shift), rec);
@@ -1050,16 +1134,21 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 }
 
 static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
-    while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
 #if SS_PROBE == 5
     return;
 #endif
+    while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
     const i64 lo = sh.ws - REACH, hi = sh.we;
     const int shift = 64 - int(sh.bbits);
     const Catalogs& cat = sh.cat;
     const AliasMap& alias = sh.alias;
     Scatter<RecC>& lists = sh.c[tid];
     DateCache dates;
+    struct Pending { u64 ckey; u32 ts; u32 camp; };
+    auto emit = [&lists, shift](u64 person, const Pending& click) {
+        lists.push(u32(mix64(person) >> shift), RecC{person, click.ckey, click.ts, click.camp});
+    };
+    Resolver<Pending, decltype(emit)> resolver(alias, emit);
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
@@ -1080,14 +1169,10 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             if (campaign < 0) return;
             // Copies of a click are identical (rules.md), so they change neither
             // the credited campaign nor the set of assisting campaigns: no dedup.
-            RecC rec;
-            rec.person = alias.person(pack_id(s1, size_t(e1 - s1), 'u'));
-            rec.ckey = pack_id(s0, size_t(e0 - s0), 'k');
-            rec.ts = u32(ts - lo);
-            rec.camp = u32(campaign);
-            lists.push(u32(mix64(rec.person) >> shift), rec);
+            resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
         });
     }
+    resolver.finish();
 }
 
 // ---------------------------------------------------------------- phase 2: dedup
@@ -1099,9 +1184,11 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     std::vector<Block*> blocks;
     std::vector<u64> table;                 // wide slots: (hash tag << 32) | reference
     std::vector<u32> small;                 // narrow slots: (hash tag << 16) | reference
-    static const u32 BATCH = 64;
-    RecA* pending[BATCH];
-    u64 pending_hash[BATCH];
+    struct Survivor { u32 ts; u32 payload; };
+    auto emit = [&out, shift](u64 person, const Survivor& event) {
+        out.push(u32(mix64(person) >> shift), RecB{person, event.ts, event.payload});
+    };
+    Resolver<Survivor, decltype(emit)> resolver(alias, emit);
     for (;;) {
         u32 bucket = u32(sh.next_bucket.fetch_add(1, std::memory_order_relaxed));
         if (bucket >= nbuckets) break;
@@ -1184,35 +1271,18 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         continue;
 #endif
         // Survivors that are valid get their person and move to a person bucket.
-        u32 waiting = 0;
-        auto flush = [&]() {
-            for (u32 k = 0; k < waiting; k++) {
-                RecA* rec = pending[k];
-                RecB row{alias.person_hashed(rec->ukey, pending_hash[k]), rec->ts, rec->payload};
-                out.push(u32(mix64(row.person) >> shift), row);
-            }
-            waiting = 0;
-        };
         for (Block* b : blocks) {
             RecA* recs = Scatter<RecA>::items(b);
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
-                const u64 hash = mix64(recs[i].ukey);
 #if SS_X == 4
-                if (true) {
+                out.push(u32(mix64(recs[i].ukey) >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
 #else
-                if (!alias.maybe(hash)) {                 // not an alias: the ID is the person
+                resolver.push(recs[i].ukey, Survivor{recs[i].ts, recs[i].payload});
 #endif
-                    out.push(u32(hash >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
-                    continue;
-                }
-                alias.prefetch_hash(hash);
-                pending[waiting] = &recs[i];
-                pending_hash[waiting++] = hash;
-                if (waiting == BATCH) flush();
             }
         }
-        flush();
+        resolver.finish();
         // This bucket's blocks are finished with: reuse them for person buckets.
         for (Block* b : blocks) sh.alloc[tid].recycle((u8*)b);
     }
@@ -1303,10 +1373,8 @@ static void process_people(Shared& sh, u32 tid) {
     const i64 ws = sh.ws, day0 = sh.day0;
     const u32 ncat = u32(sh.cat.categories.size());
     Shared::Totals& totals = sh.campaign_totals[tid];
-    totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
-    totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.credit.assign(size_t(ncamp + 1) * ndays, Shared::Credit{0, 0, 0});
     totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
-    totals.revenue.assign(size_t(ncamp + 1) * ndays, 0);
 
     UserWriter writer;
     char name[64];
@@ -1590,10 +1658,10 @@ static void process_people(Shared& sh, u32 tid) {
                     if (right > left) credited = ck[right - 1].camp;
                     for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
                 }
-                const size_t slot = size_t(credited) * ndays + size_t(day);
-                totals.sessions[slot]++;
-                totals.purchasing[slot] += cents > 0;
-                totals.revenue[slot] += cents;
+                Shared::Credit& credit = totals.credit[size_t(credited) * ndays + size_t(day)];
+                credit.sessions++;
+                credit.purchasing += cents > 0;
+                credit.revenue += cents;
             }
             if (cur_day >= 0) emit();
             for (u32 c : active) camp_count[c] = 0;
@@ -1645,10 +1713,10 @@ static void write_campaigns(Shared& sh) {
     const u32 ndays = sh.ndays;
     std::vector<i64> total(size_t(ncamp + 1) * ndays * 4, 0);
     for (auto& part : sh.campaign_totals)
-        for (size_t i = 0; i < part.sessions.size(); i++) {
-            total[i * 4] += part.sessions[i];
-            total[i * 4 + 1] += part.purchasing[i];
-            total[i * 4 + 2] += part.revenue[i];
+        for (size_t i = 0; i < part.credit.size(); i++) {
+            total[i * 4] += part.credit[i].sessions;
+            total[i * 4 + 1] += part.credit[i].purchasing;
+            total[i * 4 + 2] += part.credit[i].revenue;
             total[i * 4 + 3] += part.assisted[i];
         }
     std::vector<u8> ids, channels;
@@ -1704,7 +1772,7 @@ int main() {
     if (cfg.threads > 256) cfg.threads = 256;
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
-    cfg.use_mmap = !env("SS_MMAP", "").empty();
+    cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
 
     {
         std::string text;
@@ -1787,13 +1855,15 @@ int main() {
         file.close();
     }
     double t5 = now();
+    size_t mapped = 0;
+    for (const InputFile& f : sh.files) mapped += f.map != nullptr;
     rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | links %.3f\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), sh.links_seconds);
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links %.3f\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_seconds);
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
