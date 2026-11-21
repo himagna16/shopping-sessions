@@ -1448,28 +1448,22 @@ struct Catalogs {
 // ---------------------------------------------------------------- linked IDs
 // Maps every ID that is not its person's name to that name. An ID absent
 // from the table is its own person.
+static u32 g_alias_space = 200;             // SS_ASPACE: alias map slots per 100 entries
+
 struct AliasMap {
     struct Slot { u64 key, name; };
     Slot* slots = nullptr;
-    u64 mask = 0;
-    int shift = 64;
+    u64 cap = 16;                           // any size: a hash's slot is the high half of hash * cap
     // One bit per hash prefix, about 16 bits an entry: most IDs that are not
     // aliases are answered from this small table without touching `slots`.
     u64* filter = nullptr;
     int filter_shift = 64;
 
+    inline u64 slot_of(u64 hash) const { return u64((unsigned __int128)hash * cap >> 64); }
+
     void build(const std::pair<u64, u64>* entries, size_t count) {
-        size_t cap = 16;
-        while (cap < count * 2) cap <<= 1;
-        size_t bytes = cap * sizeof(Slot);
-        void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (p == MAP_FAILED) die("mmap failed for the alias map");
-#ifdef MADV_HUGEPAGE
-        if (!getenv("SS_NOHUGE")) madvise(p, bytes, MADV_HUGEPAGE);
-#endif
-        slots = (Slot*)p;
-        mask = cap - 1;
-        shift = 64 - __builtin_ctzll(cap);
+        cap = std::max<u64>(16, u64(count) * std::max<u32>(g_alias_space, 110) / 100);
+        slots = big_alloc<Slot>(cap + 1);
         size_t bits = 1 << 16;
         while (bits < count * 16) bits <<= 1;
         filter = big_alloc<u64>(bits / 64);
@@ -1480,12 +1474,12 @@ struct AliasMap {
         for (size_t i = 0; i < count; i++) {
             if (i + AHEAD < count) {
                 u64 ahead = hash64(entries[i + AHEAD].first);
-                __builtin_prefetch(&slots[ahead >> shift], 1);
+                __builtin_prefetch(&slots[slot_of(ahead)], 1);
                 __builtin_prefetch(&filter[(ahead >> filter_shift) >> 6], 1);
             }
             u64 h = hash64(entries[i].first);
-            u64 at = h >> shift;
-            while (slots[at].key) at = (at + 1) & mask;
+            u64 at = slot_of(h);
+            while (slots[at].key) at = at + 1 == cap ? 0 : at + 1;
             slots[at] = {entries[i].first, entries[i].second};
             u64 bit = h >> filter_shift;
             filter[bit >> 6] |= 1ULL << (bit & 63);
@@ -1497,18 +1491,18 @@ struct AliasMap {
         u64 bit = hash >> filter_shift;
         return (filter[bit >> 6] >> (bit & 63)) & 1;
     }
-    inline void prefetch_hash(u64 hash) const { __builtin_prefetch(&slots[hash >> shift]); }
+    inline void prefetch_hash(u64 hash) const { __builtin_prefetch(&slots[slot_of(hash)]); }
     // IDs whose hash starts with the `bits`-bit number `bucket` all sit in one
     // stretch of the table and of the filter. Asking for the whole stretch up
     // front lets the lookups of a bucket's IDs find it in cache.
     void prefetch_bucket(u32 bucket, u32 bits) const {
 #ifndef SS_NOSLICEPF
-        const int table_bits = 64 - shift, filter_bits = 64 - filter_shift;
-        if (table_bits >= int(bits)) {
-            const u64 first = u64(bucket) << (table_bits - int(bits));
-            const u64 bytes = std::min<u64>((sizeof(Slot) << (table_bits - int(bits))) + 256, 1u << 20);
+        const int filter_bits = 64 - filter_shift;
+        {
+            const u64 first = slot_of(u64(bucket) << (64 - bits));
+            const u64 bytes = std::min<u64>(((cap >> bits) + 1) * sizeof(Slot) + 256, 1u << 20);
             const char* base = (const char*)&slots[first];
-            const char* limit = (const char*)(slots + mask + 1);
+            const char* limit = (const char*)(slots + cap);
             for (u64 off = 0; off < bytes && base + off < limit; off += 64) __builtin_prefetch(base + off);
         }
         if (filter_bits >= int(bits) + 6) {
@@ -1523,25 +1517,24 @@ struct AliasMap {
     // True when `key` is in the map; `name` is then its person's name.
     inline bool find(u64 key, u64 hash, u64& name) const {
         if (!maybe(hash)) return false;
-        u64 at = hash >> shift;
+        u64 at = slot_of(hash);
         for (;;) {
             u64 k = slots[at].key;
             if (k == key) { name = slots[at].name; return true; }
             if (!k) return false;
-            at = (at + 1) & mask;
+            at = at + 1 == cap ? 0 : at + 1;
         }
     }
     inline u64 person_hashed(u64 key, u64 hash) const {
-        u64 at = hash >> shift;
+        u64 at = slot_of(hash);
         for (;;) {
             u64 k = slots[at].key;
             if (k == key) return slots[at].name;
             if (!k) return key;
-            at = (at + 1) & mask;
+            at = at + 1 == cap ? 0 : at + 1;
         }
     }
-    inline u64 home(u64 key) const { return hash64(key) >> shift; }
-    inline void prefetch(u64 key) const { __builtin_prefetch(&slots[home(key)]); }
+    inline void prefetch(u64 key) const { __builtin_prefetch(&slots[slot_of(hash64(key))]); }
     inline u64 person(u64 key) const {
         u64 hash = hash64(key);
         return maybe(hash) ? person_hashed(key, hash) : key;
@@ -3147,6 +3140,7 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
+    g_alias_space = u32(std::max(110, atoi(env("SS_ASPACE", "200").c_str())));
     {
         const std::string mode = env("SS_RELEASE", "2");            // 0 never, 1 chunk by chunk, 2 file by file
         g_release_input = mode == "0" ? 0 : mode == "1" ? 1 : 2;
