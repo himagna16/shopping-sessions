@@ -1030,6 +1030,10 @@ struct Catalogs {
     // campaigns
     std::vector<std::string> campaign_ids, channels;
     std::vector<i32> campaign_dense;           // c_<N> -> index, -1 = not in the file
+    // IDs of up to 8 bytes, keyed by their text as one zero-padded word plus the length
+    struct ShortId { u64 text; u32 len; i32 index; };
+    std::vector<ShortId> campaign_short;
+    int campaign_shift = 63;
     std::unordered_map<std::string, i32> campaign_other;
 
     void load(const std::string& dir) {
@@ -1117,6 +1121,19 @@ struct Catalogs {
             if (number >= 0) campaign_dense[size_t(number)] = i32(i);
             else campaign_other[campaign_ids[i]] = i32(i);
         }
+        size_t cap = 16;
+        while (cap < campaign_ids.size() * 4) cap <<= 1;
+        campaign_short.assign(cap, ShortId{0, 0, -1});
+        campaign_shift = 64 - __builtin_ctzll(cap);
+        for (size_t i = 0; i < campaign_ids.size(); i++) {
+            const std::string& id = campaign_ids[i];
+            if (id.empty() || id.size() > 8) continue;
+            u64 text = 0;
+            memcpy(&text, id.data(), id.size());
+            size_t at = hash64(text ^ id.size()) >> campaign_shift;
+            while (campaign_short[at].len) at = (at + 1) & (cap - 1);
+            campaign_short[at] = {text, u32(id.size()), i32(i)};
+        }
     }
 
     inline u32 category(const u8* s, const u8* e) const {
@@ -1140,6 +1157,21 @@ struct Catalogs {
     }
 
     inline i32 campaign(const u8* s, const u8* e) const {
+#if !defined(SS_FORCE_SLOW) && !defined(SS_CAMP1)
+        // The usual case, an ID of 1 to 8 bytes: one masked load, one probe, no loop over its digits.
+        const size_t n = size_t(e - s);
+        if (n - 1 < 8) {
+            const u64 text = rd64(s) & (~0ULL >> (8 * (8 - n)));
+            const size_t mask = campaign_short.size() - 1;
+            size_t at = hash64(text ^ n) >> campaign_shift;
+            for (;;) {
+                const ShortId& slot = campaign_short[at];
+                if (slot.text == text && slot.len == n) return slot.index;
+                if (!slot.len) return -1;
+                at = (at + 1) & mask;
+            }
+        }
+#endif
         if (e - s >= 3 && s[0] == 'c' && s[1] == '_') {
             i64 number = canonical_number(s, e, 2);
             if (number >= 0) return size_t(number) < campaign_dense.size() ? campaign_dense[size_t(number)] : -1;
@@ -1361,8 +1393,7 @@ struct Shared {
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
     // per thread, indexed campaign * ndays + day
-    struct Credit { u32 sessions, purchasing; i64 revenue; };
-    struct Totals { std::vector<Credit> credit; std::vector<u32> assisted; };
+    struct Totals { std::vector<u32> sessions, assisted, purchasing; std::vector<i64> revenue; };
     std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
     double links_seconds = 0;
@@ -1810,8 +1841,10 @@ static void process_people(Shared& sh, u32 tid) {
     const u32 ncat = u32(sh.cat.categories.size());
     const u32 bbits = sh.bbits;
     Shared::Totals& totals = sh.campaign_totals[tid];
-    totals.credit.assign(size_t(ncamp + 1) * ndays, Shared::Credit{0, 0, 0});
+    totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
     totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.revenue.assign(size_t(ncamp + 1) * ndays, 0);
 
     UserWriter writer;
     char name[64];
@@ -2098,10 +2131,9 @@ static void process_people(Shared& sh, u32 tid) {
                     if (right > left) credited = ck[right - 1].camp;
                     for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
                 }
-                Shared::Credit& credit = totals.credit[size_t(credited) * ndays + size_t(day)];
-                credit.sessions++;
-                credit.purchasing += cents > 0;
-                credit.revenue += cents;
+                const size_t slot = size_t(credited) * ndays + size_t(day);
+                totals.sessions[slot]++;
+                if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
             }
             if (cur_day >= 0) emit();
             for (u32 c : active) camp_count[c] = 0;
@@ -2165,10 +2197,10 @@ static void write_campaigns(Shared& sh) {
     const u32 ndays = sh.ndays;
     std::vector<i64> total(size_t(ncamp + 1) * ndays * 4, 0);
     for (auto& part : sh.campaign_totals)
-        for (size_t i = 0; i < part.credit.size(); i++) {
-            total[i * 4] += part.credit[i].sessions;
-            total[i * 4 + 1] += part.credit[i].purchasing;
-            total[i * 4 + 2] += part.credit[i].revenue;
+        for (size_t i = 0; i < part.sessions.size(); i++) {
+            total[i * 4] += part.sessions[i];
+            total[i * 4 + 1] += part.purchasing[i];
+            total[i * 4 + 2] += part.revenue[i];
             total[i * 4 + 3] += part.assisted[i];
         }
     std::vector<u8> ids, channels;
