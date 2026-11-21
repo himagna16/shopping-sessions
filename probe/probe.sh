@@ -1,6 +1,6 @@
 #!/bin/sh
-# Diagnostic run (never scored): linked IDs settled per ID against per record,
-# and compiler options, all built with GCC 15.
+# Diagnostic run (never scored): vectorization and alignment options, and
+# bucket counts at 60M events. Built with GCC 15.
 # Output stays under ~1,900 characters.
 exec 1>&2
 D="${DATA_DIR:-/data}"; S="${SCRATCH_DIR:-/scratch}"
@@ -43,45 +43,31 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 }
 /expand "$D" "$S/b" "${PROBE_A:-20}"
 B="$S/b"
-r nohot "$B" /pnh
+for round in 1 2; do
+r def "$B" /p
 r novec "$B" /pnv
-r id1 "$B" /pid1
-r o2 "$B" /po2
-r clake "$B" /pcl
-r def "$B" /p
-r alias1 "$B" /pa1
-r noslice "$B" /pns
-r route1 "$B" /pr1
-r o2 "$B" /po2
-r clake "$B" /pcl
-r def "$B" /p
-r alias1 "$B" /pa1
-r noslice "$B" /pns
-r route1 "$B" /pr1
-st steps "$B" /p
-st alias1 "$B" /pa1
-st noslice "$B" /pns
-st route1 "$B" /pr1
-st steps "$B" /p
-st alias1 "$B" /pa1
-st noslice "$B" /pns
-r a12 "$B" /p SS_ABITS=12
-r a10 "$B" /p SS_ABITS=10
-r b12 "$B" /p SS_BBITS=12
-r b10 "$B" /p SS_BBITS=10
-p pdef "$B" /p
-p palias1 "$B" /pa1
-one "$B" /p > /dev/null; grep -E '^user' "$S/err" | cut -c1-60
-sum sha "$B" /p
-sum sha1 "$B" /pa1
+r noslp "$B" /pns
+r noloop "$B" /pnl
+r align "$B" /pal
+r nounr "$B" /pnu
+done
+r a10 "$B" /pnv SS_ABITS=10
+r b10 "$B" /pnv SS_BBITS=10
+r a10b10 "$B" /pnv SS_ABITS=10 SS_BBITS=10
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
+for round in 1 2; do
 r 60def "$B" /p
-r 60alias1 "$B" /pa1
-r 60o2 "$B" /po2
-r 60clake "$B" /pcl
-st 60steps "$B" /p
-st 60alias1 "$B" /pa1
-one "$B" /p > /dev/null; grep -E '^user' "$S/err" | cut -c1-60
+r 60novec "$B" /pnv
+done
+r 60a11 "$B" /pnv SS_ABITS=11
+r 60b11 "$B" /pnv SS_BBITS=11
+r 60b10 "$B" /pnv SS_BBITS=10
+r 60a11b11 "$B" /pnv SS_ABITS=11 SS_BBITS=11
+r 60a11b10 "$B" /pnv SS_ABITS=11 SS_BBITS=10
+r 60a13 "$B" /pnv SS_ABITS=13
+st 60steps "$B" /pnv
+st 60b10 "$B" /pnv SS_BBITS=10
+st 60a11 "$B" /pnv SS_ABITS=11
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
