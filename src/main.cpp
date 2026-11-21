@@ -179,7 +179,7 @@ static u64 intern_id(const u8* p, size_t n) {
 // Lean form: an ID that is its column's letter plus 1 to 8 ASCII bytes (none
 // NUL) is keyed by those bytes as loaded, zero-padded. Byte order is then the
 // order of the byte-swapped keys.
-static inline u64 pack_id(const u8* p, size_t n, u8 prefix) {
+static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8 prefix) {
 #ifndef SS_FORCE_SLOW
     if (p[0] == prefix && n - 2 < 8) {
         const u64 mask = ~0ULL >> (8 * (9 - n));
