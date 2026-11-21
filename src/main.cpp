@@ -2488,6 +2488,9 @@ static void process_people(Shared& sh, u32 tid) {
     hvec<u32> cat_touched;
     hvec<u32> camp_count(ncamp + 1, 0), camp_slot(ncamp + 1, 0), active;
     hvec<u32> stamp(ncamp + 1, 0);                     // last session that counted this campaign as an assist
+    // For a person with many clicks: the sessions so far cut into runs of one day
+    // each (the day, and the number of the run's first session).
+    hvec<u32> run_day(ndays + 2, 0), run_first(ndays + 2, 0);
     u32 session_id = 0;
     u64 rows = 0;
 
@@ -2663,6 +2666,24 @@ static void process_people(Shared& sh, u32 tid) {
                 rows++;
             };
             u32 left = 0, right = 0;
+#ifndef SS_ASSIST1
+            // A campaign assists every session from the one where its first click comes
+            // into reach to the one where its last click drops out. Counting that span
+            // when it ends, a day at a time, replaces one addition per campaign in reach
+            // per session. Sessions are numbered from 0 in time order (`ord` is the next
+            // number); camp_slot holds the number at which a campaign's span began.
+            u32 ord = 0, nruns = 0;
+            auto close_span = [&](u32 c, u32 from) {
+                u32 upper = ord;                                  // sessions [from, ord) had this campaign in reach
+                for (u32 j = nruns; j-- > 0;) {
+                    const u32 first = run_first[j];
+                    const u32 lo = from > first ? from : first;
+                    if (upper > lo) totals.assisted[size_t(c) * ndays + run_day[j]] += upper - lo;
+                    upper = first;
+                    if (first <= from) break;
+                }
+            };
+#endif
             // One session: first event at `start`, last at `last` (ms from window_start).
             auto session = [&](u32 start, u32 last, u32 nevents) SS_WALK {
 #if SS_X == 9
@@ -2702,6 +2723,19 @@ static void process_people(Shared& sh, u32 tid) {
                     if (best >= 0) credited = ck[best].camp;
                 } else {
                     const u64 hi = u64(start) + u64(REACH);
+#ifndef SS_ASSIST1
+                    while (right < m && ck[right].ts <= hi) {
+                        u32 c = ck[right++].camp;
+                        if (camp_count[c]++ == 0) camp_slot[c] = ord;
+                    }
+                    while (left < right && ck[left].ts < start) {
+                        u32 c = ck[left++].camp;
+                        if (--camp_count[c] == 0) close_span(c, camp_slot[c]);
+                    }
+                    if (right > left) credited = ck[right - 1].camp;
+                    if (nruns == 0 || run_day[nruns - 1] != u32(day)) { run_day[nruns] = u32(day); run_first[nruns] = ord; nruns++; }
+                    ord++;
+#else
                     while (right < m && ck[right].ts <= hi) {
                         u32 c = ck[right++].camp;
                         if (camp_count[c]++ == 0) { camp_slot[c] = u32(active.size()); active.push_back(c); }
@@ -2717,6 +2751,7 @@ static void process_people(Shared& sh, u32 tid) {
                     }
                     if (right > left) credited = ck[right - 1].camp;
                     for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
+#endif
                 }
                 const size_t slot = size_t(credited) * ndays + size_t(day);
                 totals.sessions[slot]++;
@@ -2759,8 +2794,15 @@ static void process_people(Shared& sh, u32 tid) {
                 prev_slice = slice;
             }
             if (cur_day >= 0) emit();
+#ifndef SS_ASSIST1
+            for (u32 k = left; k < right; k++) {                  // the spans still open at the person's last session
+                const u32 c = ck[k].camp;
+                if (camp_count[c]) { close_span(c, camp_slot[c]); camp_count[c] = 0; }
+            }
+#else
             for (u32 c : active) camp_count[c] = 0;
             active.clear();
+#endif
         }
         const double step4 = now();
         steps[2] += step1 - step0;
