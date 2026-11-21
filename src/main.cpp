@@ -51,7 +51,7 @@
 // Build variants kept for measurement. Defaults: the block-level quote scanner
 // and the sortable ingest key. SS_SCAN1 / SS_SCAN2 select the older scanners,
 // SS_ING1 the full ingest_ts conversion.
-#if !defined(SS_SCAN1) && !defined(SS_SCAN2) && !defined(SS_SCAN3)
+#if !defined(SS_SCAN1) && !defined(SS_SCAN2) && !defined(SS_SCAN3) && !defined(SS_SCAN4)
 #define SS_SCAN3
 #endif
 #if !defined(SS_ING1) && !defined(SS_ING2)
@@ -492,7 +492,136 @@ static inline Masks classify(const u8* p) {
 // every line that starts in [start, stop) and has exactly NF fields. buf[start]
 // starts a line; `last` is the index of the first '\n' at or after stop - 1,
 // which ends the last such line; 64 readable bytes follow it.
-#ifdef SS_SCAN3
+#ifdef SS_SCAN4
+static inline u32 tz64(u64 x) {
+#if defined(__BMI__)
+    return u32(_tzcnt_u64(x));
+#else
+    return x ? u32(__builtin_ctzll(x)) : 64;
+#endif
+}
+
+// Calls row(starts, newline) for every line that starts in [start, stop) and has
+// exactly NF well-formed fields; starts[i] is where field i's content begins
+// (past an opening quote), and the byte before it is a quote exactly when the
+// field is quoted.
+//
+// Per 64-byte block, with S the separators (commas and newlines) and Q the
+// quotes: a quote directly after a separator opens a field; any other quote
+// must close one, so the next byte must be a separator; an opener must not be
+// followed by a separator (a field that is one quote); and a field that opened
+// with a quote must end with one. The last test uses one addition: adding the
+// openers to ~S makes a carry run through each opened field's bytes and stop on
+// the separator that ends it, marking exactly the separators that end quoted
+// fields. Lines with any fault, or the wrong field count, are decided byte by
+// byte, so the result is exact.
+template <int NF, class Row>
+static inline SS_INLINE void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
+    if (start >= stop) return;
+    enum { BLOCKS = 16, CAP = BLOCKS * 64 + 2 * NF + 48 };
+    u32 sp[CAP];                            // content start of every field, in order
+    u32 nlp[BLOCKS * 64 + 8];               // newline positions of this batch
+    u32 bp[BLOCKS * 64 + 8];                // fault positions of this batch
+    u32 n = 0;
+    u64 after_sep = 1;                      // the byte before `start` is a newline
+    u64 after_open = 0, after_other = 0, carry = 0;
+    bool carry_bad = false;                 // the unfinished line already has a fault
+    size_t line = start;
+    size_t block = start;
+    for (;;) {
+        u32 newlines = 0, faults = 0;
+        for (u32 done = 0; done < BLOCKS && block <= last; done++, block += 64) {
+#ifndef SS_NOSCANPF
+            __builtin_prefetch(buf + block + 1024);
+#endif
+            const Masks m = classify(buf + block);
+            const u64 S = m.comma | m.nl, Q = m.quote;
+            const u64 first = (S << 1) | after_sep;             // first byte of each field
+            const u64 open = Q & first, other = Q & ~first;
+            const u64 u = (open << 1) | after_open;             // byte after an opening quote
+            const u64 t = (other << 1) | after_other;           // byte after any other quote
+            const u64 plain = ~S;
+            const u64 partial = plain + open;
+            const u64 sum = partial + carry;
+            carry = u64(partial < plain) | u64(sum < partial);
+            u64 bad = (t & ~S) | (u & S) | ((sum ^ (t | u)) & S);
+            u64 starts = (first & ~Q) | u;
+            after_sep = S >> 63;
+            after_open = open >> 63;
+            after_other = other >> 63;
+            const u32 base = u32(block);
+
+            const u32 count = u32(__builtin_popcountll(starts));
+            u32* out = sp + n;
+            for (int i = 0; i < 8; i++) { out[i] = base + tz64(starts); starts &= starts - 1; }
+            if (count > 8) {
+                for (int i = 8; i < 16; i++) { out[i] = base + tz64(starts); starts &= starts - 1; }
+                for (u32 i = 16; i < count; i++) { out[i] = base + tz64(starts); starts &= starts - 1; }
+            }
+            n += count;
+
+            u64 nl = m.nl;
+            const u32 lines = u32(__builtin_popcountll(nl));
+            nlp[newlines] = base + tz64(nl); nl &= nl - 1;
+            nlp[newlines + 1] = base + tz64(nl); nl &= nl - 1;
+            for (u32 i = 2; i < lines; i++) { nlp[newlines + i] = base + tz64(nl); nl &= nl - 1; }
+            newlines += lines;
+
+            for (; bad; bad &= bad - 1) bp[faults++] = base + u32(__builtin_ctzll(bad));
+        }
+        for (int i = 0; i <= NF; i++) sp[n + i] = 0xFFFFFFFFu;  // so that a look past the end reads "beyond any line"
+        bp[faults] = 0xFFFFFFFFu;
+        u32 k = 0, b = 0;
+        for (u32 j = 0; j < newlines; j++) {
+            const u32 nl = nlp[j];
+            if (__builtin_expect((sp[k + NF - 1] <= nl) & (sp[k + NF] > nl) & (bp[b] > nl) & !carry_bad, 1)) {
+                row(sp + k, nl);
+                k += NF;
+            } else {
+                // A fault or the wrong number of fields: decide this line exactly from its bytes.
+                u32 ls[NF + 1];
+                const u8* a = buf + line;
+                const u8* end = buf + nl;
+                int f = 0;
+                bool ok = true;
+                for (;;) {
+                    const u8* comma = (const u8*)memchr(a, ',', size_t(end - a));
+                    const u8* stop_at = comma ? comma : end;
+                    if (f == NF) { ok = false; break; }
+                    u32 wrapped = 0;
+                    if (memchr(a, '"', size_t(stop_at - a))) {
+                        if (stop_at - a < 2 || a[0] != '"' || stop_at[-1] != '"' || memchr(a + 1, '"', size_t(stop_at - a - 2))) { ok = false; break; }
+                        wrapped = 1;
+                    }
+                    ls[f++] = u32(a - buf) + wrapped;
+                    if (!comma) break;
+                    a = comma + 1;
+                }
+                if (ok && f == NF) row(ls, nl);
+                while (sp[k] <= nl) k++;
+                while (bp[b] <= nl) b++;
+                carry_bad = false;
+            }
+            line = size_t(nl) + 1;
+            if (nl >= last) return;
+        }
+        if (block > last && !newlines) return;                  // cannot happen: `last` is a newline
+        // Keep the unfinished line's starts; beyond NF + 1 the line is malformed anyway.
+        carry_bad = carry_bad || b < faults;
+        u32 keep = n - k;
+        if (keep > u32(NF) + 2) keep = u32(NF) + 2;
+        memmove(sp, sp + k, keep * sizeof(u32));
+        n = keep;
+    }
+}
+
+// Handlers receive the content starts and the newline; a field is quoted exactly
+// when the byte before its start is a quote, and its end follows from the next start.
+#define ROW_PARAMS const u32* a, u32 nlpos
+#define QUOTED(i) const u32 q##i = u32(buf[a[i] - 1] == '"');
+#define FIELD(i, j) const u8 *s##i = buf + a[i], *e##i = buf + a[j] - q##j - 1 - q##i;
+#define FIELD_LAST(i) const u8 *s##i = buf + a[i], *e##i = buf + nlpos - q##i;
+#elif defined(SS_SCAN3)
 static inline u32 tz64(u64 x) {
 #if defined(__BMI__)
     return u32(_tzcnt_u64(x));
@@ -1469,7 +1598,10 @@ static void parse_links(Shared& sh, Reader& reader) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
         scan_rows<2>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-#ifdef SS_SCAN3
+#if defined(SS_SCAN4)
+            QUOTED(0) QUOTED(1)
+            FIELD(0, 1) FIELD_LAST(1)
+#elif defined(SS_SCAN3)
             FIELD(0) FIELD(1)
 #else
             const u8 *s0 = buf + line, *e0 = buf + commas[0], *s1 = e0 + 1, *e1 = buf + nl;
@@ -1509,7 +1641,13 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
         continue;
 #endif
         scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-#ifdef SS_SCAN3
+#if defined(SS_SCAN4)
+#if SS_LVL == 2
+            sink += a[0] + a[6] + nlpos; return;
+#endif
+            QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3) QUOTED(4) QUOTED(5) QUOTED(6)
+            FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD(3, 4) FIELD(4, 5) FIELD(5, 6) FIELD_LAST(6)
+#elif defined(SS_SCAN3)
 #if SS_LVL == 2
             sink += fs[0] + fe[6]; return;
 #endif
@@ -1651,7 +1789,10 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
         scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-#ifdef SS_SCAN3
+#if defined(SS_SCAN4)
+            QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3)
+            FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD_LAST(3)
+#elif defined(SS_SCAN3)
             FIELD(0) FIELD(1) FIELD(2) FIELD(3)
 #else
             const u8 *s0 = buf + line, *e0 = buf + commas[0];
