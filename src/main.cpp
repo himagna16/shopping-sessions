@@ -1934,6 +1934,18 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     if (sink == 1) fprintf(stderr, "sink\n");
 }
 
+// Record blocks are 8 KB pieces strung into lists, so the hardware prefetcher
+// starts cold at every block. Asking for the first lines of the next block
+// while the current one is processed covers the gap.
+static inline void prefetch_block(const void* block) {
+#ifndef SS_NOBLOCKPF
+    if (!block) return;
+    for (int k = 0; k < 4; k++) __builtin_prefetch((const char*)block + 64 * k);
+#else
+    (void)block;
+#endif
+}
+
 // Where the time inside phases 2 and 3 goes: CPU seconds per step, per thread.
 // Two clock reads per step per bucket; printed with the other figures on stderr.
 static double g_steps[256][8];
@@ -1978,6 +1990,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             const int index_shift = 64 - __builtin_ctzll(cap), tag_shift = int(abits) + __builtin_ctzll(cap);
             for (u32 bi = 0; bi < blocks.size(); bi++) {
                 RecA* recs = Scatter<RecA>::items(blocks[bi]);
+                if (bi + 1 < blocks.size()) prefetch_block(blocks[bi + 1]);
                 for (u32 i = 0; i < blocks[bi]->n; i++) {
                     RecA& rec = recs[i];
                     const u64 m = hash64(rec.ekey);
@@ -2010,6 +2023,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             const int index_shift = 64 - __builtin_ctzll(cap), tag_shift = int(abits) + __builtin_ctzll(cap);
             for (u32 bi = 0; bi < blocks.size(); bi++) {
                 RecA* recs = Scatter<RecA>::items(blocks[bi]);
+                if (bi + 1 < blocks.size()) prefetch_block(blocks[bi + 1]);
                 for (u32 i = 0; i < blocks[bi]->n; i++) {
                     RecA& rec = recs[i];
                     const u64 m = hash64(rec.ekey);
@@ -2550,6 +2564,7 @@ static void process_people(Shared& sh, u32 tid) {
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = sh.b[t].head[bucket]; b; b = b->next) {
                 const RecB* recs = Scatter<RecB>::items(b);
+                prefetch_block(b->next);
                 for (u32 i = 0; i < b->n; i++) {
                     const u32 who = number(recs[i].person);
                     const u32 ts = recs[i].ts;
@@ -2591,6 +2606,7 @@ static void process_people(Shared& sh, u32 tid) {
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
                 const RecC* recs = Scatter<RecC>::items(b);
+                prefetch_block(b->next);
                 for (u32 i = 0; i < b->n; i++) {
                     i64 id = lookup(recs[i].person);
                     if (id >= 0) {
