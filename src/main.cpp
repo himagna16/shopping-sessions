@@ -999,6 +999,51 @@ static T* big_alloc(size_t count) {
     return (T*)aligned;
 }
 
+// The working tables of phases 2 and 3 (dedup slots, sort keys, counters, the
+// output columns) are std::vectors on this allocator: anything of a page or
+// more comes from a per-thread region on 2 MB pages and is never handed back
+// (a vector that grows leaves its old storage behind, at most as much again).
+// On the scoring machine a small-page miss costs far more than a large-page one.
+struct HugeRegion { u8* cur = nullptr; u8* end = nullptr; };
+static thread_local HugeRegion t_huge;
+static void* huge_take(size_t bytes) {
+    bytes = (bytes + 63) & ~size_t(63);
+    HugeRegion& a = t_huge;
+    if (size_t(a.end - a.cur) < bytes) {
+        const size_t huge = 2u << 20;
+        const size_t region = (std::max<size_t>(bytes, 16u << 20) + huge - 1) & ~(huge - 1);
+        a.cur = big_alloc<u8>(region);
+        a.end = a.cur + region;
+    }
+    void* p = a.cur;
+    a.cur += bytes;
+    return p;
+}
+template <class T>
+struct Huge {
+    using value_type = T;
+    Huge() = default;
+    template <class U> Huge(const Huge<U>&) {}
+    T* allocate(size_t n) {
+        const size_t bytes = n * sizeof(T);
+#ifndef SS_NOHUGEVEC
+        if (bytes >= 4096) return (T*)huge_take(bytes);
+#endif
+        void* p = malloc(bytes ? bytes : 1);
+        if (!p) die("out of memory");
+        return (T*)p;
+    }
+    void deallocate(T* p, size_t n) {
+#ifndef SS_NOHUGEVEC
+        if (n * sizeof(T) >= 4096) return;
+#endif
+        free(p);
+    }
+    template <class U> bool operator==(const Huge<U>&) const { return true; }
+    template <class U> bool operator!=(const Huge<U>&) const { return false; }
+};
+template <class T> using hvec = std::vector<T, Huge<T>>;
+
 // ---------------------------------------------------------------- arena and scatter lists
 static const size_t SLAB = 2u << 20;
 static const size_t BLOCK = 8192;
@@ -1586,7 +1631,7 @@ struct Shared {
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
     // per thread, indexed campaign * ndays + day
-    struct Totals { std::vector<u32> sessions, assisted, purchasing; std::vector<i64> revenue; };
+    struct Totals { hvec<u32> sessions, assisted, purchasing; hvec<i64> revenue; };
     std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
     double links_seconds = 0, links_parse = 0, links_union = 0;
@@ -1864,8 +1909,8 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     const AliasMap& alias = sh.alias;
     Scatter<RecB>& out = sh.b[tid];
     std::vector<Block*> blocks;
-    std::vector<u64> table;                 // wide slots: (hash tag << 32) | reference
-    std::vector<u32> small;                 // narrow slots: (hash tag << 16) | reference
+    hvec<u64> table;                        // wide slots: (hash tag << 32) | reference
+    hvec<u32> small;                        // narrow slots: (hash tag << 16) | reference
     struct Survivor { u32 ts; u32 payload; };
     auto emit = [&out, shift](u64 person, u64 hash, const Survivor& event) {
         out.push(u32(hash >> shift), RecB{person, event.ts, event.payload});
@@ -1986,9 +2031,9 @@ struct UserWriter {
     bool opened = false;
     std::string path;
     u32 n = 0;
-    std::vector<u8> ids, cats, nulls;
-    std::vector<i32> days, sessions, events;
-    std::vector<i64> revenue;
+    hvec<u8> ids, cats, nulls;
+    hvec<i32> days, sessions, events;
+    hvec<i64> revenue;
     size_t ids_len = 0, cats_len = 0;
 
     void init(const std::string& p) {
@@ -2398,16 +2443,16 @@ static void process_people(Shared& sh, u32 tid) {
     struct Local { u64 key; u32 index; u32 used; };          // a person's number within the bucket
     struct Bought { u64 key; u32 payload; u32 pad; };        // key = person number << 32 | ts
     struct Found { u32 person; Click click; };
-    std::vector<Local> table;
-    std::vector<u64> persons, keys, sorted;
-    std::vector<u32> per_person, per_slice(nslices + 1), person_start, click_start, cursor;
-    std::vector<Bought> bought;
-    std::vector<Found> found;
-    std::vector<Click> clicks;
-    std::vector<i64> cat_cents(ncat, 0);
-    std::vector<u32> cat_touched;
-    std::vector<u32> camp_count(ncamp + 1, 0), camp_slot(ncamp + 1, 0), active;
-    std::vector<u32> stamp(ncamp + 1, 0);                     // last session that counted this campaign as an assist
+    hvec<Local> table;
+    hvec<u64> persons, keys, sorted;
+    hvec<u32> per_person, per_slice(nslices + 1), person_start, click_start, cursor;
+    hvec<Bought> bought;
+    hvec<Found> found;
+    hvec<Click> clicks;
+    hvec<i64> cat_cents(ncat, 0);
+    hvec<u32> cat_touched;
+    hvec<u32> camp_count(ncamp + 1, 0), camp_slot(ncamp + 1, 0), active;
+    hvec<u32> stamp(ncamp + 1, 0);                     // last session that counted this campaign as an assist
     u32 session_id = 0;
     u64 rows = 0;
 
