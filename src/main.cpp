@@ -268,6 +268,21 @@ static inline i64 parse_tod(const u8* p) {
     return i64(h * 3600 + m * 60 + s) * 1000;
 }
 
+// `HH:MM:SS` at p -> a code that orders times of day (under 2^24), or -1.
+[[maybe_unused]] static inline i64 tod_code(const u8* p) {
+#if defined(__BMI2__)
+    const u64 raw = rd64(p);
+    const u64 x = raw ^ 0x30303A30303A3030ULL;
+    if ((((x + 0x7676767676767676ULL) | x) & 0x8080808080808080ULL) | (x & 0x0000FF0000FF0000ULL)) return -1;
+    const u32 bcd = u32(_pext_u64(__builtin_bswap64(raw), 0x0F0F000F0F000F0FULL));      // 0xHHMMSS
+    if (((bcd >> 16) > 0x23) | (((bcd >> 8) & 0xFF) > 0x59) | ((bcd & 0xFF) > 0x59)) return -1;
+    return bcd;
+#else
+    const i64 ms = parse_tod(p);
+    return ms < 0 ? -1 : ms / 1000;
+#endif
+}
+
 // F1, exactly `YYYY-MM-DDTHH:MM:SSZ` (20 bytes at p).
 static inline i64 parse_f1(const u8* p, DateCache& cache) {
     if ((p[10] != 'T') | (p[19] != 'Z')) return TS_BAD;
@@ -368,6 +383,164 @@ static inline Masks classify(const u8* p) {
 // every line that starts in [start, stop) and has exactly NF fields. buf[start]
 // starts a line; `last` is the index of the first '\n' at or after stop - 1,
 // which ends the last such line; 64 readable bytes follow it.
+#ifdef SS_SCAN3
+static inline u32 tz64(u64 x) {
+#if defined(__BMI__)
+    return u32(_tzcnt_u64(x));
+#else
+    return x ? u32(__builtin_ctzll(x)) : 64;
+#endif
+}
+static inline u64 pext64(u64 value, u64 mask) {
+#if defined(__BMI2__)
+    return _pext_u64(value, mask);
+#else
+    u64 out = 0;
+    for (u64 bit = 1; mask; mask &= mask - 1, bit <<= 1)
+        if (value & mask & -mask) out |= bit;
+    return out;
+#endif
+}
+static inline u64 pdep64(u64 value, u64 mask) {
+#if defined(__BMI2__)
+    return _pdep_u64(value, mask);
+#else
+    u64 out = 0;
+    for (u64 bit = 1; mask; mask &= mask - 1, bit <<= 1)
+        if (value & bit) out |= mask & -mask;
+    return out;
+#endif
+}
+
+// Calls row(starts, ends) for every line that starts in [start, stop) and has
+// exactly NF well-formed fields; field i is buf[starts[i] .. ends[i]) with any
+// wrapping quotes already removed.
+//
+// Quotes are settled a whole 64-byte block at a time. With D the delimiter
+// bits and Q the quote bits, a quote is an opener if it directly follows a
+// delimiter and a closer if it directly precedes one. A line is well-quoted
+// exactly when every quote is one or the other (not both, which would be a
+// field that is a single quote) and every field's opener and closer come
+// together. Those conditions are bit tests on the block; any line they flag is
+// re-examined byte by byte, so the result is exact.
+template <int NF, class Row>
+static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
+    if (start >= stop) return;
+    enum { BLOCKS = 16, CAP = BLOCKS * 64 + NF + 48 };
+    // Entry 0 always describes the delimiter just before the unfinished line.
+    u32 pos[CAP], fs[CAP], fe[CAP];
+    u32 nl_at[BLOCKS * 64 + 1];
+    u8 nl_bad[BLOCKS * 64 + 1];
+    u32 n = 1;
+    bool carry_bad = false;                 // the unfinished line already has a quote fault
+    size_t block = start;
+    Masks cur = classify(buf + block);
+    u64 prev_delim = 1;                     // the byte before `start` is a newline
+    u64 prev_quote = 0;
+    u64 prev_open = cur.quote & 1;          // does the field after the last delimiter open with a quote
+    pos[0] = u32(start - 1);
+    fs[0] = u32(start) + u32(prev_open);
+    fe[0] = 0;
+    const Masks none{0, 0, 0};
+    for (;;) {
+        u32 newlines = 0;
+        for (u32 done = 0; done < BLOCKS && block <= last; done++, block += 64) {
+            const Masks next = block + 64 <= last ? classify(buf + block + 64) : none;
+            const u64 Q = cur.quote, D = cur.comma | cur.nl;
+            const u64 next_delim = (next.comma | next.nl) & 1, next_quote = next.quote & 1;
+            const u64 openers = Q & ((D << 1) | prev_delim);
+            const u64 closers = Q & ((D >> 1) | (next_delim << 63));
+            u64 faults = (Q & ~(openers | closers)) | (openers & closers);
+            const u32 count = u32(__builtin_popcountll(D));
+            // One bit per delimiter, in order: is the byte before it a closer, the byte after it an opener.
+            const u64 cb = pext64((closers << 1) | prev_quote, D);
+            const u64 ob = pext64((openers >> 1) | (next_quote << 63), D);
+            u64 unpaired = ((ob << 1) | prev_open) ^ cb;
+            if (count < 64) unpaired &= (1ULL << count) - 1;
+            if (unpaired) faults |= pdep64(unpaired, D);
+            if (count) prev_open = (ob >> (count - 1)) & 1;
+
+            u64 rest = cur.nl, pending = faults;
+            for (; rest; rest &= rest - 1) {
+                const u64 upto = (2ULL << __builtin_ctzll(rest)) - 1;
+                nl_at[newlines] = n + u32(__builtin_popcountll(D & upto)) - 1;
+                nl_bad[newlines] = u8(carry_bad | ((pending & upto) != 0));
+                pending &= ~upto;
+                carry_bad = false;
+                newlines++;
+            }
+            carry_bad |= pending != 0;
+
+            u32* out = pos + n;
+            const u32 base = u32(block);
+            u64 bits = D;
+            for (int i = 0; i < 8; i++) { out[i] = base + tz64(bits); bits &= bits - 1; }
+            if (count > 8) {
+                for (int i = 8; i < 16; i++) { out[i] = base + tz64(bits); bits &= bits - 1; }
+                for (u32 i = 16; i < count; i++) { out[i] = base + tz64(bits); bits &= bits - 1; }
+            }
+#if defined(__AVX2__)
+            const __m256i select = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+            const __m256i one = _mm256_set1_epi32(1);
+            for (u32 i = 0; i < count; i += 8) {
+                const __m256i p = _mm256_loadu_si256((const __m256i*)(out + i));
+                const __m256i o = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(int((ob >> i) & 0xFF)), select), select);
+                const __m256i c = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(int((cb >> i) & 0xFF)), select), select);
+                _mm256_storeu_si256((__m256i*)(fs + n + i), _mm256_sub_epi32(_mm256_add_epi32(p, one), o));
+                _mm256_storeu_si256((__m256i*)(fe + n + i), _mm256_add_epi32(p, c));
+            }
+#else
+            for (u32 i = 0; i < count; i++) {
+                fs[n + i] = out[i] + 1 + u32((ob >> i) & 1);
+                fe[n + i] = out[i] - u32((cb >> i) & 1);
+            }
+#endif
+            n += count;
+            prev_delim = D >> 63;
+            prev_quote = Q >> 63;
+            cur = next;
+        }
+        u32 from = 1;                       // first delimiter of the line being walked
+        for (u32 j = 0; j < newlines; j++) {
+            const u32 at = nl_at[j];
+            if (at - from == NF - 1) {
+                if (!nl_bad[j]) {
+                    row(fs + from - 1, fe + from);
+                } else {
+                    // A quote fault somewhere in this line: decide it exactly.
+                    u32 ls[NF], le[NF];
+                    bool ok = true;
+                    for (int f = 0; f < NF; f++) {
+                        const u8* a = buf + pos[from - 1 + f] + 1;
+                        const u8* b = buf + pos[from + f];
+                        if (memchr(a, '"', size_t(b - a))) {
+                            if (b - a < 2 || a[0] != '"' || b[-1] != '"' || memchr(a + 1, '"', size_t(b - a - 2))) { ok = false; break; }
+                            a++; b--;
+                        }
+                        ls[f] = u32(a - buf);
+                        le[f] = u32(b - buf);
+                    }
+                    if (ok) row(ls, le);
+                }
+            }
+            from = at + 1;
+            if (pos[at] >= last) return;
+        }
+        if (block > last && !newlines) return;      // cannot happen: `last` is a newline
+        // Keep the previous delimiter and the unfinished line's own; beyond NF the line is malformed anyway.
+        u32 keep = n - (from - 1);
+        if (keep > u32(NF) + 2) keep = u32(NF) + 2;
+        memmove(pos, pos + from - 1, keep * sizeof(u32));
+        memmove(fs, fs + from - 1, keep * sizeof(u32));
+        memmove(fe, fe + from - 1, keep * sizeof(u32));
+        n = keep;
+    }
+}
+
+// Handlers receive finished field bounds.
+#define ROW_PARAMS const u32* fs, const u32* fe
+#define FIELD(i) const u8 *s##i = buf + fs[i], *e##i = buf + fe[i];
+#else
 #ifdef SS_SCAN2
 static inline u32 tz64(u64 x) {
 #if defined(__BMI__)
@@ -472,6 +645,10 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t, R
 // If the count does not reach the line's total, a quote sits somewhere else.
 #define UNQUOTE(s, e) \
     { u32 w = u32((e) - (s) >= 2) & u32(*(s) == '"') & u32((e)[-1] == '"'); (s) += w; (e) -= w; wrapped += 2 * w; }
+
+// Handlers receive the raw delimiter positions and strip the quotes themselves.
+#define ROW_PARAMS size_t line, const auto* commas, size_t nl, u32 quotes
+#endif
 
 // ---------------------------------------------------------------- input chunks
 struct InputFile { int fd; size_t size; const u8* map; };
@@ -1039,6 +1216,9 @@ struct Shared {
     Catalogs cat;
     i64 ws = 0, we = 0;                     // event window, epoch ms
     i64 day0 = 0;                           // first session day (days since the epoch)
+    i64 day_base = 0;                       // that day's midnight, epoch ms
+    std::vector<u64> day_text8;             // `YYYY-MM-DD` of each window day: first 8 bytes
+    std::vector<u16> day_text2;             //   and the last 2
     u32 ndays = 0;
     u32 abits = 6, bbits = 6;               // log2 of event buckets and person buckets
     std::vector<InputFile> files;
@@ -1098,11 +1278,16 @@ static void parse_links(Shared& sh, Reader& reader) {
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
-        scan_rows<2>(buf, start, stop, last, [&](size_t line, const auto* commas, size_t nl, u32 quotes) {
+        scan_rows<2>(buf, start, stop, last, [&](ROW_PARAMS) {
+#ifdef SS_SCAN3
+            FIELD(0) FIELD(1)
+#else
             const u8 *s0 = buf + line, *e0 = buf + commas[0], *s1 = e0 + 1, *e1 = buf + nl;
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1)
-            if (wrapped != quotes || s0 == e0 || s1 == e1) return;
+            if (wrapped != quotes) return;
+#endif
+            if (s0 == e0 || s1 == e1) return;
             links.add(pack_id(s0, size_t(e0 - s0), 'u'), pack_id(s1, size_t(e1 - s1), 'u'));
         });
     }
@@ -1129,7 +1314,13 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
-        scan_rows<7>(buf, start, stop, last, [&](size_t line, const auto* commas, size_t nl, u32 quotes) {
+        scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) {
+#ifdef SS_SCAN3
+#if SS_LVL == 2
+            sink += fs[0] + fe[6]; return;
+#endif
+            FIELD(0) FIELD(1) FIELD(2) FIELD(3) FIELD(4) FIELD(5) FIELD(6)
+#else
 #if SS_LVL == 2
             sink += commas[0] + commas[5] + nl + quotes + line; return;
 #endif
@@ -1142,7 +1333,9 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
             const u8 *s6 = e5 + 1, *e6 = buf + nl;
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1) UNQUOTE(s2, e2) UNQUOTE(s3, e3) UNQUOTE(s4, e4) UNQUOTE(s5, e5) UNQUOTE(s6, e6)
-            if (wrapped != quotes || s0 == e0) return;          // malformed, or no event_id
+            if (wrapped != quotes) return;                      // a quote somewhere it may not be
+#endif
+            if (s0 == e0) return;                               // no event_id
 #if SS_LVL == 3
             sink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3) + size_t(e4 - s4) + size_t(e5 - s5) + size_t(e6 - s6); return;
 #endif
@@ -1152,6 +1345,43 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #if SS_LVL == 4
             sink += rec.ekey + size_t(e6 - s6); return;
 #endif
+#ifdef SS_ING2
+            // Only two things are needed from ingest_ts: whether the event is late, and
+            // an order among copies of one event. So it is kept as a sortable key,
+            // (days since the epoch) * 2^24 + a time-of-day code. Nearly always it
+            // carries the event's own UTC date: then its date text equals that day's
+            // text, the event cannot be late, and the code comes straight from the digits.
+            rec.ingest = INT64_MAX;                 // rules.md: always valid F1; if not, the copy can never be kept
+            rec.ukey = 0;
+            rec.ts = DEAD;
+            rec.payload = 0;
+            const i64 ts = parse_ts(s2, size_t(e2 - s2), dates);
+            const bool in_window = ts != TS_BAD && ts >= ws && ts < we;
+            bool timely = false;                    // ingest_ts valid and not over 24 h after ts
+            bool settled = false;
+#ifndef SS_FORCE_SLOW
+            if (in_window && e3 - s3 == 20) {
+                const u32 d = u32(u64(ts - sh.day_base) / u64(DAY));
+                if (u32(rd64(s3) == sh.day_text8[d]) & u32(rd16(s3 + 8) == sh.day_text2[d]) & u32(s3[10] == 'T') & u32(s3[19] == 'Z')) {
+                    const i64 code = tod_code(s3 + 11);
+                    if (code >= 0) { rec.ingest = (sh.day0 + d) * (1LL << 24) + code; timely = true; }
+                    settled = true;
+                }
+            }
+#endif
+            if (!settled) {
+                const i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
+                if (ingest != TS_BAD) {
+                    rec.ingest = floor_div(ingest, DAY) * (1LL << 24) + tod_code(s3 + 11);
+                    timely = in_window && ingest - ts <= DAY;
+                }
+            }
+#if SS_LVL == 5 || SS_LVL == 6
+            sink += rec.ekey + u64(rec.ingest) + u64(ts) + size_t(e6 - s6); return;
+#endif
+            if (timely && s1 != e1 && s5 != e5) {
+                {
+#else
             // rules.md: ingest_ts is always valid F1. If it is not, the copy can never be kept.
             i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
             rec.ingest = ingest == TS_BAD ? INT64_MAX : ingest;
@@ -1167,6 +1397,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
                 sink += rec.ekey + u64(rec.ingest) + u64(ts) + size_t(e6 - s6); return;
 #endif
                 if (ts != TS_BAD && ts >= ws && ts < we && ingest - ts <= DAY) {
+#endif
                     size_t kind = size_t(e4 - s4);
                     bool ok = false;
                     if (kind == 4) {
@@ -1224,14 +1455,19 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
-        scan_rows<4>(buf, start, stop, last, [&](size_t line, const auto* commas, size_t nl, u32 quotes) {
+        scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) {
+#ifdef SS_SCAN3
+            FIELD(0) FIELD(1) FIELD(2) FIELD(3)
+#else
             const u8 *s0 = buf + line, *e0 = buf + commas[0];
             const u8 *s1 = e0 + 1, *e1 = buf + commas[1];
             const u8 *s2 = e1 + 1, *e2 = buf + commas[2];
             const u8 *s3 = e2 + 1, *e3 = buf + nl;
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1) UNQUOTE(s2, e2) UNQUOTE(s3, e3)
-            if (wrapped != quotes || s0 == e0 || s1 == e1) return;
+            if (wrapped != quotes) return;
+#endif
+            if (s0 == e0 || s1 == e1) return;
             i64 ts = parse_ts(s3, size_t(e3 - s3), dates);
             if (ts == TS_BAD || ts < lo || ts >= hi) return;
             i32 campaign = cat.campaign(s2, e2);
@@ -1857,6 +2093,19 @@ int main() {
     if (sh.we - sh.ws + REACH >= i64(0xFFFFFFF0u)) die("window longer than this build supports");
     sh.day0 = floor_div(sh.ws, DAY);
     sh.ndays = sh.we > sh.ws ? u32(floor_div(sh.we - 1, DAY) - sh.day0 + 1) : 1;
+    sh.day_base = sh.day0 * DAY;
+    for (u32 d = 0; d <= sh.ndays; d++) {
+        // civil date of day0 + d (Howard Hinnant's civil_from_days)
+        i64 z = sh.day0 + d + 719468;
+        i64 era = (z >= 0 ? z : z - 146096) / 146097, doe = z - era * 146097;
+        i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+        i64 day = doy - (153 * mp + 2) / 5 + 1, month = mp < 10 ? mp + 3 : mp - 9, year = yoe + era * 400 + (month <= 2);
+        char text[16];
+        snprintf(text, sizeof text, "%04lld-%02lld-%02lld", (long long)year, (long long)month, (long long)day);
+        sh.day_text8.push_back(rd64((const u8*)text));
+        sh.day_text2.push_back(rd16((const u8*)text + 8));
+    }
     sh.cat.load(cfg.data);
 
     list_csv(sh, "links", sh.link_tasks);
