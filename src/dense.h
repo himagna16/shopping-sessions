@@ -589,6 +589,101 @@ static inline SS_HOT bool line2(const u8* p, Fields<2>& f, const u8*& next) {
     return true;
 }
 
+// The same three readers for a line whose newline is already known (the usual
+// way in: line_rows finds the newlines of a batch of lines first, so reading one
+// line does not wait on the line before it). Only commas and quotes are looked for.
+struct CommaQuote { u64 comma, quote; };
+static inline SS_HOT CommaQuote comma_quote(const u8* p) {
+#if defined(__AVX2__)
+    const __m256i a = _mm256_loadu_si256((const __m256i*)p), b = _mm256_loadu_si256((const __m256i*)(p + 32));
+    const __m256i c = _mm256_set1_epi8(','), q = _mm256_set1_epi8('"');
+    CommaQuote m;
+    m.comma = u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c))) | (u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, c)))) << 32);
+    m.quote = u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, q))) | (u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, q)))) << 32);
+    return m;
+#else
+    const Masks all = classify(p);
+    return {all.comma, all.quote};
+#endif
+}
+static inline SS_HOT u64 newline_mask(const u8* p) {
+#if defined(__AVX2__)
+    const __m256i n = _mm256_set1_epi8('\n');
+    return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), n))) |
+           (u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + 32)), n)))) << 32);
+#else
+    return classify(p).nl;
+#endif
+}
+
+// [p, nl) is the line, nl its newline (the first one at or after p).
+static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<7>& f) {
+    const size_t len = size_t(nl - p);
+    const CommaQuote A = comma_quote(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca); ca &= ca - 1;
+    const u32 c3 = tz64(ca);
+    if (c3 >= 64 || c3 >= len) return false;                    // the third comma within 64 bytes and within the line
+    const u8* q = p + c3 + 1;
+    const size_t e = size_t(nl - q);
+    if (e >= 64) return false;
+    const CommaQuote B = comma_quote(q);
+    u64 cb = B.comma;
+    const u32 c4 = tz64(cb); cb &= cb - 1;
+    const u32 c5 = tz64(cb); cb &= cb - 1;
+    const u32 c6 = tz64(cb); cb &= cb - 1;
+    const u32 c7 = tz64(cb);
+    const u64 QA = A.quote, QB = B.quote;
+    const u64 bad_a = quote_faults(A.comma, QA) & (~0ULL >> (63 - c3));
+    const u64 bad_b = quote_faults(B.comma | (1ULL << e), QB) & (~0ULL >> (63 - e));
+    if ((c6 >= e) | (c7 <= e) | ((bad_a | bad_b) != 0)) return false;
+    const u32 o0 = u32(QA & 1), o1 = u32(QA >> (c1 + 1)) & 1, o2 = u32(QA >> (c2 + 1)) & 1;
+    const u32 o3 = u32(QB & 1), o4 = u32(QB >> (c4 + 1)) & 1, o5 = u32(QB >> (c5 + 1)) & 1, o6 = u32(QB >> (c6 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + c2 - o1;
+    f.s[2] = p + c2 + 1 + o2; f.e[2] = p + c3 - o2;
+    f.s[3] = q + o3;          f.e[3] = q + c4 - o3;
+    f.s[4] = q + c4 + 1 + o4; f.e[4] = q + c5 - o4;
+    f.s[5] = q + c5 + 1 + o5; f.e[5] = q + c6 - o5;
+    f.s[6] = q + c6 + 1 + o6; f.e[6] = nl - o6;
+    return true;
+}
+static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<4>& f) {
+    const size_t e = size_t(nl - p);
+    if (e >= 64) return false;
+    const CommaQuote A = comma_quote(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca); ca &= ca - 1;
+    const u32 c3 = tz64(ca); ca &= ca - 1;
+    const u32 c4 = tz64(ca);
+    const u64 Q = A.quote;
+    const u64 bad = quote_faults(A.comma | (1ULL << e), Q) & (~0ULL >> (63 - e));
+    if ((c3 >= e) | (c4 <= e) | (bad != 0)) return false;
+    const u32 o0 = u32(Q & 1), o1 = u32(Q >> (c1 + 1)) & 1, o2 = u32(Q >> (c2 + 1)) & 1, o3 = u32(Q >> (c3 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + c2 - o1;
+    f.s[2] = p + c2 + 1 + o2; f.e[2] = p + c3 - o2;
+    f.s[3] = p + c3 + 1 + o3; f.e[3] = nl - o3;
+    return true;
+}
+static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<2>& f) {
+    const size_t e = size_t(nl - p);
+    if (e >= 64) return false;
+    const CommaQuote A = comma_quote(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca);
+    const u64 Q = A.quote;
+    const u64 bad = quote_faults(A.comma | (1ULL << e), Q) & (~0ULL >> (63 - e));
+    if ((c1 >= e) | (c2 <= e) | (bad != 0)) return false;
+    const u32 o0 = u32(Q & 1), o1 = u32(Q >> (c1 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = nl - o1;
+    return true;
+}
+
 // Calls row(fields) for every well-formed line of NF fields that starts in
 // [start, stop); `last` is the newline that ends the last such line, with 64
 // readable bytes after it (as for scan_rows).
@@ -607,6 +702,36 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
         }
         row(f);
     });
+#elif !defined(SS_LINE1)
+    // The newlines of a batch of lines first, 64 bytes at a time; then each line
+    // of the batch on its own, its end already known.
+    (void)fast;
+    enum { BATCH = 64 };
+    u32 ends[BATCH + 72];
+    size_t block = start, line = start;
+    for (;;) {
+        u32 count = 0;
+        while (count < BATCH && block <= last) {
+            __builtin_prefetch(buf + block + 1024);
+            u64 nl = newline_mask(buf + block);
+            const u32 found = u32(__builtin_popcountll(nl));
+            ends[count] = u32(block) + tz64(nl); nl &= nl - 1;
+            ends[count + 1] = u32(block) + tz64(nl); nl &= nl - 1;
+            for (u32 i = 2; i < found; i++) { ends[count + i] = u32(block) + tz64(nl); nl &= nl - 1; }
+            count += found;
+            block += 64;
+        }
+        for (u32 k = 0; k < count; k++) {
+            if (line >= stop) return;
+            const u8* p = buf + line;
+            const u8* nl = buf + ends[k];
+            line = size_t(ends[k]) + 1;
+            Fields<NF> f;
+            if (__builtin_expect(!line_known(p, nl, f), 0) && !split_exact<NF>(p, nl, f)) continue;
+            row(f);
+        }
+        if (block > last) return;                               // every newline up to `last` has been used
+    }
 #else
     const u8* p = buf + start;
     const u8* const stop_at = buf + stop;
@@ -673,6 +798,15 @@ static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) 
             const u8* next = nullptr;
             const bool quick_ok = fast(p, quick, next);
             done++;
+            {
+                Fields<NF> known;
+                if (line_known(p, nl, known)) {
+                    bool same = exact_ok;
+                    for (int i = 0; same && i < NF; i++) same = exact.s[i] == known.s[i] && exact.e[i] == known.e[i];
+                    if (!same && failures++ < 5) fprintf(stderr, "line test (known end): %d fields, mismatch on [%.*s]\n", NF, int(nl - p), (const char*)p);
+                    accepted += 1ULL << 32;
+                }
+            }
             if (!quick_ok) continue;
             accepted++;
             bool same = exact_ok && next == nl + 1;
@@ -722,8 +856,9 @@ static void line_selftest(u64 lines) {
         if (wrong) _exit(1);
     }
     const u64 bad = line_selftest_one<7>(state, lines, line7, a7) + line_selftest_one<4>(state, lines, line4, a4) + line_selftest_one<2>(state, lines, line2, a2);
-    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
-            (unsigned long long)a7, (unsigned long long)a4, (unsigned long long)a2, (unsigned long long)bad);
+    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu, with a known end %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
+            (unsigned long long)(a7 & 0xFFFFFFFF), (unsigned long long)(a4 & 0xFFFFFFFF), (unsigned long long)(a2 & 0xFFFFFFFF),
+            (unsigned long long)(a7 >> 32), (unsigned long long)(a4 >> 32), (unsigned long long)(a2 >> 32), (unsigned long long)bad);
     _exit(bad ? 1 : 0);
 }
 #endif
