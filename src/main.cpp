@@ -26,6 +26,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -421,7 +422,7 @@ static u8* slab_alloc() {
         if (p == MAP_FAILED) die("mmap failed for the record arena");
         u8* base = (u8*)((uintptr_t(p) + SLAB - 1) & ~(uintptr_t(SLAB) - 1));
 #ifdef MADV_HUGEPAGE
-        madvise(base, len, MADV_HUGEPAGE);
+        if (!getenv("SS_NOHUGE")) madvise(base, len, MADV_HUGEPAGE);
 #endif
         g_arena_cur = base;
         g_arena_end = base + len;
@@ -695,7 +696,7 @@ struct AliasMap {
         void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (p == MAP_FAILED) die("mmap failed for the alias map");
 #ifdef MADV_HUGEPAGE
-        madvise(p, bytes, MADV_HUGEPAGE);
+        if (!getenv("SS_NOHUGE")) madvise(p, bytes, MADV_HUGEPAGE);
 #endif
         slots = (Slot*)p;
         mask = cap - 1;
@@ -1589,6 +1590,11 @@ int main() {
         file.close();
     }
     double t5 = now();
+    rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
+            double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
+            long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
     fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu\n",
             T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load());
     _exit(0);
