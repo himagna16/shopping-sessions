@@ -389,7 +389,7 @@ static i64 parse_f3_slow(const u8* p, size_t n) {
 // 11-byte match and gives that midnight in epoch ms; any other text misses and
 // goes to the general parser.
 struct DateTable {
-    struct Entry { u64 a; u32 b; u32 used; i64 ms; };
+    struct Entry { u64 a; u32 b; u32 used; i64 ms; i64 sec; };       // sec: that midnight in epoch seconds
     Entry slot[256];
     u64 seed = 0;
 
@@ -410,7 +410,7 @@ struct DateTable {
             if (yy < 0 || yy > 9999) continue;
             char text[16];
             snprintf(text, sizeof text, "%04lld-%02lld-%02lldT", (long long)yy, (long long)mm, (long long)dd);
-            all.push_back({rd64((const u8*)text), rd32((const u8*)text + 8) & 0xFFFFFF, 1, day * DAY});
+            all.push_back({rd64((const u8*)text), rd32((const u8*)text + 8) & 0xFFFFFF, 1, day * DAY, day * 86400});
         }
         u64 state = 0x2545F4914F6CDD1DULL;
         for (int attempt = 0; attempt < 200000; attempt++) {
@@ -426,6 +426,13 @@ struct DateTable {
             if (!clash) { seed = candidate; return; }
         }
         memset(slot, 0, sizeof slot);
+    }
+    // The entry of the date text at p, or null.
+    inline SS_HOT const Entry* find(const u8* p) const {
+        const u64 a = rd64(p);
+        const u32 b = rd32(p + 8) & 0xFFFFFF;
+        const Entry& e = slot[index(a, b, seed)];
+        return (u32(e.a == a) & u32(e.b == b) & e.used) ? &e : nullptr;
     }
     inline SS_HOT i64 lookup(const u8* p) const {
         const u64 a = rd64(p);
@@ -445,6 +452,30 @@ static inline SS_HOT i32 tod_seconds(const u8* p) {
     const u32 h = u32(t >> 8) & 0xFF, m = u32(t >> 32) & 0xFF, sec = u32(t >> 56);
     if (h > 23) return -1;
     return i32(h * 3600 + m * 60 + sec);
+}
+
+// Two `HH:MM:SS` texts at once: seconds since midnight for each, -1 for one that
+// is not a time of day (exactly what tod_seconds says of each).
+static inline SS_HOT void tod_pair(const u8* pa, const u8* pb, i32& sa, i32& sb) {
+#if defined(__SSE4_1__) && !defined(SS_NOTODPAIR)
+    const __m128i x = _mm_sub_epi8(_mm_set_epi64x((long long)rd64(pb), (long long)rd64(pa)), _mm_set1_epi8('0'));
+    // Per place: the largest digit allowed (2, 9, 5, 9, 5, 9); the colons must be exactly 10 above '0'.
+    const __m128i limit = _mm_setr_epi8(2, 9, 10, 5, 9, 10, 5, 9, 2, 9, 10, 5, 9, 10, 5, 9);
+    const __m128i colon = _mm_setr_epi8(0, 0, 10, 0, 0, 10, 0, 0, 0, 0, 10, 0, 0, 10, 0, 0);
+    const __m128i at_colon = _mm_setr_epi8(0, 0, -1, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0);
+    const __m128i ok = _mm_and_si128(_mm_cmpeq_epi8(_mm_min_epu8(x, limit), x), _mm_cmpeq_epi8(_mm_and_si128(x, at_colon), colon));
+    const u32 good = u32(_mm_movemask_epi8(ok));
+    const __m128i digits = _mm_shuffle_epi8(x, _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, 8, 9, 11, 12, 14, 15, -1, -1));
+    const __m128i pairs = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0, 10, 1, 10, 1, 10, 1, 0, 0));    // HH, MM, SS
+    const __m128i parts = _mm_madd_epi16(pairs, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
+    const __m128i seconds = _mm_add_epi32(parts, _mm_srli_epi64(parts, 32));
+    const u32 a = u32(_mm_cvtsi128_si32(seconds)), b = u32(_mm_extract_epi32(seconds, 2));
+    sa = (((good & 0xFF) == 0xFF) & (a < 86400)) ? i32(a) : -1;        // under 86,400 seconds: the hour is at most 23
+    sb = (((good >> 8) == 0xFF) & (b < 86400)) ? i32(b) : -1;
+#else
+    sa = tod_seconds(pa);
+    sb = tod_seconds(pb);
+#endif
 }
 
 // Any `ts`: F1, F2 or F3 -> epoch ms, or TS_BAD. p readable for n + 8 bytes.
