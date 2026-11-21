@@ -52,14 +52,15 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 E="${PROBE_E:-20000000}"
 /generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
 B="$S/b"
-r dense "$B" /p
+r line "$B" /p
 dl " "
+r block "$B" /pb
 r swar "$B" /psw
-r dense "$B" /p
-r swar "$B" /psw
-echo "parse: wall cpu (touch scan fields ts type +event +user all)"
+r line "$B" /p
+r block "$B" /pb
+echo "parse: wall cpu (touch scan fields ts type +event +user all swar block)"
 for round in 1 2; do
-for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p psw; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p psw pb; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 done
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
@@ -76,8 +77,8 @@ E3=$(( E * 3 ))
 B="$S/c"
 r 60dense "$B" /p
 dl " "
-r 60swar "$B" /psw
-for v in pl1 pl2 pl4 pl7 p; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+r 60block "$B" /pb
+for v in pl1 pl2 pl4 pl7 p pb; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 r 60dense "$B" /p
 fi
 echo "t=$(( $(date +%s) - START ))s"
