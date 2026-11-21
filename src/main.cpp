@@ -1448,7 +1448,7 @@ struct Catalogs {
 // ---------------------------------------------------------------- linked IDs
 // Maps every ID that is not its person's name to that name. An ID absent
 // from the table is its own person.
-static u32 g_alias_space = 200;             // SS_ASPACE: alias map slots per 100 entries
+static u32 g_alias_space = 300;             // SS_ASPACE: alias map slots per 100 entries
 
 struct AliasMap {
     struct Slot { u64 key, name; };
@@ -3140,7 +3140,7 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
-    g_alias_space = u32(std::max(110, atoi(env("SS_ASPACE", "200").c_str())));
+    g_alias_space = u32(std::max(110, atoi(env("SS_ASPACE", "300").c_str())));
     {
         const std::string mode = env("SS_RELEASE", "2");            // 0 never, 1 chunk by chunk, 2 file by file
         g_release_input = mode == "0" ? 0 : mode == "1" ? 1 : 2;
@@ -3195,9 +3195,13 @@ int main() {
     }
     size_t event_bytes = 0;
     for (const Task& task : sh.event_tasks) event_bytes += task.end - task.begin;
-    // About 16K events a bucket, so a bucket's dedup table stays in cache.
+    // Up to about 32K events a bucket and at most 2,048 buckets. Fewer, larger
+    // buckets cost the dedup a little and save the parse more: every bucket has
+    // staging memory, and all of it has to stay in cache beside the scan.
+    // Measured on the scoring machine: 1,024 buckets at 20M events and 2,048 at
+    // 60M each beat twice as many by about 1%.
     size_t rows = event_bytes / 64;
-    while (sh.abits < 12 && (rows >> sh.abits) > 16384) sh.abits++;
+    while (sh.abits < 11 && (rows >> sh.abits) > 32768) sh.abits++;
     sh.bbits = sh.abits;
     if (!env("SS_ABITS", "").empty()) sh.abits = u32(std::min(14, std::max(1, atoi(env("SS_ABITS", "").c_str()))));
     if (!env("SS_BBITS", "").empty()) sh.bbits = u32(std::min(14, std::max(1, atoi(env("SS_BBITS", "").c_str()))));
