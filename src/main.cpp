@@ -1832,7 +1832,7 @@ struct UserWriter {
 struct Cell { u64 person; u32 bin; u32 count; u32 first; u32 last; u32 purchases; u32 pad; };
 struct Purchase { u32 payload; u32 next; };
 
-static void process_people(Shared& sh, u32 tid) {
+[[maybe_unused]] static void process_people_v1(Shared& sh, u32 tid) {
     const u32 nthreads = sh.cfg.threads;
     const u32 ncamp = u32(sh.cat.campaign_ids.size());
     const u32 organic = ncamp;
@@ -2143,6 +2143,310 @@ static void process_people(Shared& sh, u32 tid) {
     writer.finish();
     sh.user_rows.fetch_add(rows);
 }
+
+// The people phase. Per bucket: every person gets a local number; each event
+// becomes one 64-bit key (person number, 30-minute slice, time within the
+// slice); two counting passes order the keys by person and slice with no
+// comparisons. Events in one slice are under 30 minutes apart, so they always
+// share a session and a session boundary can only fall between two slices:
+// walking a person's slices in order gives the sessions without sorting events.
+#ifndef SS_PEOPLE1
+static void process_people(Shared& sh, u32 tid) {
+    const u32 nthreads = sh.cfg.threads;
+    const u32 ncamp = u32(sh.cat.campaign_ids.size());
+    const u32 organic = ncamp;
+    const u32 ndays = sh.ndays;
+    const i64 ws = sh.ws, day0 = sh.day0;
+    const u32 ncat = u32(sh.cat.categories.size());
+    const u32 bbits = sh.bbits;
+    const u32 SLICE = u32(SESSION_GAP);
+    const u32 nslices = u32((sh.we - sh.ws) / SESSION_GAP) + 2;
+    Shared::Totals& totals = sh.campaign_totals[tid];
+    totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.revenue.assign(size_t(ncamp + 1) * ndays, 0);
+
+    UserWriter writer;
+    char name[64];
+    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid);
+    writer.init(sh.cfg.out + name);
+
+    struct Local { u64 key; u32 index; u32 used; };          // a person's number within the bucket
+    struct Bought { u64 key; u32 payload; u32 pad; };        // key = person number << 32 | ts
+    struct Found { u32 person; Click click; };
+    std::vector<Local> table;
+    std::vector<u64> persons, keys, sorted;
+    std::vector<u32> per_person, per_slice(nslices + 1), person_start, click_start, cursor;
+    std::vector<Bought> bought;
+    std::vector<Found> found;
+    std::vector<Click> clicks;
+    std::vector<i64> cat_cents(ncat, 0);
+    std::vector<u32> cat_touched;
+    std::vector<u32> camp_count(ncamp + 1, 0), camp_slot(ncamp + 1, 0), active;
+    std::vector<u32> stamp(ncamp + 1, 0);                     // last session that counted this campaign as an assist
+    u32 session_id = 0;
+    u64 rows = 0;
+
+    for (;;) {
+        size_t turn = sh.next_person.fetch_add(1, std::memory_order_relaxed);
+        if (turn >= sh.person_order.size()) break;
+        u32 bucket = sh.person_order[turn];
+
+        size_t nev = 0;
+        for (u32 t = 0; t < nthreads; t++)
+            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) nev += b->n;
+        if (!nev) continue;
+
+        // 1. Number the people and key the events.
+        size_t cap = 64;
+        while (cap < nev / 8) cap <<= 1;
+        table.assign(cap, Local{0, 0, 0});
+        u64 mask = cap - 1;
+        int shift = 64 - __builtin_ctzll(cap);
+        persons.clear();
+        per_person.clear();
+        bought.clear();
+        keys.resize(nev);
+        memset(per_slice.data(), 0, per_slice.size() * sizeof(u32));
+        auto number = [&](u64 person) -> u32 {
+            u64 at = (hash64(person) << bbits) >> shift;
+            for (;;) {
+                const Local& slot = table[at];
+                if (!slot.used) break;
+                if (slot.key == person) return slot.index;
+                at = (at + 1) & mask;
+            }
+            if ((persons.size() + 1) * 2 > cap) {                 // keep the table at most half full
+                cap <<= 1;
+                mask = cap - 1;
+                shift--;
+                table.assign(cap, Local{0, 0, 0});
+                for (u32 i = 0; i < persons.size(); i++) {
+                    u64 h = (hash64(persons[i]) << bbits) >> shift;
+                    while (table[h].used) h = (h + 1) & mask;
+                    table[h] = {persons[i], i, 1};
+                }
+                at = (hash64(person) << bbits) >> shift;
+                while (table[at].used) at = (at + 1) & mask;
+            }
+            const u32 index = u32(persons.size());
+            table[at] = {person, index, 1};
+            persons.push_back(person);
+            per_person.push_back(0);
+            return index;
+        };
+        size_t j = 0;
+        for (u32 t = 0; t < nthreads; t++)
+            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) {
+                const RecB* recs = Scatter<RecB>::items(b);
+                for (u32 i = 0; i < b->n; i++) {
+                    const u32 who = number(recs[i].person);
+                    const u32 ts = recs[i].ts;
+                    const u32 slice = ts / SLICE;
+                    keys[j++] = (u64(who) << 33) | (u64(slice) << 21) | (ts - slice * SLICE);
+                    per_slice[slice]++;
+                    per_person[who]++;
+                    if (recs[i].payload) bought.push_back({(u64(who) << 32) | ts, recs[i].payload, 0});
+                }
+            }
+        const u32 npeople = u32(persons.size());
+
+        // 2. Order the keys by slice, then (keeping that order) by person.
+        sorted.resize(nev);
+        for (u32 k = 0, sum = 0; k < per_slice.size(); k++) { u32 n = per_slice[k]; per_slice[k] = sum; sum += n; }
+        for (size_t k = 0; k < nev; k++) sorted[per_slice[(keys[k] >> 21) & 0xFFF]++] = keys[k];
+        person_start.resize(npeople + 1);
+        for (u32 k = 0, sum = 0; k < npeople; k++) { person_start[k] = sum; sum += per_person[k]; }
+        person_start[npeople] = u32(nev);
+        cursor.assign(person_start.begin(), person_start.end() - 1);
+        for (size_t k = 0; k < nev; k++) keys[cursor[sorted[k] >> 33]++] = sorted[k];
+        if (bought.size() > 1) std::sort(bought.begin(), bought.end(), [](const Bought& x, const Bought& y) { return x.key < y.key; });
+        bought.push_back({~0ULL, 0, 0});                          // sentinel
+
+        // 3. Clicks of people who have events, grouped by person.
+        auto lookup = [&](u64 person) -> i64 {
+            u64 at = (hash64(person) << bbits) >> shift;
+            for (;;) {
+                const Local& slot = table[at];
+                if (!slot.used) return -1;
+                if (slot.key == person) return slot.index;
+                at = (at + 1) & mask;
+            }
+        };
+        click_start.assign(npeople + 1, 0);
+        found.clear();
+        for (u32 t = 0; t < nthreads; t++)
+            for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
+                const RecC* recs = Scatter<RecC>::items(b);
+                for (u32 i = 0; i < b->n; i++) {
+                    i64 id = lookup(recs[i].person);
+                    if (id >= 0) {
+                        click_start[size_t(id)]++;
+                        found.push_back({u32(id), {recs[i].ts, recs[i].camp, recs[i].ckey}});
+                    }
+                }
+            }
+        const size_t nclicks = found.size();
+        if (nclicks) {
+            for (u32 p = 0, sum = 0; p <= npeople; p++) { u32 n = click_start[p]; click_start[p] = sum; sum += n; }
+            cursor.assign(click_start.begin(), click_start.end() - 1);
+            clicks.resize(nclicks);
+            for (const Found& f : found) clicks[cursor[f.person]++] = f.click;
+        }
+
+        // 4. Each person: sessions, click credit and assists, daily rows.
+        size_t next_bought = 0;
+        for (u32 p = 0; p < npeople; p++) {
+            const u64* mine = keys.data() + person_start[p];
+            const u32 n = person_start[p + 1] - person_start[p];
+            Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
+            const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
+            // A handful of clicks are simply scanned for every session. More are put in
+            // time order (at one instant the smallest click_id last) for a sliding window.
+            const bool scan_clicks = m <= 16;
+            if (!scan_clicks) {
+                auto before = [](const Click& x, const Click& y) {
+                    return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key, 'k'));
+                };
+                std::sort(ck, ck + m, before);
+            }
+
+            char name_buf[16];
+            u32 name_len = 0;
+            std::string name_long;
+            const char* person_name = name_buf;
+            if (persons[p] & INTERN_BIT) {
+                name_long = id_string(persons[p], 'u');
+                person_name = name_long.data();
+                name_len = u32(name_long.size());
+            } else {
+#ifdef SS_ID2
+                name_buf[name_len++] = 'u';
+                for (u64 key = persons[p]; key; key >>= 8) name_buf[name_len++] = char(key & 0xFF);
+#else
+                for (int sh7 = 56; sh7 >= 0; sh7 -= 7) {
+                    char c = char((persons[p] >> sh7) & 0x7F);
+                    if (!c) break;
+                    name_buf[name_len++] = c;
+                }
+#endif
+            }
+            i64 cur_day = -1;
+            i32 d_sessions = 0, d_events = 0;
+            i64 d_revenue = 0;
+            auto emit = [&]() {
+                const std::string* top = nullptr;
+                if (!cat_touched.empty()) {
+                    std::sort(cat_touched.begin(), cat_touched.end());   // categories are numbered in byte order
+                    i64 best = 0;
+                    for (u32 c : cat_touched) {
+                        if (cat_cents[c] > best) { best = cat_cents[c]; top = &sh.cat.categories[c]; }
+                        cat_cents[c] = 0;
+                    }
+                    cat_touched.clear();
+                }
+#if SS_X != 6
+                writer.add(person_name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+#endif
+                rows++;
+            };
+            u32 left = 0, right = 0;
+            // One session: first event at `start`, last at `last` (ms from window_start).
+            auto session = [&](u32 start, u32 last, u32 nevents) {
+                const i64 day = floor_div(ws + start, DAY) - day0;
+                if (day != cur_day) {
+                    if (cur_day >= 0) emit();
+                    cur_day = day; d_sessions = 0; d_events = 0; d_revenue = 0;
+                }
+                i64 cents = 0;
+                const u64 upto = (u64(p) << 32) | last;
+                while (bought[next_bought].key <= upto) {         // this person's purchases up to the session's end
+                    const u32 payload = bought[next_bought++].payload;
+                    const u32 c = payload & 0xFF;
+                    const i64 price = payload >> 8;
+                    if (!cat_cents[c]) cat_touched.push_back(c);
+                    cat_cents[c] += price;
+                    cents += price;
+                }
+                // purchases have a price of at least 1, so cents > 0 means "has a purchase"
+                d_sessions++; d_events += i32(nevents); d_revenue += cents;
+
+                u32 credited = organic;
+                // Click times count from window_start - 7 days, event times from
+                // window_start, so the clicks in reach are those in [start, start + 7 days].
+                if (scan_clicks) {
+                    session_id++;
+                    i64 best = -1;
+                    for (u32 k = 0; k < m; k++) {
+                        const u32 t = ck[k].ts;
+                        if (u32(t - start) > u32(REACH)) continue;            // before start, or over 7 days back
+                        const u32 c = ck[k].camp;
+                        if (stamp[c] != session_id) { stamp[c] = session_id; totals.assisted[size_t(c) * ndays + size_t(day)]++; }
+                        if (best < 0 || t > ck[best].ts || (t == ck[best].ts && id_less(ck[k].key, ck[best].key, 'k'))) best = k;
+                    }
+                    if (best >= 0) credited = ck[best].camp;
+                } else {
+                    const u64 hi = u64(start) + u64(REACH);
+                    while (right < m && ck[right].ts <= hi) {
+                        u32 c = ck[right++].camp;
+                        if (camp_count[c]++ == 0) { camp_slot[c] = u32(active.size()); active.push_back(c); }
+                    }
+                    while (left < right && ck[left].ts < start) {
+                        u32 c = ck[left++].camp;
+                        if (--camp_count[c] == 0) {
+                            u32 tail = active.back();
+                            active[camp_slot[c]] = tail;
+                            camp_slot[tail] = camp_slot[c];
+                            active.pop_back();
+                        }
+                    }
+                    if (right > left) credited = ck[right - 1].camp;
+                    for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
+                }
+                const size_t slot = size_t(credited) * ndays + size_t(day);
+                totals.sessions[slot]++;
+                if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
+            };
+
+            // Walk the slices. Within a slice the keys are in no order, so take min and max.
+            u32 i = 0;
+            u32 start = 0, last = 0, nevents = 0, prev_slice = 0;
+            bool open = false;
+            while (i < n) {
+                const u32 slice = u32(mine[i] >> 21) & 0xFFF;
+                const u32 base = slice * SLICE;
+                u32 lo = u32(mine[i]) & 0x1FFFFF, hi = lo, count = 1;
+                for (i++; i < n && (u32(mine[i] >> 21) & 0xFFF) == slice; i++) {
+                    const u32 v = u32(mine[i]) & 0x1FFFFF;
+                    lo = v < lo ? v : lo;
+                    hi = v > hi ? v : hi;
+                    count++;
+                }
+                // A later slice continues the session only if it is the very next
+                // slice and its first event is within 30 minutes of the last one.
+                if (open && slice == prev_slice + 1 && i64(base + lo) - i64(last) <= SESSION_GAP) {
+                    last = base + hi;
+                    nevents += count;
+                } else {
+                    if (open) session(start, last, nevents);
+                    start = base + lo; last = base + hi; nevents = count;
+                    open = true;
+                }
+                prev_slice = slice;
+            }
+            if (open) session(start, last, nevents);
+            if (cur_day >= 0) emit();
+            for (u32 c : active) camp_count[c] = 0;
+            active.clear();
+        }
+    }
+    writer.finish();
+    sh.user_rows.fetch_add(rows);
+}
+#else
+static void process_people(Shared& sh, u32 tid) { process_people_v1(sh, tid); }
+#endif
 
 // ---------------------------------------------------------------- main
 static double thread_cpu() {
