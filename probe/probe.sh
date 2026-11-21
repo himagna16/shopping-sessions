@@ -30,6 +30,11 @@ p() {     # parse only: best of 3 by parse cpu -> "parse parse_cpu user sys"
   done
   echo "$label $best"
 }
+st() {    # steps inside dedup and people, ms of thread time, from the last of 2 runs
+  label="$1"; shift
+  one "$@" > /dev/null; one "$@" > /dev/null
+  awk -v l="$label" '/^steps/{printf "%s tab %d mov %d | key %d ord %d clk %d walk %d fin %d\n", l, $5*1000, $7*1000, $11*1000, $13*1000, $15*1000, $17*1000, $19*1000}' "$S/err"
+}
 /expand "$D" "$S/b" "${PROBE_A:-20}"
 B="$S/b"
 CL=/pcl
@@ -48,11 +53,15 @@ p times "$B" /pl5
 p rest "$B" /pl7
 p noclicks "$B" /pnc
 p full "$B" /p
-r t8c1m "$B" /p SS_CHUNK=1048576
+st steps "$B" /p
+st noclk "$B" /px5
+st nowr "$B" /px6
+st nosess "$B" /px9
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
 grep -E '^user' "$S/err" | cut -c1-70
 r 60g15 "$B" /p15
 r 60clang "$B" "$CL"
+st 60steps "$B" /p
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
