@@ -1,7 +1,6 @@
 #!/bin/sh
-# Diagnostic run (never scored): times builds that stop the event row handler
-# after each step, and builds that skip one later step, on the scoring
-# machine. Output stays under ~1,900 characters: only the end of stderr is shown.
+# Diagnostic run (never scored): compares scanner and timestamp variants on
+# the scoring machine. Output stays under ~1,900 characters.
 exec 1>&2
 D="${DATA_DIR:-/data}"; S="${SCRATCH_DIR:-/scratch}"
 START=$(date +%s)
@@ -13,7 +12,7 @@ r() {
   for i in 1 2; do
     rm -rf "$S/out"; mkdir -p "$S/out"
     t0=$(date +%s%N)
-    env "$@" DATA_DIR="$data" OUTPUT_DIR="$S/out" "$bin" 2> "$S/err"; rc=$?
+    env SS_MMAP=2 "$@" DATA_DIR="$data" OUTPUT_DIR="$S/out" "$bin" 2> "$S/err"; rc=$?
     t1=$(date +%s%N)
     w=$(( (t1 - t0) / 1000000 ))
     line=$(awk -v w=$w -v rc=$rc '/^threads/{printf "%d %d %d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000, $23*1000, $NF*1000} END{if (rc) printf " rc%d", rc}' "$S/err")
@@ -24,21 +23,18 @@ r() {
 /expand "$D" "$S/b" 20
 B="$S/b"
 r base "$B" /p
-for l in 1 2 3 4 5 6 7; do r L$l "$B" /l$l; done
-r L8 "$B" /q5
-r d1only "$B" /x3
-r dnotab "$B" /x7
-r dnoali "$B" /x4
-r pcells "$B" /x2
-r pno4 "$B" /x1
-r pnoclk "$B" /x5
-r pnowr "$B" /x6
-r pread "$B" /p SS_MMAP=0
-r t1 "$B" /p SS_THREADS=1
+r scan2 "$B" /ps2
+r scan3 "$B" /ps3
+r ing2 "$B" /pi2
+r both "$B" /pc
+r both+id2 "$B" /pcd
+r both-pread "$B" /pc SS_MMAP=0
+for l in 2 3 5 7; do r cL$l "$B" /cl$l; done
+r cL8 "$B" /cq5
 r base "$B" /p
+r both "$B" /pc
 rm -rf "$S/b"; /expand "$D" "$S/c" 60; B="$S/c"
 r 60base "$B" /p
-[ "$(elapsed)" -lt 140 ] && r 60L8 "$B" /q5
-grep -o 'mapped.*' "$S/err" | head -1
+r 60both "$B" /pc
 echo "t=$(elapsed)s"
 exit 1
