@@ -341,11 +341,83 @@ static i64 parse_f3_slow(const u8* p, size_t n) {
     return huge ? INT64_MAX : i64(v);       // too long is not malformed, only outside any window
 }
 
+// The dates near the window, keyed by their text `YYYY-MM-DDT` through a hash
+// chosen at start-up to have no collisions among them. A hit is an exact
+// 11-byte match and gives that midnight in epoch ms; any other text misses and
+// goes to the general parser.
+struct DateTable {
+    struct Entry { u64 a; u32 b; u32 used; i64 ms; };
+    Entry slot[256];
+    u64 seed = 0;
+
+    static inline u32 index(u64 a, u32 b, u64 seed) { return u32(((a ^ (u64(b) << 24)) * seed) >> 56); }
+
+    void build(i64 first_day, i64 last_day) {       // days since the epoch, inclusive
+        memset(slot, 0, sizeof slot);
+        seed = 0;
+        const i64 count = last_day - first_day + 1;
+        if (count < 1 || count > 72) return;         // too many to place without collisions: no table
+        std::vector<Entry> all;
+        for (i64 day = first_day; day <= last_day; day++) {
+            i64 z = day + 719468;
+            i64 era = (z >= 0 ? z : z - 146096) / 146097, doe = z - era * 146097;
+            i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+            i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100), mp = (5 * doy + 2) / 153;
+            i64 dd = doy - (153 * mp + 2) / 5 + 1, mm = mp < 10 ? mp + 3 : mp - 9, yy = yoe + era * 400 + (mm <= 2);
+            if (yy < 0 || yy > 9999) continue;
+            char text[16];
+            snprintf(text, sizeof text, "%04lld-%02lld-%02lldT", (long long)yy, (long long)mm, (long long)dd);
+            all.push_back({rd64((const u8*)text), rd32((const u8*)text + 8) & 0xFFFFFF, 1, day * DAY});
+        }
+        u64 state = 0x2545F4914F6CDD1DULL;
+        for (int attempt = 0; attempt < 200000; attempt++) {
+            state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+            const u64 candidate = state | 1;
+            memset(slot, 0, sizeof slot);
+            bool clash = false;
+            for (const Entry& e : all) {
+                Entry& home = slot[index(e.a, e.b, candidate)];
+                if (home.used) { clash = true; break; }
+                home = e;
+            }
+            if (!clash) { seed = candidate; return; }
+        }
+        memset(slot, 0, sizeof slot);
+    }
+    inline i64 lookup(const u8* p) const {
+        const u64 a = rd64(p);
+        const u32 b = rd32(p + 8) & 0xFFFFFF;
+        const Entry& e = slot[index(a, b, seed)];
+        return (u32(e.a == a) & u32(e.b == b) & e.used) ? e.ms : TS_BAD;
+    }
+};
+static DateTable g_dates;
+
+// `HH:MM:SS` at p -> seconds since midnight, or -1. One add checks every digit,
+// both colons and the tens ranges; one multiply forms the three numbers.
+static inline i32 tod_seconds(const u8* p) {
+    const u64 w = rd64(p) ^ 0x30303A30303A3030ULL;
+    if (((w + 0x060A0F060A0F060DULL) | w) & 0xF0F0F0F0F0F0F0F0ULL) return -1;
+    const u64 t = w * 2561;
+    const u32 h = u32(t >> 8) & 0xFF, m = u32(t >> 32) & 0xFF, sec = u32(t >> 56);
+    if (h > 23) return -1;
+    return i32(h * 3600 + m * 60 + sec);
+}
+
 // Any `ts`: F1, F2 or F3 -> epoch ms, or TS_BAD. p readable for n + 8 bytes.
 static inline i64 parse_ts(const u8* p, size_t n, DateCache& cache) {
 #ifndef SS_FORCE_SLOW
     if (n == 20) {
-        if (p[19] == 'Z') return parse_f1(p, cache);
+        if (p[19] == 'Z') {
+#ifndef SS_TS1
+            const i64 day = g_dates.lookup(p);
+            if (day != TS_BAD) {
+                const i32 seconds = tod_seconds(p + 11);
+                return seconds < 0 ? TS_BAD : day + i64(seconds) * 1000;
+            }
+#endif
+            return parse_f1(p, cache);
+        }
     } else if (n == 13) {
         u64 hi, lo;
         if (parse8(p, hi) && parse8(p + 5, lo)) return i64(hi * 100000 + lo % 100000);
@@ -355,8 +427,18 @@ static inline i64 parse_ts(const u8* p, size_t n, DateCache& cache) {
     if (n == 20 && p[19] == 'Z') return parse_f1(p, cache);
 #endif
     if (n == 25 && p[10] == 'T' && (p[19] == '+' || p[19] == '-') && p[22] == ':') {
-        i64 date = parse_date(p, cache);
-        i64 tod = parse_tod(p + 11);
+        i64 date, tod;
+#if !defined(SS_FORCE_SLOW) && !defined(SS_TS1)
+        date = g_dates.lookup(p);
+        if (date != TS_BAD) {
+            const i32 seconds = tod_seconds(p + 11);
+            tod = seconds < 0 ? -1 : i64(seconds) * 1000;
+        } else
+#endif
+        {
+            date = parse_date(p, cache);
+            tod = parse_tod(p + 11);
+        }
         u32 h0 = p[20] - '0', h1 = p[21] - '0', m0 = p[23] - '0', m1 = p[24] - '0';
         if (date == TS_BAD || tod < 0 || h0 > 9 || h1 > 9 || m0 > 9 || m1 > 9) return TS_BAD;
         u32 oh = h0 * 10 + h1, om = m0 * 10 + m1;
@@ -2165,6 +2247,7 @@ int main() {
     if (sh.we - sh.ws + REACH >= i64(0xFFFFFFF0u)) die("window longer than this build supports");
     sh.day0 = floor_div(sh.ws, DAY);
     sh.ndays = sh.we > sh.ws ? u32(floor_div(sh.we - 1, DAY) - sh.day0 + 1) : 1;
+    g_dates.build(sh.day0 - 9, sh.day0 + i64(sh.ndays) + 8);
     sh.day_base = sh.day0 * DAY;
     for (u32 d = 0; d <= sh.ndays; d++) {
         // civil date of day0 + d (Howard Hinnant's civil_from_days)
