@@ -24,13 +24,11 @@ static std::string slurp(const std::string& path) {
     return out;
 }
 
-// Shifts the character after the ID's first letter within its own 36-symbol
-// alphabet (0-9a-z, or 0-9A-Z for an upper-cased ID), so distinct IDs stay distinct.
-static inline void shift_id(char* field, char* end, int by) {
-    if (field < end && *field == '"') field++;
-    if (end - field < 2) return;
-    const bool upper = field[0] >= 'A' && field[0] <= 'Z';
-    char& c = field[1];
+// Shifts the two characters after the ID's first letter within their own
+// 36-symbol alphabet (0-9a-z, or 0-9A-Z for an upper-cased ID): copy k moves
+// the first by k % 36 and the second by k / 36, so up to 1,296 copies of an ID
+// stay distinct.
+static inline void shift_char(char& c, bool upper, int by) {
     int v;
     if (c >= '0' && c <= '9') v = c - '0';
     else if (!upper && c >= 'a' && c <= 'z') v = c - 'a' + 10;
@@ -38,6 +36,13 @@ static inline void shift_id(char* field, char* end, int by) {
     else return;
     v = (v + by) % 36;
     c = char(v < 10 ? '0' + v : (upper ? 'A' : 'a') + v - 10);
+}
+static inline void shift_id(char* field, char* end, int by) {
+    if (field < end && *field == '"') field++;
+    if (end - field < 2) return;
+    const bool upper = field[0] >= 'A' && field[0] <= 'Z';
+    shift_char(field[1], upper, by % 36);
+    if (by >= 36 && end - field >= 3 && field[2] != '"') shift_char(field[2], upper, by / 36);
 }
 
 static void expand_file(const std::string& src, const std::string& dst, int copies, int fields_to_shift) {
