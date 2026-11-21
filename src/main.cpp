@@ -48,11 +48,11 @@
 #ifndef SS_UNIT
 #define SS_UNIT 128         // bytes staged per bucket before they are moved to its block chain
 #endif
-// Build variants kept for measurement. Defaults: the block-level quote scanner
-// and the sortable ingest key. SS_SCAN1 / SS_SCAN2 select the older scanners,
-// SS_ING1 the full ingest_ts conversion.
+// Build variants kept for measurement. Defaults: the carry-add field-start
+// scanner and the sortable ingest key. SS_SCAN1 / SS_SCAN2 / SS_SCAN3 select
+// the older scanners, SS_ING1 the full ingest_ts conversion.
 #if !defined(SS_SCAN1) && !defined(SS_SCAN2) && !defined(SS_SCAN3) && !defined(SS_SCAN4)
-#define SS_SCAN3
+#define SS_SCAN4
 #endif
 #if !defined(SS_ING1) && !defined(SS_ING2)
 #define SS_ING2
