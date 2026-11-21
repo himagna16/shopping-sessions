@@ -63,9 +63,9 @@ r chain "$B" /pc
 r a512 "$B" /p512
 r c512k "$B" /p SS_CHUNK=524288
 r c128k "$B" /p SS_CHUNK=131072
-echo "parse: wall cpu (touch line fields ts type +event +user all chain table a512)"
+echo "parse: wall cpu (touch line fields ts type +event +user all chain table a512 noclicks nolinks)"
 for round in 1 2; do
-for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pc pt p512; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pc pt p512 pnc pnl; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 done
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
