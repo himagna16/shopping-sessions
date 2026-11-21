@@ -107,6 +107,9 @@
 #ifndef SS_PROBE
 #define SS_PROBE 0
 #endif
+#ifndef SS_DX
+#define SS_DX 0           // measurement builds only: leave one step of the dense walk out (dense.h)
+#endif
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -424,7 +427,7 @@ struct DateTable {
         }
         memset(slot, 0, sizeof slot);
     }
-    inline i64 lookup(const u8* p) const {
+    inline SS_HOT i64 lookup(const u8* p) const {
         const u64 a = rd64(p);
         const u32 b = rd32(p + 8) & 0xFFFFFF;
         const Entry& e = slot[index(a, b, seed)];
@@ -2234,7 +2237,9 @@ struct UserWriter {
         parts[4].values = revenue.data(); parts[4].values_len = size_t(n) * 8;
         parts[5].levels = levels.data(); parts[5].levels_len = levels.size();
         parts[5].values = cats.data(); parts[5].values_len = cats_len;
+#if SS_DX != 6
         file.row_group(n, parts);
+#endif
         memset(nulls.data(), 0, groups);
         n = 0; ids_len = 0; cats_len = 0;
     }

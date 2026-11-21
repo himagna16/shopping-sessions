@@ -589,6 +589,101 @@ static inline SS_HOT bool line2(const u8* p, Fields<2>& f, const u8*& next) {
     return true;
 }
 
+// The same three readers for a line whose newline is already known (the usual
+// way in: line_rows finds the newlines of a batch of lines first, so reading one
+// line does not wait on the line before it). Only commas and quotes are looked for.
+struct CommaQuote { u64 comma, quote; };
+static inline SS_HOT CommaQuote comma_quote(const u8* p) {
+#if defined(__AVX2__)
+    const __m256i a = _mm256_loadu_si256((const __m256i*)p), b = _mm256_loadu_si256((const __m256i*)(p + 32));
+    const __m256i c = _mm256_set1_epi8(','), q = _mm256_set1_epi8('"');
+    CommaQuote m;
+    m.comma = u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, c))) | (u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, c)))) << 32);
+    m.quote = u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, q))) | (u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, q)))) << 32);
+    return m;
+#else
+    const Masks all = classify(p);
+    return {all.comma, all.quote};
+#endif
+}
+static inline SS_HOT u64 newline_mask(const u8* p) {
+#if defined(__AVX2__)
+    const __m256i n = _mm256_set1_epi8('\n');
+    return u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)p), n))) |
+           (u64(u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)(p + 32)), n)))) << 32);
+#else
+    return classify(p).nl;
+#endif
+}
+
+// [p, nl) is the line, nl its newline (the first one at or after p).
+static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<7>& f) {
+    const size_t len = size_t(nl - p);
+    const CommaQuote A = comma_quote(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca); ca &= ca - 1;
+    const u32 c3 = tz64(ca);
+    if (c3 >= 64 || c3 >= len) return false;                    // the third comma within 64 bytes and within the line
+    const u8* q = p + c3 + 1;
+    const size_t e = size_t(nl - q);
+    if (e >= 64) return false;
+    const CommaQuote B = comma_quote(q);
+    u64 cb = B.comma;
+    const u32 c4 = tz64(cb); cb &= cb - 1;
+    const u32 c5 = tz64(cb); cb &= cb - 1;
+    const u32 c6 = tz64(cb); cb &= cb - 1;
+    const u32 c7 = tz64(cb);
+    const u64 QA = A.quote, QB = B.quote;
+    const u64 bad_a = quote_faults(A.comma, QA) & (~0ULL >> (63 - c3));
+    const u64 bad_b = quote_faults(B.comma | (1ULL << e), QB) & (~0ULL >> (63 - e));
+    if ((c6 >= e) | (c7 <= e) | ((bad_a | bad_b) != 0)) return false;
+    const u32 o0 = u32(QA & 1), o1 = u32(QA >> (c1 + 1)) & 1, o2 = u32(QA >> (c2 + 1)) & 1;
+    const u32 o3 = u32(QB & 1), o4 = u32(QB >> (c4 + 1)) & 1, o5 = u32(QB >> (c5 + 1)) & 1, o6 = u32(QB >> (c6 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + c2 - o1;
+    f.s[2] = p + c2 + 1 + o2; f.e[2] = p + c3 - o2;
+    f.s[3] = q + o3;          f.e[3] = q + c4 - o3;
+    f.s[4] = q + c4 + 1 + o4; f.e[4] = q + c5 - o4;
+    f.s[5] = q + c5 + 1 + o5; f.e[5] = q + c6 - o5;
+    f.s[6] = q + c6 + 1 + o6; f.e[6] = nl - o6;
+    return true;
+}
+static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<4>& f) {
+    const size_t e = size_t(nl - p);
+    if (e >= 64) return false;
+    const CommaQuote A = comma_quote(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca); ca &= ca - 1;
+    const u32 c3 = tz64(ca); ca &= ca - 1;
+    const u32 c4 = tz64(ca);
+    const u64 Q = A.quote;
+    const u64 bad = quote_faults(A.comma | (1ULL << e), Q) & (~0ULL >> (63 - e));
+    if ((c3 >= e) | (c4 <= e) | (bad != 0)) return false;
+    const u32 o0 = u32(Q & 1), o1 = u32(Q >> (c1 + 1)) & 1, o2 = u32(Q >> (c2 + 1)) & 1, o3 = u32(Q >> (c3 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = p + c2 - o1;
+    f.s[2] = p + c2 + 1 + o2; f.e[2] = p + c3 - o2;
+    f.s[3] = p + c3 + 1 + o3; f.e[3] = nl - o3;
+    return true;
+}
+static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<2>& f) {
+    const size_t e = size_t(nl - p);
+    if (e >= 64) return false;
+    const CommaQuote A = comma_quote(p);
+    u64 ca = A.comma;
+    const u32 c1 = tz64(ca); ca &= ca - 1;
+    const u32 c2 = tz64(ca);
+    const u64 Q = A.quote;
+    const u64 bad = quote_faults(A.comma | (1ULL << e), Q) & (~0ULL >> (63 - e));
+    if ((c1 >= e) | (c2 <= e) | (bad != 0)) return false;
+    const u32 o0 = u32(Q & 1), o1 = u32(Q >> (c1 + 1)) & 1;
+    f.s[0] = p + o0;          f.e[0] = p + c1 - o0;
+    f.s[1] = p + c1 + 1 + o1; f.e[1] = nl - o1;
+    return true;
+}
+
 // Calls row(fields) for every well-formed line of NF fields that starts in
 // [start, stop); `last` is the newline that ends the last such line, with 64
 // readable bytes after it (as for scan_rows).
@@ -607,6 +702,36 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
         }
         row(f);
     });
+#elif !defined(SS_LINE1)
+    // The newlines of a batch of lines first, 64 bytes at a time; then each line
+    // of the batch on its own, its end already known.
+    (void)fast;
+    enum { BATCH = 64 };
+    u32 ends[BATCH + 72];
+    size_t block = start, line = start;
+    for (;;) {
+        u32 count = 0;
+        while (count < BATCH && block <= last) {
+            __builtin_prefetch(buf + block + 1024);
+            u64 nl = newline_mask(buf + block);
+            const u32 found = u32(__builtin_popcountll(nl));
+            ends[count] = u32(block) + tz64(nl); nl &= nl - 1;
+            ends[count + 1] = u32(block) + tz64(nl); nl &= nl - 1;
+            for (u32 i = 2; i < found; i++) { ends[count + i] = u32(block) + tz64(nl); nl &= nl - 1; }
+            count += found;
+            block += 64;
+        }
+        for (u32 k = 0; k < count; k++) {
+            if (line >= stop) return;
+            const u8* p = buf + line;
+            const u8* nl = buf + ends[k];
+            line = size_t(ends[k]) + 1;
+            Fields<NF> f;
+            if (__builtin_expect(!line_known(p, nl, f), 0) && !split_exact<NF>(p, nl, f)) continue;
+            row(f);
+        }
+        if (block > last) return;                               // every newline up to `last` has been used
+    }
 #else
     const u8* p = buf + start;
     const u8* const stop_at = buf + stop;
@@ -673,6 +798,15 @@ static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) 
             const u8* next = nullptr;
             const bool quick_ok = fast(p, quick, next);
             done++;
+            {
+                Fields<NF> known;
+                if (line_known(p, nl, known)) {
+                    bool same = exact_ok;
+                    for (int i = 0; same && i < NF; i++) same = exact.s[i] == known.s[i] && exact.e[i] == known.e[i];
+                    if (!same && failures++ < 5) fprintf(stderr, "line test (known end): %d fields, mismatch on [%.*s]\n", NF, int(nl - p), (const char*)p);
+                    accepted += 1ULL << 32;
+                }
+            }
             if (!quick_ok) continue;
             accepted++;
             bool same = exact_ok && next == nl + 1;
@@ -722,8 +856,9 @@ static void line_selftest(u64 lines) {
         if (wrong) _exit(1);
     }
     const u64 bad = line_selftest_one<7>(state, lines, line7, a7) + line_selftest_one<4>(state, lines, line4, a4) + line_selftest_one<2>(state, lines, line2, a2);
-    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
-            (unsigned long long)a7, (unsigned long long)a4, (unsigned long long)a2, (unsigned long long)bad);
+    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu, with a known end %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
+            (unsigned long long)(a7 & 0xFFFFFFFF), (unsigned long long)(a4 & 0xFFFFFFFF), (unsigned long long)(a2 & 0xFFFFFFFF),
+            (unsigned long long)(a7 >> 32), (unsigned long long)(a4 >> 32), (unsigned long long)(a2 >> 32), (unsigned long long)bad);
     _exit(bad ? 1 : 0);
 }
 #endif
@@ -776,6 +911,9 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
         D.ptab[l.person] = parents ^ IDENT;
     };
     for (const Task& task : sh.link_tasks) {
+#ifdef SS_NOLINKS                    // measurement builds only
+        break;
+#endif
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
         line_rows<2>(buf, start, stop, last, line2, [&](const Fields<2>& f) SS_INLINE {
@@ -953,6 +1091,9 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecK, 64>& lists = sh.k[tid];
     const u64 ukey = D.ukey, pmax = D.pmax;
     DateCache dates;
+#ifdef SS_NOCLICKS                   // measurement builds only
+    return;
+#endif
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
@@ -1102,9 +1243,6 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     // ties settled afterwards.
     Click* ck = nullptr;
     u32 m = 0;
-#ifndef SS_DX
-#define SS_DX 0                      // measurement builds only: leave one step of the walk out
-#endif
 #if SS_DX == 3
     cx.rows += n; return;
 #endif
@@ -1174,24 +1312,31 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     // a campaign assists once for each click in the run whose previous click of
     // the same campaign lies before the run. Assists are counted per click and
     // added to the totals when the day changes.
+    // From 17 to 64 clicks the same is done over as many 8-click groups as needed.
+    static_assert(SS_SCANMAX <= 16, "the one-compare path holds 16 clicks");
     const bool light = scan_clicks && m > 0;
-    alignas(32) u32 lts[16];
-    alignas(32) i32 lprev[16];
-    alignas(32) u32 lacc[16];
-    u32 lcamp[17];
+    const bool medium = !scan_clicks && m <= 64;
+    const u32 groups = (m + 7) / 8;
+    alignas(32) u32 lts[64];
+    alignas(32) i32 lprev[64];
+    alignas(32) u32 lacc[64];
+    u32 lcamp[65];
 #if defined(__AVX2__)
     __m256i lt0 = _mm256_setzero_si256(), lt1 = lt0, lp0 = lt0, lp1 = lt0, acc0 = lt0, acc1 = lt0;
 #endif
-    if (light) {
-        for (u32 i = 1; i < m; i++) {
-            const Click v = ck[i];
-            u32 j = i;
-            while (j > 0 && (v.ts < ck[j - 1].ts || (v.ts == ck[j - 1].ts && dense_click_less(ck[j - 1].key, v.key)))) { ck[j] = ck[j - 1]; j--; }
-            ck[j] = v;
-        }
+    if (light | medium) {
+        if (light)
+            for (u32 i = 1; i < m; i++) {
+                const Click v = ck[i];
+                u32 j = i;
+                while (j > 0 && (v.ts < ck[j - 1].ts || (v.ts == ck[j - 1].ts && dense_click_less(ck[j - 1].key, v.key)))) { ck[j] = ck[j - 1]; j--; }
+                ck[j] = v;
+            }
         const u32 tag = ++cx.session_id;
-        for (u32 k = 0; k < 16; k++) { lts[k] = 0xFFFFFFFFu; lprev[k] = -1; lacc[k] = 0; lcamp[k] = organic; }
-        lcamp[16] = organic;
+        const u32 padded = light ? 16 : groups * 8;
+        for (u32 k = 0; k < padded; k++) { lts[k] = 0xFFFFFFFFu; lprev[k] = -1; lacc[k] = 0; lcamp[k] = organic; }
+        if (light) lcamp[16] = organic;
+        lcamp[64] = organic;
         for (u32 k = 0; k < m; k++) {
             const u32 c = ck[k].camp;
             lts[k] = ck[k].ts;
@@ -1231,10 +1376,12 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     };
     auto flush_assists = [&]() SS_WALK {
 #if defined(__AVX2__)
-        _mm256_store_si256((__m256i*)lacc, acc0);
-        _mm256_store_si256((__m256i*)(lacc + 8), acc1);
-        acc0 = _mm256_setzero_si256();
-        acc1 = acc0;
+        if (light) {
+            _mm256_store_si256((__m256i*)lacc, acc0);
+            _mm256_store_si256((__m256i*)(lacc + 8), acc1);
+            acc0 = _mm256_setzero_si256();
+            acc1 = acc0;
+        }
 #endif
         for (u32 k = 0; k < m; k++) { totals.assisted[size_t(lcamp[k]) * ndays + size_t(cur_day)] += lacc[k]; lacc[k] = 0; }
     };
@@ -1258,7 +1405,7 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         const i64 day = i64((start + day_shift) / u32(DAY));
         if (day != cur_day) {
             if (cur_day >= 0) {
-                if (light) flush_assists();
+                if (light | medium) flush_assists();
                 emit();
             }
             cur_day = day; d_sessions = 0; d_events = 0; d_revenue = 0;
@@ -1302,6 +1449,27 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             for (u32 k = 0; k < m; k++) lacc[k] += ((inmask >> k) & 1) & u32(lprev[k] < first);
 #endif
             credited = lcamp[inmask ? 31 - __builtin_clz(inmask) : 16];
+        } else if (medium) {
+            u64 inmask = 0;
+#if defined(__AVX2__)
+            const __m256i from = _mm256_set1_epi32(int(start)), reach = _mm256_set1_epi32(int(REACH));
+            __m256i in[8];
+            for (u32 g = 0; g < groups; g++) {
+                const __m256i d = _mm256_sub_epi32(_mm256_load_si256((const __m256i*)(lts + 8 * g)), from);
+                in[g] = _mm256_cmpeq_epi32(_mm256_min_epu32(d, reach), d);
+                inmask |= u64(u32(_mm256_movemask_ps(_mm256_castsi256_ps(in[g])))) << (8 * g);
+            }
+            const __m256i first = _mm256_set1_epi32(inmask ? int(__builtin_ctzll(inmask)) : 64);
+            for (u32 g = 0; g < groups; g++) {
+                const __m256i hit = _mm256_and_si256(in[g], _mm256_cmpgt_epi32(first, _mm256_load_si256((const __m256i*)(lprev + 8 * g))));
+                _mm256_store_si256((__m256i*)(lacc + 8 * g), _mm256_sub_epi32(_mm256_load_si256((const __m256i*)(lacc + 8 * g)), hit));
+            }
+#else
+            for (u32 k = 0; k < m; k++) inmask |= u64(u32(lts[k] - start) <= u32(REACH)) << k;
+            const i32 first = inmask ? i32(__builtin_ctzll(inmask)) : 64;
+            for (u32 k = 0; k < m; k++) lacc[k] += u32((inmask >> k) & 1) & u32(lprev[k] < first);
+#endif
+            credited = lcamp[inmask ? 63 - __builtin_clzll(inmask) : 64];
         } else if (!scan_clicks) {
             const u64 upto = u64(start) + u64(REACH);
             while (right < m && ck[right].ts <= upto) {
@@ -1321,7 +1489,7 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
     }
     if (cur_day >= 0) {
-        if (light) flush_assists();
+        if (light | medium) flush_assists();
         emit();
     }
     for (u32 k = left; k < right; k++) {                  // the spans still open at the person's last session
