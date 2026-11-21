@@ -3044,7 +3044,11 @@ int main() {
     });
     double t2 = now();
 
-    double c2 = run_threads(T, [&](u32 tid) {
+    // SS_T2 / SS_T3: fewer threads for the dedup or the people phase (measurement).
+    const u32 T2 = std::min<u32>(T, std::max<u32>(1, u32(atoi(env("SS_T2", "0").c_str())) ? u32(atoi(env("SS_T2", "0").c_str())) : T));
+    const u32 T3 = std::min<u32>(T, std::max<u32>(1, u32(atoi(env("SS_T3", "0").c_str())) ? u32(atoi(env("SS_T3", "0").c_str())) : T));
+    for (u32 t = T2; t < T; t++) { sh.b[t].init(1u << sh.bbits, &sh.alloc[t]); sh.b[t].finish(); }
+    double c2 = run_threads(T2, [&](u32 tid) {
         sh.b[tid].init(1u << sh.bbits, &sh.alloc[tid]);
         dedup_buckets(sh, tid);
         sh.b[tid].finish();
@@ -3062,7 +3066,7 @@ int main() {
         for (u32 k = 0; k < nb; k++) sh.person_order[k] = k;
         std::sort(sh.person_order.begin(), sh.person_order.end(), [&](u32 x, u32 y) { return size[x] > size[y]; });
     }
-    double c3 = run_threads(T, [&](u32 tid) { process_people(sh, tid); });
+    double c3 = run_threads(T3, [&](u32 tid) { process_people(sh, tid); });
     double t4 = now();
 
     write_campaigns(sh);
