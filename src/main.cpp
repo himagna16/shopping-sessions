@@ -1836,8 +1836,13 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     resolver.finish();
 }
 
+// Where the time inside phases 2 and 3 goes: CPU seconds per step, per thread.
+// Two clock reads per step per bucket; printed with the other figures on stderr.
+static double g_steps[256][8];
+
 // ---------------------------------------------------------------- phase 2: dedup
 static void dedup_buckets(Shared& sh, u32 tid) {
+    double* steps = g_steps[tid & 255];
     const u32 nbuckets = 1u << sh.abits;
     const u32 abits = sh.abits;
     const int shift = 64 - int(sh.bbits);
@@ -1859,6 +1864,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         for (u32 t = 0; t < sh.cfg.threads; t++)
             for (Block* b = sh.a[t].head[bucket]; b; b = b->next) { blocks.push_back(b); total += b->n; }
         if (!total) continue;
+        const double step0 = now();
         // Smallest ingest_ts wins; equal ingest_ts means identical copies.
         // A slot is a hash tag plus (block << 8 | index) + 1. With at most 256
         // blocks the reference fits 16 bits and the whole slot 4 bytes.
@@ -1934,6 +1940,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
 #if SS_X == 3
         continue;
 #endif
+        const double step1 = now();
         // Survivors that are valid get their person and move to a person bucket.
         for (Block* b : blocks) {
             RecA* recs = Scatter<RecA>::items(b);
@@ -1949,6 +1956,9 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         resolver.finish();
         // This bucket's blocks are finished with: reuse them for person buckets.
         for (Block* b : blocks) sh.alloc[tid].recycle((u8*)b);
+        const double step2 = now();
+        steps[0] += step1 - step0;
+        steps[1] += step2 - step1;
     }
 }
 
@@ -2368,6 +2378,7 @@ static void process_people(Shared& sh, u32 tid) {
     char name[64];
     snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid);
     writer.init(sh.cfg.out + name);
+    double* steps = g_steps[tid & 255];
 
     struct Local { u64 key; u32 index; u32 used; };          // a person's number within the bucket
     struct Bought { u64 key; u32 payload; u32 pad; };        // key = person number << 32 | ts
@@ -2394,6 +2405,7 @@ static void process_people(Shared& sh, u32 tid) {
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = sh.b[t].head[bucket]; b; b = b->next) nev += b->n;
         if (!nev) continue;
+        const double step0 = now();
 
         // 1. Number the people and key the events.
         size_t cap = 64;
@@ -2448,6 +2460,7 @@ static void process_people(Shared& sh, u32 tid) {
                 }
             }
         const u32 npeople = u32(persons.size());
+        const double step1 = now();
 
         // 2. Order the keys by slice, then (keeping that order) by person.
         sorted.resize(nev);
@@ -2460,6 +2473,7 @@ static void process_people(Shared& sh, u32 tid) {
         for (size_t k = 0; k < nev; k++) keys[cursor[sorted[k] >> 33]++] = sorted[k];
         if (bought.size() > 1) std::sort(bought.begin(), bought.end(), [](const Bought& x, const Bought& y) { return x.key < y.key; });
         bought.push_back({~0ULL, 0, 0});                          // sentinel
+        const double step2 = now();
 
         // 3. Clicks of people who have events, grouped by person.
         auto lookup = [&](u64 person) -> i64 {
@@ -2493,12 +2507,17 @@ static void process_people(Shared& sh, u32 tid) {
         }
 
         // 4. Each person: sessions, click credit and assists, daily rows.
+        const double step3 = now();
         size_t next_bought = 0;
         for (u32 p = 0; p < npeople; p++) {
             const u64* mine = keys.data() + person_start[p];
             const u32 n = person_start[p + 1] - person_start[p];
             Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
+#if SS_X == 5
+            const u32 m = 0;
+#else
             const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
+#endif
             // A handful of clicks are simply scanned for every session. More are put in
             // time order (at one instant the smallest click_id last) for a sliding window.
             const bool scan_clicks = m <= 16;
@@ -2551,6 +2570,9 @@ static void process_people(Shared& sh, u32 tid) {
             u32 left = 0, right = 0;
             // One session: first event at `start`, last at `last` (ms from window_start).
             auto session = [&](u32 start, u32 last, u32 nevents) {
+#if SS_X == 9
+                rows += start + last + nevents; return;
+#endif
                 const i64 day = floor_div(ws + start, DAY) - day0;
                 if (day != cur_day) {
                     if (cur_day >= 0) emit();
@@ -2637,8 +2659,15 @@ static void process_people(Shared& sh, u32 tid) {
             for (u32 c : active) camp_count[c] = 0;
             active.clear();
         }
+        const double step4 = now();
+        steps[2] += step1 - step0;
+        steps[3] += step2 - step1;
+        steps[4] += step3 - step2;
+        steps[5] += step4 - step3;
     }
+    const double step5 = now();
     writer.finish();
+    steps[6] += now() - step5;
     sh.user_rows.fetch_add(rows);
 }
 #else
@@ -2871,6 +2900,12 @@ int main() {
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
     fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links parse %.3f union %.3f | links %.3f\n",
             T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_parse, sh.links_union, sh.links_seconds);
+    {
+        double sum[8] = {};
+        for (u32 t = 0; t < T && t < 256; t++) for (int k = 0; k < 8; k++) sum[k] += g_steps[t][k];
+        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f\n",
+                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6]);
+    }
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
