@@ -39,6 +39,9 @@
 
 #include "parquet.h"
 
+#ifndef SS_UNIT
+#define SS_UNIT 64          // bytes staged per bucket before they are moved to its block chain
+#endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
 #endif
@@ -351,7 +354,7 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, Row&& row
     { u32 w = u32((e) - (s) >= 2) & u32(*(s) == '"') & u32((e)[-1] == '"'); (s) += w; (e) -= w; wrapped += 2 * w; }
 
 // ---------------------------------------------------------------- input chunks
-struct InputFile { int fd; size_t size; };
+struct InputFile { int fd; size_t size; const u8* map; };
 struct Task { u32 file; size_t begin, end; };
 
 // A thread's read buffer. data() has 64 readable bytes before and after.
@@ -375,6 +378,18 @@ struct Reader {
     // Loads the lines of `task`. Returns false when no line starts inside it.
     bool load(const InputFile& f, const Task& task, const u8*& buf, size_t& start, size_t& stop) {
         size_t from = task.begin ? task.begin - 1 : 0;
+        if (f.map) {
+            // Mapped input: usable in place when the chunk's last line ends in a
+            // newline with 64 readable bytes after it; otherwise copy as usual.
+            const u8* last = (const u8*)memchr(f.map + task.end - 1, '\n', f.size - (task.end - 1));
+            if (last && size_t(last - f.map) + 65 <= f.size) {
+                buf = f.map + from;
+                const u8* first = (const u8*)memchr(buf, '\n', size_t(last - buf) + 1);
+                start = size_t(first - buf) + 1;
+                stop = task.end - from;
+                return start < stop;
+            }
+        }
         size_t have = 0;
         size_t slack = 4096;
         size_t need = task.end - 1 - from;                 // a '\n' is needed at or after this index
@@ -412,7 +427,7 @@ static size_t g_arena_region = 1ULL << 30;
 
 static u8* slab_alloc() {
     std::lock_guard<std::mutex> guard(g_arena_lock);
-    if (g_arena_cur + SLAB > g_arena_end) {
+    if (size_t(g_arena_end - g_arena_cur) < SLAB) {
         size_t len = g_arena_region;
         void* p = mmap(nullptr, len + SLAB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
 #ifdef MAP_NORESERVE
@@ -455,7 +470,7 @@ struct Block { Block* next; u32 n; };
 // at the block's end: a cursor on a BLOCK boundary means "needs a new block".
 template <class T>
 struct Scatter {
-    static constexpr size_t PER = sizeof(T) == 24 ? 8 : 64 / sizeof(T);
+    static constexpr size_t PER = sizeof(T) == 24 ? 8 : SS_UNIT / sizeof(T);
     static constexpr size_t UNIT = PER * sizeof(T);
     static constexpr size_t HDR = BLOCK - ((BLOCK - 64) / UNIT) * UNIT;
     static constexpr u32 CAP = u32((BLOCK - HDR) / sizeof(T));
@@ -497,7 +512,7 @@ struct Scatter {
         T* c = cur[b];
         if (!(uintptr_t(c) & (BLOCK - 1))) c = grow(b, c);
         const u8* src = stage + size_t(b) * UNIT;
-#if defined(__AVX2__)
+#if defined(__AVX2__) && !defined(SS_NO_STREAM)
         for (size_t k = 0; k < UNIT; k += 32)
             _mm256_stream_si256((__m256i*)((u8*)c + k), _mm256_load_si256((const __m256i*)(src + k)));
 #else
@@ -598,30 +613,44 @@ struct Catalogs {
     std::unordered_map<std::string, i32> campaign_other;
 
     void load(const std::string& dir) {
+        // Products: one pass, numbering categories as they first appear; a
+        // repeated product ID keeps its last row. Then renumber in byte order.
         auto products = read_small_csv(dir + "/products.csv", 2);
-        std::unordered_map<std::string, std::string> category_of;
-        for (auto& row : products) category_of[row[0]] = row[1];      // a repeated ID keeps its last row
-        categories.push_back("unknown");
-        for (auto& kv : category_of) categories.push_back(kv.second);
-        std::sort(categories.begin(), categories.end());
-        categories.erase(std::unique(categories.begin(), categories.end()), categories.end());
-        if (categories.size() > 255) die("more than 255 categories");
-        std::unordered_map<std::string, u8> index;
-        for (size_t i = 0; i < categories.size(); i++) index[categories[i]] = u8(i);
-        unknown = index["unknown"];
-        i64 largest = -1;
-        for (auto& kv : category_of) {
-            const u8* s = (const u8*)kv.first.data();
-            if (kv.first.size() >= 2 && s[0] == 'p') largest = std::max(largest, canonical_number(s, s + kv.first.size(), 1));
+        std::unordered_map<std::string, u32> seen_category;
+        std::vector<std::string> names;
+        auto category_id = [&](const std::string& name) -> u32 {
+            auto it = seen_category.find(name);
+            if (it != seen_category.end()) return it->second;
+            names.push_back(name);
+            seen_category.emplace(name, u32(names.size() - 1));
+            return u32(names.size() - 1);
+        };
+        category_id("unknown");
+        std::vector<u32> dense;                    // provisional category + 1
+        std::unordered_map<std::string, u32> other;
+        for (auto& row : products) {
+            const u8* s = (const u8*)row[0].data();
+            i64 number = (row[0].size() >= 2 && s[0] == 'p') ? canonical_number(s, s + row[0].size(), 1) : -1;
+            u32 id = category_id(row[1]);
+            if (number >= 0) {
+                if (size_t(number) >= dense.size()) dense.resize(size_t(number) + 1 + dense.size() / 2, 0);
+                dense[size_t(number)] = id + 1;
+            } else {
+                other[row[0]] = id;
+            }
         }
-        product_dense.assign(size_t(largest + 1), 0);
-        for (auto& kv : category_of) {
-            const u8* s = (const u8*)kv.first.data();
-            i64 number = (kv.first.size() >= 2 && s[0] == 'p') ? canonical_number(s, s + kv.first.size(), 1) : -1;
-            if (number >= 0) product_dense[size_t(number)] = u8(index[kv.second] + 1);
-            else product_other[kv.first] = index[kv.second];
-        }
+        if (names.size() > 255) die("more than 255 categories");
+        std::vector<u32> rank(names.size());
+        for (u32 i = 0; i < names.size(); i++) rank[i] = i;
+        std::sort(rank.begin(), rank.end(), [&](u32 x, u32 y) { return names[x] < names[y]; });
+        std::vector<u8> final_id(names.size());
+        for (u32 i = 0; i < rank.size(); i++) { final_id[rank[i]] = u8(i); categories.push_back(names[rank[i]]); }
+        unknown = final_id[0];
+        product_dense.assign(dense.size(), 0);
+        for (size_t i = 0; i < dense.size(); i++) if (dense[i]) product_dense[i] = u8(final_id[dense[i] - 1] + 1);
+        for (auto& kv : other) product_other[kv.first] = final_id[kv.second];
 
+        i64 largest = -1;
         auto campaigns = read_small_csv(dir + "/campaigns.csv", 2);
         std::unordered_map<std::string, i32> seen;
         for (auto& row : campaigns) {
@@ -790,6 +819,7 @@ struct Config {
     std::string data, out;
     u32 threads = 8;
     size_t chunk = 256 << 10;
+    bool use_mmap = false;
 };
 
 struct Shared {
@@ -828,7 +858,12 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
         int fd = open(path.c_str(), O_RDONLY);
         if (fd < 0) die("cannot open an input file");
         u32 index = u32(sh.files.size());
-        sh.files.push_back({fd, size_t(st.st_size)});
+        const u8* map = nullptr;
+        if (sh.cfg.use_mmap) {
+            void* p = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+            if (p != MAP_FAILED) map = (const u8*)p;
+        }
+        sh.files.push_back({fd, size_t(st.st_size), map});
         for (size_t at = 0; at < size_t(st.st_size); at += sh.cfg.chunk)
             tasks.push_back({index, at, std::min(size_t(st.st_size), at + sh.cfg.chunk)});
     }
@@ -1510,6 +1545,7 @@ int main() {
     if (cfg.threads > 256) cfg.threads = 256;
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
+    cfg.use_mmap = !env("SS_MMAP", "").empty();
 
     {
         std::string text;
@@ -1536,6 +1572,8 @@ int main() {
     size_t rows = event_bytes / 64;
     while (sh.abits < 12 && (rows >> sh.abits) > 16384) sh.abits++;
     sh.bbits = sh.abits;
+    if (!env("SS_ABITS", "").empty()) sh.abits = u32(std::min(14, std::max(1, atoi(env("SS_ABITS", "").c_str()))));
+    if (!env("SS_BBITS", "").empty()) sh.bbits = u32(std::min(14, std::max(1, atoi(env("SS_BBITS", "").c_str()))));
     g_arena_region = std::max<size_t>(64u << 20, std::min<size_t>(4ULL << 30, event_bytes / 2 + (64u << 20)));
     g_arena_region = (g_arena_region + SLAB - 1) & ~(SLAB - 1);
 
