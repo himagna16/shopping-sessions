@@ -1369,6 +1369,7 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecK, 64>& lists = sh.k[tid];
     const u64 ukey = D.ukey, pmax = D.pmax;
     DateCache dates;
+    [[maybe_unused]] u64 csink = 0;
 #ifdef SS_NOCLICKS                   // measurement builds only
     return;
 #endif
@@ -1378,17 +1379,37 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+#ifndef SS_CL
+#define SS_CL 0                      // measurement builds only: stop the click row handler after step N
+#endif
+#if SS_CL == 1
+        for (size_t i = start; i < last; i += 64) csink += buf[i];
+        release_chunk(sh.files[task.file], task);
+        continue;
+#endif
         line_rows<4>(buf, start, stop, last, line4, [&](const Fields<4>& f) SS_INLINE {
             const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
+#if SS_CL == 2
+            csink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3); return;
+#endif
             if (s0 == e0 || s1 == e1) return;
             const i64 ts = parse_ts(s3, size_t(e3 - s3), dates);
             if (ts == TS_BAD || ts < lo || ts >= hi) return;
+#if SS_CL == 3
+            csink += u64(ts); return;
+#endif
             const i32 campaign = cat.campaign(s2, e2);
             if (campaign < 0) return;
+#if SS_CL == 4
+            csink += u64(ts) + u64(campaign); return;
+#endif
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
             u64 key, user_value;
             b36_pair(s0 + 1, n0 - 1, s1 + 1, n1 - 1, key, user_value);
             const u64 who = unscramble40(user_value, ukey);
+#if SS_CL == 5
+            csink += u64(ts) + u64(campaign) + key + who; return;
+#endif
             if ((s1[0] == 'u') & (user_value != ~0ULL) & ((who >> 9) < pmax) & ((who & 511) < 16)) {
                 const u32 user = (u32(who >> 9) << 4) | u32(who & 15);
                 if (s0[0] != 'k') key = ~0ULL;
@@ -1403,6 +1424,7 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
         });
         release_chunk(sh.files[task.file], task);
     }
+    if (csink == 1) fprintf(stderr, "sink\n");
 }
 
 // ---------------------------------------------------------------- between the phases
