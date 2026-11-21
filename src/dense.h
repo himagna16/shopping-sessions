@@ -1102,9 +1102,6 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     // ties settled afterwards.
     Click* ck = nullptr;
     u32 m = 0;
-#ifndef SS_DX
-#define SS_DX 0                      // measurement builds only: leave one step of the walk out
-#endif
 #if SS_DX == 3
     cx.rows += n; return;
 #endif
