@@ -42,6 +42,9 @@
 #ifndef SS_UNIT
 #define SS_UNIT 64          // bytes staged per bucket before they are moved to its block chain
 #endif
+#ifndef SS_X
+#define SS_X 0            // measurement builds only: skip one step (see probe branch)
+#endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
 #endif
@@ -466,6 +469,7 @@ static const size_t BLOCK = 8192;
 static std::mutex g_arena_lock;
 static u8* g_arena_cur = nullptr;
 static u8* g_arena_end = nullptr;
+static std::vector<std::pair<u8*, size_t>> g_arena_regions;
 static size_t g_arena_region = 1ULL << 30;
 
 static u8* slab_alloc() {
@@ -484,6 +488,7 @@ static u8* slab_alloc() {
 #endif
         g_arena_cur = base;
         g_arena_end = base + len;
+        g_arena_regions.emplace_back(base, len);
     }
     u8* out = g_arena_cur;
     g_arena_cur += SLAB;
@@ -591,7 +596,26 @@ struct RecB { u64 person; u32 ts; u32 payload; };                          // on
 struct RecC { u64 person; u64 ckey; u32 ts; u32 camp; };                   // one valid click, 24 bytes
 
 // ---------------------------------------------------------------- catalogs
-// Small files (products, campaigns): the same dialect, parsed the plain way.
+// One line of the dialect split the plain way. False if the line is malformed.
+static bool split_line(std::string_view line, std::vector<std::string>& fields) {
+    fields.clear();
+    if (line.empty()) return false;
+    size_t s = 0;
+    for (;;) {
+        size_t c = line.find(',', s);
+        std::string_view field = line.substr(s, c == std::string_view::npos ? std::string_view::npos : c - s);
+        if (field.find('"') != std::string_view::npos) {
+            if (field.size() < 2 || field.front() != '"' || field.back() != '"' ||
+                field.substr(1, field.size() - 2).find('"') != std::string_view::npos) return false;
+            field = field.substr(1, field.size() - 2);
+        }
+        fields.emplace_back(field);
+        if (c == std::string_view::npos) return true;
+        s = c + 1;
+    }
+}
+
+// Small files (campaigns): the same dialect, parsed the plain way.
 static std::vector<std::vector<std::string>> read_small_csv(const std::string& path, size_t width) {
     std::vector<std::vector<std::string>> rows;
     FILE* f = fopen(path.c_str(), "rb");
@@ -610,21 +634,7 @@ static std::vector<std::vector<std::string>> read_small_csv(const std::string& p
         at = nl + 1;
         if (header) { header = false; continue; }
         std::vector<std::string> fields;
-        bool ok = !line.empty();
-        size_t s = 0;
-        while (ok) {
-            size_t c = line.find(',', s);
-            std::string_view field = line.substr(s, c == std::string_view::npos ? std::string_view::npos : c - s);
-            if (field.find('"') != std::string_view::npos) {
-                if (field.size() < 2 || field.front() != '"' || field.back() != '"' ||
-                    field.substr(1, field.size() - 2).find('"') != std::string_view::npos) { ok = false; break; }
-                field = field.substr(1, field.size() - 2);
-            }
-            fields.emplace_back(field);
-            if (c == std::string_view::npos) break;
-            s = c + 1;
-        }
-        if (ok && fields.size() == width) rows.push_back(std::move(fields));
+        if (split_line(line, fields) && fields.size() == width) rows.push_back(std::move(fields));
     }
     return rows;
 }
@@ -656,30 +666,55 @@ struct Catalogs {
     std::unordered_map<std::string, i32> campaign_other;
 
     void load(const std::string& dir) {
-        // Products: one pass, numbering categories as they first appear; a
-        // repeated product ID keeps its last row. Then renumber in byte order.
-        auto products = read_small_csv(dir + "/products.csv", 2);
-        std::unordered_map<std::string, u32> seen_category;
-        std::vector<std::string> names;
-        auto category_id = [&](const std::string& name) -> u32 {
-            auto it = seen_category.find(name);
-            if (it != seen_category.end()) return it->second;
-            names.push_back(name);
-            seen_category.emplace(name, u32(names.size() - 1));
+        // Products: one pass over the file, numbering categories as they first
+        // appear; a repeated product ID keeps its last row. Then renumber in byte order.
+        std::vector<std::string> names{"unknown"};
+        auto category_id = [&](const char* p, size_t n) -> u32 {
+            for (size_t i = names.size(); i-- > 0;)
+                if (names[i].size() == n && memcmp(names[i].data(), p, n) == 0) return u32(i);
+            if (names.size() >= 255) die("more than 255 categories");
+            names.emplace_back(p, n);
             return u32(names.size() - 1);
         };
-        category_id("unknown");
         std::vector<u32> dense;                    // provisional category + 1
         std::unordered_map<std::string, u32> other;
-        for (auto& row : products) {
-            const u8* s = (const u8*)row[0].data();
-            i64 number = (row[0].size() >= 2 && s[0] == 'p') ? canonical_number(s, s + row[0].size(), 1) : -1;
-            u32 id = category_id(row[1]);
+        auto add_product = [&](const char* id, size_t id_len, const char* cat, size_t cat_len) {
+            const u8* s = (const u8*)id;
+            i64 number = (id_len >= 2 && s[0] == 'p') ? canonical_number(s, s + id_len, 1) : -1;
+            u32 category = category_id(cat, cat_len);
             if (number >= 0) {
                 if (size_t(number) >= dense.size()) dense.resize(size_t(number) + 1 + dense.size() / 2, 0);
-                dense[size_t(number)] = id + 1;
+                dense[size_t(number)] = category + 1;
             } else {
-                other[row[0]] = id;
+                other[std::string(id, id_len)] = category;
+            }
+        };
+        {
+            std::string data;
+            if (FILE* f = fopen((dir + "/products.csv").c_str(), "rb")) {
+                char tmp[1 << 16];
+                size_t got;
+                while ((got = fread(tmp, 1, sizeof tmp, f)) > 0) data.append(tmp, got);
+                fclose(f);
+            }
+            const char* p = data.data();
+            const char* end = p + data.size();
+            const char* header = (const char*)memchr(p, '\n', size_t(end - p));
+            p = header ? header + 1 : end;
+            while (p < end) {
+                const char* nl = (const char*)memchr(p, '\n', size_t(end - p));
+                if (!nl) nl = end;
+                const char* comma = (const char*)memchr(p, ',', size_t(nl - p));
+                // The plain shape `id,category` with no quote and one comma is handled here.
+                if (comma && !memchr(p, '"', size_t(nl - p)) && !memchr(comma + 1, ',', size_t(nl - comma - 1))) {
+                    add_product(p, size_t(comma - p), comma + 1, size_t(nl - comma - 1));
+                } else {
+                    std::string_view line(p, size_t(nl - p));
+                    std::vector<std::string> fields;
+                    if (split_line(line, fields) && fields.size() == 2)
+                        add_product(fields[0].data(), fields[0].size(), fields[1].data(), fields[1].size());
+                }
+                p = nl + 1;
             }
         }
         if (names.size() > 255) die("more than 255 categories");
@@ -883,9 +918,11 @@ struct Shared {
     std::vector<Scatter<RecC>> c;
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
-    // per thread: [(campaign * ndays + day) * 4 + {sessions, purchasing, revenue, assisted}]
-    std::vector<std::vector<i64>> campaign_totals;
+    // per thread, indexed campaign * ndays + day
+    struct Totals { std::vector<u32> sessions, purchasing, assisted; std::vector<i64> revenue; };
+    std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
+    double links_seconds = 0;
 };
 
 static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& tasks) {
@@ -915,6 +952,7 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
 
 // ---------------------------------------------------------------- phase 1: parse
 static void parse_links(Shared& sh, Reader& reader) {
+    const double began = now();
     Links links;
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop;
@@ -928,6 +966,7 @@ static void parse_links(Shared& sh, Reader& reader) {
         });
     }
     links.solve(sh.alias);
+    sh.links_seconds = now() - began;
     sh.links_ready.store(true, std::memory_order_release);
 }
 
@@ -1012,6 +1051,9 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 
 static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
+#if SS_PROBE == 5
+    return;
+#endif
     const i64 lo = sh.ws - REACH, hi = sh.we;
     const int shift = 64 - int(sh.bbits);
     const Catalogs& cat = sh.cat;
@@ -1055,7 +1097,8 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     const AliasMap& alias = sh.alias;
     Scatter<RecB>& out = sh.b[tid];
     std::vector<Block*> blocks;
-    std::vector<u64> table;                 // (hash tag << 32) | (block << 8 | index) + 1
+    std::vector<u64> table;                 // wide slots: (hash tag << 32) | reference
+    std::vector<u32> small;                 // narrow slots: (hash tag << 16) | reference
     static const u32 BATCH = 64;
     RecA* pending[BATCH];
     u64 pending_hash[BATCH];
@@ -1067,34 +1110,79 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         for (u32 t = 0; t < sh.cfg.threads; t++)
             for (Block* b = sh.a[t].head[bucket]; b; b = b->next) { blocks.push_back(b); total += b->n; }
         if (!total) continue;
-        size_t cap = 16;
-        while (cap < total * 2) cap <<= 1;
-        table.assign(cap, 0);
-        const u64 mask = cap - 1;
         // Smallest ingest_ts wins; equal ingest_ts means identical copies.
-        for (u32 bi = 0; bi < blocks.size(); bi++) {
-            RecA* recs = Scatter<RecA>::items(blocks[bi]);
-            for (u32 i = 0; i < blocks[bi]->n; i++) {
-                RecA& rec = recs[i];
-                const u64 m = mix64(rec.ekey);
-                const u64 mine = (m >> 20 << 32) | ((bi << 8 | i) + 1);
-                u64 at = m & mask;
-                for (;;) {
-                    u64 slot = table[at];
-                    if (!slot) { table[at] = mine; break; }
-                    if ((slot ^ mine) >> 32 == 0) {
-                        u32 ref = u32(slot) - 1;
-                        RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
-                        if (best.ekey == rec.ekey) {
-                            if (rec.ingest < best.ingest) { best.ts = DEAD; table[at] = mine; }
-                            else rec.ts = DEAD;
-                            break;
+        // A slot is a hash tag plus (block << 8 | index) + 1. With at most 256
+        // blocks the reference fits 16 bits and the whole slot 4 bytes.
+#if SS_X == 7
+        if (false) {
+#else
+        if (blocks.size() <= 256) {
+#endif
+            size_t cap = 16;
+            while (cap * 2 < total * 3) cap <<= 1;
+            small.assign(cap, 0);
+            const u64 mask = cap - 1;
+            for (u32 bi = 0; bi < blocks.size(); bi++) {
+                RecA* recs = Scatter<RecA>::items(blocks[bi]);
+                for (u32 i = 0; i < blocks[bi]->n; i++) {
+                    RecA& rec = recs[i];
+                    const u64 m = mix64(rec.ekey);
+                    const u32 mine = (u32(m >> 20) << 16) | ((bi << 8 | i) + 1);
+                    u64 at = m & mask;
+                    for (;;) {
+                        u32 slot = small[at];
+                        if (!slot) { small[at] = mine; break; }
+                        if ((slot ^ mine) >> 16 == 0) {
+                            u32 ref = (slot & 0xFFFF) - 1;
+                            RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
+                            if (best.ekey == rec.ekey) {
+                                if (rec.ingest < best.ingest) { best.ts = DEAD; small[at] = mine; }
+                                else rec.ts = DEAD;
+                                break;
+                            }
                         }
+                        at = (at + 1) & mask;
                     }
-                    at = (at + 1) & mask;
+                }
+            }
+        } else {
+#if SS_X == 7
+            if (true) goto emit;
+#endif
+            size_t cap = 16;
+            while (cap < total * 2) cap <<= 1;
+            table.assign(cap, 0);
+            const u64 mask = cap - 1;
+            for (u32 bi = 0; bi < blocks.size(); bi++) {
+                RecA* recs = Scatter<RecA>::items(blocks[bi]);
+                for (u32 i = 0; i < blocks[bi]->n; i++) {
+                    RecA& rec = recs[i];
+                    const u64 m = mix64(rec.ekey);
+                    const u64 mine = (m >> 20 << 32) | ((bi << 8 | i) + 1);
+                    u64 at = m & mask;
+                    for (;;) {
+                        u64 slot = table[at];
+                        if (!slot) { table[at] = mine; break; }
+                        if ((slot ^ mine) >> 32 == 0) {
+                            u32 ref = u32(slot) - 1;
+                            RecA& best = Scatter<RecA>::items(blocks[ref >> 8])[ref & 255];
+                            if (best.ekey == rec.ekey) {
+                                if (rec.ingest < best.ingest) { best.ts = DEAD; table[at] = mine; }
+                                else rec.ts = DEAD;
+                                break;
+                            }
+                        }
+                        at = (at + 1) & mask;
+                    }
                 }
             }
         }
+#if SS_X == 7
+    emit:
+#endif
+#if SS_X == 3
+        continue;
+#endif
         // Survivors that are valid get their person and move to a person bucket.
         u32 waiting = 0;
         auto flush = [&]() {
@@ -1110,7 +1198,11 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
                 const u64 hash = mix64(recs[i].ukey);
+#if SS_X == 4
+                if (true) {
+#else
                 if (!alias.maybe(hash)) {                 // not an alias: the ID is the person
+#endif
                     out.push(u32(hash >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
                     continue;
                 }
@@ -1210,8 +1302,11 @@ static void process_people(Shared& sh, u32 tid) {
     const u32 ndays = sh.ndays;
     const i64 ws = sh.ws, day0 = sh.day0;
     const u32 ncat = u32(sh.cat.categories.size());
-    std::vector<i64>& totals = sh.campaign_totals[tid];
-    totals.assign(size_t(ncamp + 1) * ndays * 4, 0);
+    Shared::Totals& totals = sh.campaign_totals[tid];
+    totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
+    totals.revenue.assign(size_t(ncamp + 1) * ndays, 0);
 
     UserWriter writer;
     char name[64];
@@ -1222,6 +1317,8 @@ static void process_people(Shared& sh, u32 tid) {
     std::vector<Cell> cells;
     std::vector<Purchase> purchases;
     std::vector<u64> persons;
+    struct Found { u32 person; Click click; };
+    std::vector<Found> found;
     std::vector<Click> clicks;
     std::vector<i64> cat_cents(ncat, 0);
     std::vector<u32> cat_touched;
@@ -1293,6 +1390,9 @@ static void process_people(Shared& sh, u32 tid) {
                 }
             }
         const u32 ncells = u32(cells.size());
+#if SS_X == 2
+        rows += ncells; continue;
+#endif
 
         // 2. Number the people and list each one's cells in slice order.
         size_t pcap = 64;
@@ -1339,29 +1439,29 @@ static void process_people(Shared& sh, u32 tid) {
             }
         };
         click_start.assign(npeople + 1, 0);
-        size_t nclicks = 0;
+        found.clear();
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
                 const RecC* recs = Scatter<RecC>::items(b);
                 for (u32 i = 0; i < b->n; i++) {
                     i64 id = lookup(recs[i].person);
-                    if (id >= 0) { click_start[size_t(id)]++; nclicks++; }
+                    if (id >= 0) {
+                        click_start[size_t(id)]++;
+                        found.push_back({u32(id), {recs[i].ts, recs[i].camp, recs[i].ckey}});
+                    }
                 }
             }
+        const size_t nclicks = found.size();
         if (nclicks) {
             for (u32 p = 0, sum = 0; p <= npeople; p++) { u32 n = click_start[p]; click_start[p] = sum; sum += n; }
             cursor.assign(click_start.begin(), click_start.end() - 1);
             clicks.resize(nclicks);
-            for (u32 t = 0; t < nthreads; t++)
-                for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
-                    const RecC* recs = Scatter<RecC>::items(b);
-                    for (u32 i = 0; i < b->n; i++) {
-                        i64 id = lookup(recs[i].person);
-                        if (id >= 0) clicks[cursor[size_t(id)]++] = {recs[i].ts, recs[i].camp, recs[i].ckey};
-                    }
-                }
+            for (const Found& f : found) clicks[cursor[f.person]++] = f.click;
         }
 
+#if SS_X == 1
+        rows += nclicks; continue;
+#endif
         // 4. Each person: sessions, click credit and assists, daily rows.
         for (u32 p = 0; p < npeople; p++) {
             u32* mine = order.data() + person_cells[p];
@@ -1378,7 +1478,11 @@ static void process_people(Shared& sh, u32 tid) {
                 std::sort(mine, mine + n, [&](u32 x, u32 y) { return cells[x].bin < cells[y].bin; });
             }
             Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
+#if SS_X == 5
+            const u32 m = 0;
+#else
             const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
+#endif
             // Time ascending; at one instant the smallest click_id comes last, so
             // the last click at or before a session start is the one to credit.
             auto before = [](const Click& x, const Click& y) {
@@ -1429,7 +1533,9 @@ static void process_people(Shared& sh, u32 tid) {
                     }
                     cat_touched.clear();
                 }
+#if SS_X != 6
                 writer.add(person_name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+#endif
                 rows++;
             };
             u32 left = 0, right = 0;
@@ -1482,12 +1588,12 @@ static void process_people(Shared& sh, u32 tid) {
                         }
                     }
                     if (right > left) credited = ck[right - 1].camp;
-                    for (u32 c : active) totals[(size_t(c) * ndays + size_t(day)) * 4 + 3]++;
+                    for (u32 c : active) totals.assisted[size_t(c) * ndays + size_t(day)]++;
                 }
-                i64* cell_total = &totals[(size_t(credited) * ndays + size_t(day)) * 4];
-                cell_total[0]++;
-                cell_total[1] += cents > 0;
-                cell_total[2] += cents;
+                const size_t slot = size_t(credited) * ndays + size_t(day);
+                totals.sessions[slot]++;
+                totals.purchasing[slot] += cents > 0;
+                totals.revenue[slot] += cents;
             }
             if (cur_day >= 0) emit();
             for (u32 c : active) camp_count[c] = 0;
@@ -1539,7 +1645,12 @@ static void write_campaigns(Shared& sh) {
     const u32 ndays = sh.ndays;
     std::vector<i64> total(size_t(ncamp + 1) * ndays * 4, 0);
     for (auto& part : sh.campaign_totals)
-        for (size_t i = 0; i < part.size(); i++) total[i] += part[i];
+        for (size_t i = 0; i < part.sessions.size(); i++) {
+            total[i * 4] += part.sessions[i];
+            total[i * 4 + 1] += part.purchasing[i];
+            total[i * 4 + 2] += part.revenue[i];
+            total[i * 4 + 3] += part.assisted[i];
+        }
     std::vector<u8> ids, channels;
     std::vector<i32> days;
     std::vector<i64> sessions, purchasing, revenue, assisted;
@@ -1681,10 +1792,25 @@ int main() {
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load());
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | links %.3f\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), sh.links_seconds);
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
+    if (getenv("SS_ZAP")) {
+        // Hand the record arena back on all threads instead of leaving it to a single-threaded exit.
+        std::vector<std::pair<u8*, size_t>> pieces;
+        for (auto& region : g_arena_regions)
+            for (size_t at = 0; at < region.second; at += 16u << 20)
+                pieces.emplace_back(region.first + at, std::min<size_t>(16u << 20, region.second - at));
+        std::atomic<size_t> next{0};
+        run_threads(T, [&](u32) {
+            for (;;) {
+                size_t i = next.fetch_add(1);
+                if (i >= pieces.size()) return;
+                madvise(pieces[i].first, pieces[i].second, MADV_DONTNEED);
+            }
+        });
+    }
     _exit(0);
 }
