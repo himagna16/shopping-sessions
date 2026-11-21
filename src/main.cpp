@@ -1143,9 +1143,9 @@ struct Block { Block* next; u32 n; };
 // stores, so the scatter touches each destination line once and never reads it.
 // Blocks are BLOCK-aligned and their header is sized so the records end exactly
 // at the block's end: a cursor on a BLOCK boundary means "needs a new block".
-template <class T>
+template <class T, size_t U = SS_UNIT>
 struct Scatter {
-    static constexpr size_t PER = sizeof(T) == 24 ? 8 : SS_UNIT / sizeof(T);
+    static constexpr size_t PER = sizeof(T) == 24 ? 8 : U / sizeof(T);
     static constexpr size_t UNIT = PER * sizeof(T);
     static constexpr size_t HDR = BLOCK - ((BLOCK - 64) / UNIT) * UNIT;
     static constexpr u32 CAP = u32((BLOCK - HDR) / sizeof(T));
@@ -1224,6 +1224,9 @@ struct Scatter {
 struct RecA { u64 ekey; u64 ukey; i64 ingest; u32 ts; u32 payload; };      // one event copy, 32 bytes
 struct RecB { u64 person; u32 ts; u32 payload; };                          // one surviving event, 16 bytes
 struct RecC { u64 person; u64 ckey; u32 ts; u32 camp; };                   // one valid click, 24 bytes
+// The dense path's records (dense.h says what the words hold).
+struct RecD { u64 a, b; };                                                 // one event copy with a decoded number, 16 bytes
+struct RecK { u64 x, y; };                                                 // one valid click of a decoded user, 16 bytes
 
 // ---------------------------------------------------------------- catalogs
 // One line of the dialect split the plain way. False if the line is malformed.
@@ -1719,6 +1722,11 @@ struct Shared {
     // filled by the first round of the people phase, consumed by the second.
     std::vector<Scatter<RecB>> lb;
     std::vector<Scatter<RecC>> lc;
+    // The dense path: event copies by event number, clicks by person number.
+    std::vector<Scatter<RecD, 64>> d;
+    std::vector<Scatter<RecK, 64>> k;
+    Links odd_links;                        // links the dense path leaves to the general one
+    u32 part_base = 0;                      // first output file and totals slot of the general people phase
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
     // per thread, indexed campaign * ndays + day
@@ -2581,7 +2589,8 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
     const u32 bbits = sh.bbits;
     const u32 SLICE = u32(SESSION_GAP);
     const u32 nslices = u32((sh.we - sh.ws) / SESSION_GAP) + 2;
-    Shared::Totals& totals = sh.campaign_totals[tid + round * nthreads];
+    const u32 part = tid + (round ? nthreads : sh.part_base);
+    Shared::Totals& totals = sh.campaign_totals[part];
     totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
     totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
     totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
@@ -2589,7 +2598,7 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
 
     UserWriter writer;
     char name[64];
-    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid + round * nthreads);
+    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", part);
     writer.init(sh.cfg.out + name);
     double* steps = g_steps[tid & 255];
 
@@ -3060,6 +3069,8 @@ static double run_threads(u32 n, F&& body) {
     return sum;
 }
 
+#include "dense.h"
+
 static i64 manifest_time(const std::string& text, const char* key) {
     size_t at = text.find(key);
     if (at == std::string::npos) die("manifest.json lacks a window bound");
@@ -3126,7 +3137,7 @@ static void write_campaigns(Shared& sh) {
     file.close();
 }
 
-int main() {
+int main(int, char** argv) {
     double t0 = now();
     Shared sh;
     Config& cfg = sh.cfg;
@@ -3209,6 +3220,24 @@ int main() {
     g_arena_region = (g_arena_region + SLAB - 1) & ~(SLAB - 1);
 
     const u32 T = cfg.threads;
+    bool dense = false;
+#ifdef SS_DENSE_BUILD
+    g_dense.argv = argv;
+    dense = dense_setup(sh);
+    if (dense) {
+        // The general path now only carries the few IDs that do not decode and the
+        // people handed over to it: a few buckets are enough.
+        sh.abits = 4;
+        sh.bbits = 6;
+        if (!env("SS_ABITS", "").empty()) sh.abits = u32(std::min(14, std::max(1, atoi(env("SS_ABITS", "").c_str()))));
+        if (!env("SS_BBITS", "").empty()) sh.bbits = u32(std::min(14, std::max(1, atoi(env("SS_BBITS", "").c_str()))));
+        sh.part_base = T;
+        sh.d.resize(T);
+        sh.k.resize(T);
+    }
+#else
+    (void)argv;
+#endif
     sh.a.resize(T);
     sh.b.resize(T);
     sh.c.resize(T);
@@ -3220,32 +3249,10 @@ int main() {
     mkdir((cfg.out + "/user_daily").c_str(), 0777);
     mkdir((cfg.out + "/campaign_daily").c_str(), 0777);
     double t1 = now();
+    double t2 = 0, t3 = 0, t4 = 0, c1 = 0, c2 = 0, c3 = 0;
 
-    double c1 = run_threads(T, [&](u32 tid) {
-        Reader reader;
-        sh.a[tid].init(1u << sh.abits, &sh.alloc[tid]);
-        if (tid == 0) parse_links(sh, reader);
-        parse_events(sh, tid, reader);
-        sh.a[tid].finish();
-        sh.c[tid].init(1u << sh.bbits, &sh.alloc[tid]);
-        parse_clicks(sh, tid, reader);
-        sh.c[tid].finish();
-    });
-    double t2 = now();
-
-    // SS_T2 / SS_T3: fewer threads for the dedup or the people phase (measurement).
-    const u32 T2 = std::min<u32>(T, std::max<u32>(1, u32(atoi(env("SS_T2", "0").c_str())) ? u32(atoi(env("SS_T2", "0").c_str())) : T));
-    const u32 T3 = std::min<u32>(T, std::max<u32>(1, u32(atoi(env("SS_T3", "0").c_str())) ? u32(atoi(env("SS_T3", "0").c_str())) : T));
-    for (u32 t = T2; t < T; t++) { sh.b[t].init(1u << sh.bbits, &sh.alloc[t]); sh.b[t].finish(); }
-    double c2 = run_threads(T2, [&](u32 tid) {
-        sh.b[tid].init(1u << sh.bbits, &sh.alloc[tid]);
-        dedup_buckets(sh, tid);
-        sh.b[tid].finish();
-    });
-    double t3 = now();
-
-    // Largest person buckets first, so a heavy one never ends up running alone at the end.
     auto order_buckets = [&](std::vector<Scatter<RecB>>& lists) {
+        // Largest person buckets first, so a heavy one never ends up running alone at the end.
         const u32 nb = 1u << sh.bbits;
         std::vector<u64> size(nb, 0);
         for (u32 t = 0; t < T; t++)
@@ -3256,15 +3263,91 @@ int main() {
         std::sort(sh.person_order.begin(), sh.person_order.end(), [&](u32 x, u32 y) { return size[x] > size[y]; });
         sh.next_person.store(0);
     };
+#ifdef SS_DENSE_BUILD
+    if (dense) {
+        Dense& D = g_dense;
+        c1 = run_threads(T, [&](u32 tid) {
+            Reader reader;
+            sh.a[tid].init(1u << sh.abits, &sh.alloc[tid]);
+            sh.d[tid].init(D.nparts, &sh.alloc[tid]);
+            if (tid == 0) parse_links_dense(sh, reader);
+            parse_events_dense(sh, tid, reader);
+            sh.a[tid].finish();
+            sh.d[tid].finish();
+            sh.k[tid].init(D.cparts, &sh.alloc[tid]);
+            parse_clicks_dense(sh, tid, reader);
+            sh.k[tid].finish();
+        });
+        if (env("SS_DENSE_BAIL", "") == "2") dense_bail(9);
+        if (D.bail.load()) dense_restart(sh, false);
+        dense_settle(sh);
+        t2 = now();
+        // Phase 2: the general dedup (few events) and the clicks grouped by person.
+        c2 = run_threads(T, [&](u32 tid) {
+            DenseCtx& cx = D.ctx[tid];
+            sh.b[tid].init(1u << sh.bbits, &sh.alloc[tid]);
+            sh.c[tid].init(1u << sh.bbits, &sh.alloc[tid]);
+            const int shift = 64 - int(sh.bbits);
+            for (const RecC& click : cx.pending) {
+                const u64 name = sh.alias.person(click.person);
+                sh.c[tid].push(u32(hash64(name) >> shift), RecC{name, click.ckey, click.ts, click.camp});
+            }
+            dedup_buckets(sh, tid);
+            dense_group_clicks(sh, tid);
+            sh.c[tid].finish();
+        });
+        t3 = now();
+        // Phase 3: events by number. Phase 4: the stretches that cross partitions, then the general people phase.
+        c3 = run_threads(T, [&](u32 tid) {
+            dense_walk(sh, tid);
+            sh.b[tid].finish();
+        });
+        dense_groups();
+        order_buckets(sh.b);
+        c3 += run_threads(T, [&](u32 tid) {
+            dense_stitch(sh, tid);
+            D.ctx[tid].writer.finish();
+            sh.user_rows.fetch_add(D.ctx[tid].rows);
+            process_people(sh, tid, 0);
+        });
+        t4 = now();
+        if (env("SS_DENSE_BAIL", "") == "1") dense_bail(9);
+        if (D.bail.load()) dense_restart(sh, true);
+    } else
+#endif
+    {
+    c1 = run_threads(T, [&](u32 tid) {
+        Reader reader;
+        sh.a[tid].init(1u << sh.abits, &sh.alloc[tid]);
+        if (tid == 0) parse_links(sh, reader);
+        parse_events(sh, tid, reader);
+        sh.a[tid].finish();
+        sh.c[tid].init(1u << sh.bbits, &sh.alloc[tid]);
+        parse_clicks(sh, tid, reader);
+        sh.c[tid].finish();
+    });
+    t2 = now();
+
+    // SS_T2 / SS_T3: fewer threads for the dedup or the people phase (measurement).
+    const u32 T2 = std::min<u32>(T, std::max<u32>(1, u32(atoi(env("SS_T2", "0").c_str())) ? u32(atoi(env("SS_T2", "0").c_str())) : T));
+    const u32 T3 = std::min<u32>(T, std::max<u32>(1, u32(atoi(env("SS_T3", "0").c_str())) ? u32(atoi(env("SS_T3", "0").c_str())) : T));
+    for (u32 t = T2; t < T; t++) { sh.b[t].init(1u << sh.bbits, &sh.alloc[t]); sh.b[t].finish(); }
+    c2 = run_threads(T2, [&](u32 tid) {
+        sh.b[tid].init(1u << sh.bbits, &sh.alloc[tid]);
+        dedup_buckets(sh, tid);
+        sh.b[tid].finish();
+    });
+    t3 = now();
+
     order_buckets(sh.b);
 #ifdef SS_ALIAS1
-    double c3 = run_threads(T3, [&](u32 tid) { process_people(sh, tid, 0); });
+    c3 = run_threads(T3, [&](u32 tid) { process_people(sh, tid, 0); });
 #else
     for (u32 t = T3; t < T; t++) {
         sh.lb[t].init(1u << sh.bbits, &sh.alloc[t]); sh.lb[t].finish();
         sh.lc[t].init(1u << sh.bbits, &sh.alloc[t]); sh.lc[t].finish();
     }
-    double c3 = run_threads(T3, [&](u32 tid) {
+    c3 = run_threads(T3, [&](u32 tid) {
         sh.lb[tid].init(1u << sh.bbits, &sh.alloc[tid]);
         sh.lc[tid].init(1u << sh.bbits, &sh.alloc[tid]);
         process_people(sh, tid, 0);
@@ -3274,7 +3357,8 @@ int main() {
     order_buckets(sh.lb);
     c3 += run_threads(T3, [&](u32 tid) { process_people(sh, tid, 1); });
 #endif
-    double t4 = now();
+    t4 = now();
+    }
 
     write_campaigns(sh);
     if (sh.user_rows.load() == 0) {                       // an empty table still needs a file with the schema
@@ -3298,6 +3382,23 @@ int main() {
         fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f | people %.0f | linked events %.0f ids %.0f\n",
                 sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7], sum[8], sum[9]);
     }
+#ifdef SS_DENSE_BUILD
+    if (dense) {
+        Dense& D = g_dense;
+        u64 people = 0, split = 0, sorted = 0, handed = 0, stitched = 0, odd_users = 0, odd_clicks = 0, pending = 0, marked = 0;
+        double cpu[4] = {};
+        for (const DenseCtx& cx : D.ctx) {
+            people += cx.n_people; split += cx.n_split; sorted += cx.n_sorted; handed += cx.n_handed; stitched += cx.n_stitched;
+            odd_users += cx.odd_users.size(); odd_clicks += cx.odd_clicks.size(); pending += cx.pending.size(); marked += cx.marked.size();
+            for (int k = 0; k < 4; k++) cpu[k] += cx.cpu[k];
+        }
+        fprintf(stderr, "dense keys e %llx u %llx\n", (unsigned long long)D.ekey, (unsigned long long)D.ukey);
+        fprintf(stderr, "dense | setup %.4f | numbers %llu parts %u people %u | walked %llu split %llu sorted %llu stitched events %llu groups %zu | handed events %llu odd users %llu odd clicks %llu pending clicks %llu marked %llu | cpu place %.3f sweep %.3f walk %.3f stitch %.3f\n",
+                D.setup_seconds, (unsigned long long)D.nidx, D.nparts, D.pmax, (unsigned long long)people, (unsigned long long)split, (unsigned long long)sorted,
+                (unsigned long long)stitched, D.gstart.size(), (unsigned long long)handed, (unsigned long long)odd_users, (unsigned long long)odd_clicks,
+                (unsigned long long)pending, (unsigned long long)marked, cpu[0], cpu[1], cpu[2], cpu[3]);
+    }
+#endif
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
