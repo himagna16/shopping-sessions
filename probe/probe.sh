@@ -52,38 +52,41 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 E="${PROBE_E:-20000000}"
 /generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
 B="$S/b"
-r batch "$B" /p
+r def "$B" /p
 dl " "
-r chain "$B" /pc
-r stage "$B" /ps
-r table "$B" /pt
+r g2k "$B" /pg2
+r g8k "$B" /pg8
+r nohot "$B" /pnh
+r dw13 "$B" /p13
+r g2kd13 "$B" /pgd
 r a512 "$B" /p512
-r dw15 "$B" /p15
-r batch "$B" /p
-r chain "$B" /pc
-r stage "$B" /ps
-r a512 "$B" /p512
-r c512k "$B" /p SS_CHUNK=524288
-echo "parse: wall cpu (touch line fields ts type +event +user all chain stage table a512 noclicks nolinks)"
-for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pc ps pt p512 pnc pnl; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+r pf0 "$B" /pf0
+r pf2k "$B" /pf2
+r pf512 "$B" /pf5
+r def "$B" /p
+echo "parse: wall cpu (touch line fields ts type +event +user all a512)"
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p p512; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
+w g2k "$B" /pg2
+w g8k "$B" /pg8
+w nohot "$B" /pnh
+w g2kd13 "$B" /pgd
 w noclick "$B" /dx1
 w nowrite "$B" /dx2
 w noheavy "$B" /dx4
-w nofile "$B" /dx6
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"
 if [ "$G" -le 22 ]; then
 E3=$(( E * 3 ))
 /generate --seed 9 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
 B="$S/c"
-r 60batch "$B" /p
+r 60def "$B" /p
 dl " "
-r 60stage "$B" /ps
+r 60g2k "$B" /pg2
+r 60g2kd13 "$B" /pgd
 r 60a512 "$B" /p512
-r 60dw15 "$B" /p15
-r 60batch "$B" /p
+r 60def "$B" /p
 fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
