@@ -1,6 +1,6 @@
 #!/bin/sh
-# Diagnostic run (never scored): inlining variants, the click parser by stage,
-# resolver distance, and whether a GCC 15 build writes the same bytes.
+# Diagnostic run (never scored): linked IDs settled per ID against per record,
+# and compiler options, all built with GCC 15.
 # Output stays under ~1,900 characters.
 exec 1>&2
 D="${DATA_DIR:-/data}"; S="${SCRATCH_DIR:-/scratch}"
@@ -44,46 +44,36 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 /expand "$D" "$S/b" "${PROBE_A:-20}"
 B="$S/b"
 r def "$B" /p
+r alias1 "$B" /pa1
+r id1 "$B" /pid1
 r nohot "$B" /pnh
-r nowalk "$B" /pnw
-r g15 "$B" /p15
-r id2 "$B" /pid2
-r rel2 "$B" /p SS_RELEASE=2
+r o2 "$B" /po2
+r clake "$B" /pcl
+r novec "$B" /pnv
 r def "$B" /p
+r alias1 "$B" /pa1
+r id1 "$B" /pid1
 r nohot "$B" /pnh
-r nowalk "$B" /pnw
-r g15 "$B" /p15
-r id2 "$B" /pid2
-r rel2 "$B" /p SS_RELEASE=2
-r t2x4 "$B" /p SS_T2=4
-r t3x4 "$B" /p SS_T3=4
+r o2 "$B" /po2
+r clake "$B" /pcl
+r novec "$B" /pnv
 st steps "$B" /p
-st nowalk "$B" /pnw
-st assist1 "$B" /pa1
+st alias1 "$B" /pa1
 st steps "$B" /p
-st assist1 "$B" /pa1
-st noblkpf "$B" /pnb
-st steps "$B" /p
-st noblkpf "$B" /pnb
-st scan0 "$B" /ps0
-st scan6 "$B" /ps6
-st d8 "$B" /pd8
-st d32 "$B" /pd32
-st d64 "$B" /pd64
-p cscan "$B" /pc2
-p cts "$B" /pc3
-p ccamp "$B" /pc4
-p cids "$B" /pc5
-p cnoalias "$B" /pc6
-p full "$B" /p
-sum sha14 "$B" /p
-sum sha15 "$B" /p15
+st alias1 "$B" /pa1
+p pdef "$B" /p
+p palias1 "$B" /pa1
+one "$B" /p > /dev/null; grep -E '^user' "$S/err" | cut -c1-60
+sum sha "$B" /p
+sum sha1 "$B" /pa1
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
-r 60nohot "$B" /pnh
-r 60g15 "$B" /p15
-r 60id2 "$B" /pid2
-r 60rel2 "$B" /p SS_RELEASE=2
+r 60alias1 "$B" /pa1
+r 60o2 "$B" /po2
+r 60clake "$B" /pcl
+st 60steps "$B" /p
+st 60alias1 "$B" /pa1
+one "$B" /p > /dev/null; grep -E '^user' "$S/err" | cut -c1-60
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
