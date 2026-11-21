@@ -886,6 +886,30 @@ static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) 
 static void line_selftest(u64 lines) {
     u64 state = 0x9E3779B97F4A7C15ULL ^ lines, a7 = 0, a4 = 0, a2 = 0;
     {
+        // The paired time-of-day conversion against the single one.
+        auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+        u64 wrong = 0, valid = 0;
+        for (u64 i = 0; i < lines; i++) {
+            u8 text[2][16];
+            for (int k = 0; k < 2; k++) {
+                const u64 kind = rnd() % 6;
+                for (int j = 0; j < 16; j++) text[k][j] = u8(kind == 0 ? rnd() & 0xFF : "0123456789:/;0123456"[rnd() % 20]);
+                if (kind >= 2) {
+                    const u32 h = u32(rnd() % (kind == 2 ? 30 : 24)), m = u32(rnd() % (kind == 3 ? 70 : 60)), sec = u32(rnd() % (kind == 4 ? 70 : 60));
+                    snprintf((char*)text[k], 16, "%02u:%02u:%02u", h, m, sec);
+                    if (rnd() % 16 == 0) text[k][rnd() % 8] = u8("0123456789:/;T Z-"[rnd() % 17]);
+                }
+            }
+            i32 a, b;
+            tod_pair(text[0], text[1], a, b);
+            const i32 wa = tod_seconds(text[0]), wb = tod_seconds(text[1]);
+            valid += (wa >= 0) + (wb >= 0);
+            if (a != wa || b != wb) { if (wrong++ < 5) fprintf(stderr, "time pair mismatch: [%.8s] [%.8s] got %d %d want %d %d\n", (const char*)text[0], (const char*)text[1], a, b, wa, wb); }
+        }
+        fprintf(stderr, "time pair: %llu pairs, %llu valid times, %llu mismatches\n", (unsigned long long)lines, (unsigned long long)valid, (unsigned long long)wrong);
+        if (wrong) _exit(1);
+    }
+    {
         // The paired ID decode against the single one, on IDs of every shape.
         auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
         u64 wrong = 0, valid = 0;
@@ -1048,16 +1072,36 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
             // As in parse_events: is the copy valid and on time, and where does its
             // ingest_ts stand among the copies of its event. Here the ingest time is
             // kept as whole seconds from a little before the window.
-            const i64 ts = parse_ts(s2, size_t(e2 - s2), dates);
-            const bool in_window = ts != TS_BAD && ts >= ws && ts < we;
-            bool timely = false, settled = false, far = false;
+            i64 ts;
+            bool in_window, timely = false, settled = false, far = false;
             u32 ing = ING_NONE;
-            if (in_window && e3 - s3 == 20) {
-                const u32 d = u32(u64(ts - sh.day_base) / u64(DAY));
-                if (u32(rd64(s3) == sh.day_text8[d]) & u32(rd16(s3 + 8) == sh.day_text2[d]) & u32(s3[10] == 'T') & u32(s3[19] == 'Z')) {
-                    const i32 seconds = tod_seconds(s3 + 11);
-                    if (seconds >= 0) { ing = day_lead + d * 86400 + u32(seconds); timely = true; }
+            const size_t n2 = size_t(e2 - s2), n3 = size_t(e3 - s3);
+            const DateTable::Entry* day = nullptr;
+#ifndef SS_NOFUSE
+            if (((n2 == 20) & (n3 == 20)) && s2[19] == 'Z' && (day = g_dates.find(s2)) != nullptr) {
+                // Both times in the usual form, the commonest line: one look-up of the
+                // date and both times of day converted together. The ingest time is
+                // settled here when it carries the same date as ts (then it cannot be late).
+                i32 ts_seconds, ing_seconds;
+                tod_pair(s2 + 11, s3 + 11, ts_seconds, ing_seconds);
+                ts = ts_seconds < 0 ? TS_BAD : day->ms + i64(ts_seconds) * 1000;
+                in_window = ts != TS_BAD && ts >= ws && ts < we;
+                if (in_window && (u32(rd64(s3) == rd64(s2)) & u32(rd16(s3 + 8) == rd16(s2 + 8)) & u32(s3[10] == 'T') & u32(s3[19] == 'Z'))) {
+                    if (ing_seconds >= 0) { ing = u32(day->sec - ing_base) + u32(ing_seconds); timely = true; }
                     settled = true;
+                }
+            } else
+#endif
+            {
+                ts = parse_ts(s2, n2, dates);
+                in_window = ts != TS_BAD && ts >= ws && ts < we;
+                if (in_window && n3 == 20) {
+                    const u32 d = u32(u64(ts - sh.day_base) / u64(DAY));
+                    if (u32(rd64(s3) == sh.day_text8[d]) & u32(rd16(s3 + 8) == sh.day_text2[d]) & u32(s3[10] == 'T') & u32(s3[19] == 'Z')) {
+                        const i32 seconds = tod_seconds(s3 + 11);
+                        if (seconds >= 0) { ing = day_lead + d * 86400 + u32(seconds); timely = true; }
+                        settled = true;
+                    }
                 }
             }
             if (!settled) {
