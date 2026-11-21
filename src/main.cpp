@@ -81,6 +81,9 @@
 #ifndef SS_LVL
 #define SS_LVL 0          // measurement builds only: stop the event row handler after step N
 #endif
+#ifndef SS_SCANMAX
+#define SS_SCANMAX 16     // a person with at most this many clicks has them scanned for every session
+#endif
 #ifndef SS_CLVL
 #define SS_CLVL 0         // measurement builds only: stop the click row handler after step N
 #endif
@@ -2618,7 +2621,7 @@ static void process_people(Shared& sh, u32 tid) {
 #endif
             // A handful of clicks are simply scanned for every session. More are put in
             // time order (at one instant the smallest click_id last) for a sliding window.
-            const bool scan_clicks = m <= 16;
+            const bool scan_clicks = m <= SS_SCANMAX;
             if (!scan_clicks) {
                 auto before = [](const Click& x, const Click& y) {
                     return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key, 'k'));
