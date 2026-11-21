@@ -17,12 +17,13 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then V3="-march=x86-64-v3 -mtune=skylake-av
  && $B -DSS_LPF=0 -o /pf0 \
  && $B -DSS_LPF=2048 -o /pf2 \
  && $B -DSS_LPF=512 -o /pf5 \
+ && $B -DSS_DIGEST -o /pdg \
  && for l in 1 2 3 4 5 6 7; do $B -DSS_PL=$l -o /pl$l || exit 1; done \
  && for l in 1 2 4; do $B -DSS_DX=$l -o /dx$l || exit 1; done \
- && strip /p /pg2 /pg8 /pnh /p13 /pgd /p512 /pf0 /pf2 /pf5 /pl? /dx?
+ && strip /p /pg2 /pg8 /pnh /p13 /pgd /p512 /pf0 /pf2 /pf5 /pdg /pl? /dx?
 
 FROM debian:bookworm-slim
 COPY --from=gen /g/target/release/generate /generate
-COPY --from=build /p /pg2 /pg8 /pnh /p13 /pgd /p512 /pf0 /pf2 /pf5 /pl1 /pl2 /pl3 /pl4 /pl5 /pl6 /pl7 /dx1 /dx2 /dx4 /
+COPY --from=build /p /pg2 /pg8 /pnh /p13 /pgd /p512 /pf0 /pf2 /pf5 /pdg /pl1 /pl2 /pl3 /pl4 /pl5 /pl6 /pl7 /dx1 /dx2 /dx4 /
 COPY probe/probe.sh /probe.sh
 CMD ["/bin/sh", "/probe.sh"]

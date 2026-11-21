@@ -44,6 +44,11 @@ w() {     # the walk: cpu ms per step, lowest walk of 3 runs
 dl() {    # the dense path's own line from the last run, numbers only (ms)
   awk -v l="$1" '/^dense \|/{printf "%s set %.1f hand %s cpu pl %d sw %d wk %d st %d wall se %.1f wk %.1f jn %.1f st %.1f\n", l, $4*1000, $27, $42*1000, $44*1000, $46*1000, $48*1000, $52*1000, $54*1000, $56*1000, $58*1000}' "$S/err"
 }
+dg() {    # the output digest of one run (dense and general must agree)
+  label="$1"; shift
+  one "$@" > /dev/null
+  awk -v l="$label" '/^digest/{print l, substr($3, 9), substr($5, 9), $7}' "$S/err"
+}
 sum() {   # one thread, so the files do not depend on timing: a digest of everything written
   label="$1"; shift
   one "$@" SS_THREADS=1 > /dev/null
@@ -64,6 +69,8 @@ r pf0 "$B" /pf0
 r pf2k "$B" /pf2
 r pf512 "$B" /pf5
 r def "$B" /p
+dg d20 "$B" /pdg
+dg g20 "$B" /pdg SS_DENSE=0
 echo "parse: wall cpu (touch line fields ts type +event +user all a512)"
 for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p p512; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 echo "walk: place sweep walk stitch | wall walk stitch"
@@ -87,6 +94,8 @@ r 60g2k "$B" /pg2
 r 60g2kd13 "$B" /pgd
 r 60a512 "$B" /p512
 r 60def "$B" /p
+dg d60 "$B" /pdg
+dg g60 "$B" /pdg SS_DENSE=0
 fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
