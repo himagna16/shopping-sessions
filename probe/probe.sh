@@ -57,32 +57,25 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 E="${PROBE_E:-20000000}"
 /generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
 B="$S/b"
-for round in 1 2; do
-r def "$B" /p
-r g1k "$B" /pg1
-r g4k "$B" /pg4
-r g8k "$B" /pg8
-r pf512 "$B" /pf5
+for round in 1 2 3; do
+r fuse "$B" /p
+r nofuse "$B" /pnf
+r notod "$B" /pnt
 done
-dl " "
-r gen "$B" /p SS_DENSE=0
+echo "parse: wall cpu (fields ts type | same without the fused lane)"
+for v in pl3 pl4 pl5 pn3 pn4 pn5 p pnf; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 dg d20 "$B" /pdg
 dg g20 "$B" /pdg SS_DENSE=0
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"
 if [ "$G" -le 22 ]; then
 E3=$(( E * 3 ))
-/generate --seed 11 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
+/generate --seed 13 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
 B="$S/c"
 for round in 1 2 3; do
-r 60def "$B" /p
-r 60dw14 "$B" /p14
+r 60fuse "$B" /p
+r 60nofuse "$B" /pnf
 done
-dl " "
-grep "^dense |" "$S/err" | cut -c1-120
-r 60g8k "$B" /pg8
-r 60pf512 "$B" /pf5
-r 60gen "$B" /p SS_DENSE=0
 dg d60 "$B" /pdg
 dg g60 "$B" /pdg SS_DENSE=0
 fi
