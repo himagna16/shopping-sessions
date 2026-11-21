@@ -896,6 +896,20 @@ struct InputFile { int fd; size_t size; const u8* map; };
 struct Task { u32 file; size_t begin, end; };
 
 static bool g_release_input = false;        // SS_RELEASE: drop a mapped chunk's page-table entries once it is parsed
+static bool g_populate_input = false;       // SS_POPULATE: map a chunk's pages in one call before it is parsed
+
+// Asks the kernel to fill in the page-table entries of a mapped chunk at once,
+// instead of taking a fault every few pages while scanning it. Advice only.
+static inline void populate_chunk(const u8* map, size_t from, size_t to) {
+#ifdef __linux__
+    if (!g_populate_input) return;
+    const size_t page = 4096;
+    from &= ~(page - 1);
+    madvise((void*)(map + from), to - from, 22 /* MADV_POPULATE_READ */);
+#else
+    (void)map; (void)from; (void)to;
+#endif
+}
 
 // The whole pages inside a finished chunk of a mapped file. The file stays
 // cached; this only spreads the unmapping over the workers instead of leaving
@@ -931,6 +945,7 @@ struct Reader {
         if (f.map) {
             // Mapped input: usable in place when the chunk's last line ends in a
             // newline with 64 readable bytes after it; otherwise copy as usual.
+            populate_chunk(f.map, from, std::min(f.size, task.end + 256));
             const u8* last = (const u8*)memchr(f.map + task.end - 1, '\n', f.size - (task.end - 1));
             if (last && size_t(last - f.map) + 65 <= f.size) {
                 buf = f.map + from;
@@ -2788,6 +2803,7 @@ int main() {
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
     g_release_input = !env("SS_RELEASE", "").empty();
+    g_populate_input = !env("SS_POPULATE", "").empty();
 #ifdef __linux__
     if (!env("SS_PIN", "").empty()) {
         cpu_set_t allowed;
