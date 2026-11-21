@@ -29,13 +29,11 @@ B="$S/b"
 r base "$B" /p
 r mmap "$B" /p SS_MMAP=1
 r c64k "$B" /p SS_CHUNK=65536
-r c128k "$B" /p SS_CHUNK=131072
 r c512k "$B" /p SS_CHUNK=524288
 r c1m "$B" /p SS_CHUNK=1048576
 r c4m "$B" /p SS_CHUNK=4194304
 r mm1m "$B" /p SS_MMAP=1 SS_CHUNK=1048576
 r mm4m "$B" /p SS_MMAP=1 SS_CHUNK=4194304
-r a8 "$B" /p SS_ABITS=8
 r a9 "$B" /p SS_ABITS=9
 r a10 "$B" /p SS_ABITS=10
 r a12 "$B" /p SS_ABITS=12
@@ -44,7 +42,6 @@ r b8 "$B" /p SS_BBITS=8
 r b9 "$B" /p SS_BBITS=9
 r b10 "$B" /p SS_BBITS=10
 r b12 "$B" /p SS_BBITS=12
-r b13 "$B" /p SS_BBITS=13
 r u128 "$B" /p128
 r nostr "$B" /pns
 r jcc "$B" /pjcc
@@ -52,6 +49,8 @@ r o2 "$B" /po2
 r 512 "$B" /p512
 r id2 "$B" /pid2
 r combo "$B" /pc
+r pgo "$B" /ppgo
+r cpgo "$B" /pcpgo
 r combo-mm "$B" /pc SS_MMAP=1
 r combo-1m "$B" /pc SS_CHUNK=1048576
 r t10 "$B" /p SS_THREADS=10
