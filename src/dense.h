@@ -262,17 +262,10 @@ static inline bool dense_click_less(u64 a, u64 b) {
 // ---------------------------------------------------------------- keys
 // Reads the start of the largest event file, recovers both keys from it and
 // sizes the tables. False leaves the run on the general path.
-static bool dense_setup(Shared& sh) {
-    Dense& D = g_dense;
-    const double began = now();
-    {
-        const char* v = getenv("SS_DENSE");
-        if (v && *v == '0') return false;
-    }
+// Recovers both keys from the start of the largest event file. False if the
+// data does not show them plainly.
+static bool dense_recover(Shared& sh, u64& ukey_out, u64& ekey_out, double& rows_out) {
     const u32 T = sh.cfg.threads;
-    if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
-    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
-
     size_t total_bytes = 0, best_size = 0;
     i64 best = -1;
     for (const Task& task : sh.event_tasks) {
@@ -395,8 +388,43 @@ static bool dense_setup(Shared& sh) {
     }
     if (keys.size() != 1) return false;
 
+    ukey_out = ukey;
+    ekey_out = keys[0];
+    rows_out = rows_est;
+    return true;
+}
+
+// Recovers the keys and sizes the tables. False leaves the run on the general path.
+// SS_DENSE=0 switches the dense path off; SS_DENSE=2 (tests) takes it even when
+// no key is found, with arbitrary keys: every ID then decodes to some number,
+// nearly all of them out of range, and the result must still be exact.
+static bool dense_setup(Shared& sh) {
+    Dense& D = g_dense;
+    const double began = now();
+    bool forced = false;
+    {
+        const char* v = getenv("SS_DENSE");
+        if (v && *v == '0') return false;
+        forced = v && *v == '2';
+    }
+    const u32 T = sh.cfg.threads;
+    if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
+    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
+    u64 ukey = 0, ekey = 0;
+    double rows_est = 0;
+    if (!dense_recover(sh, ukey, ekey, rows_est)) {
+        if (!forced) return false;
+        size_t total_bytes = 0;
+        for (const Task& task : sh.event_tasks) total_bytes += task.end - task.begin;
+        rows_est = double(total_bytes) / 40 + 16;
+        if (rows_est > 4.0e9) return false;
+        ukey = 0x5DEECE66DULL;
+        ekey = 0x2545F4914FULL;
+    }
+    const u64 pmax = std::min<u64>(1u << 23, u64(rows_est / 30 + rows_est / 300) + 256);
+    const u64 nidx = u64(rows_est + rows_est / 32) + 4096;
     D.ukey = ukey;
-    D.ekey = keys[0];
+    D.ekey = ekey;
     D.nidx = nidx;
     D.nparts = u32(nidx >> SS_DW) + 1;
     D.pmax = u32(pmax);
