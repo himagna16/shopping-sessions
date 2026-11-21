@@ -914,7 +914,9 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t, R
 struct InputFile { int fd; size_t size; const u8* map; };
 struct Task { u32 file; size_t begin, end; };
 
-static bool g_release_input = false;        // SS_RELEASE: drop a mapped chunk's page-table entries once it is parsed
+static int g_release_input = 0;             // SS_RELEASE: 1 drops a mapped chunk's page-table entries once it is parsed,
+                                            // 2 drops a whole file's when its last chunk is parsed
+static std::atomic<u32>* g_chunks_left = nullptr;   // per input file, for SS_RELEASE=2
 static bool g_populate_input = false;       // SS_POPULATE: map a chunk's pages in one call before it is parsed
 
 // Asks the kernel to fill in the page-table entries of a mapped chunk at once,
@@ -935,6 +937,13 @@ static inline void populate_chunk(const u8* map, size_t from, size_t to) {
 // it all to the single-threaded exit.
 static inline void release_chunk(const InputFile& f, const Task& task) {
     if (!g_release_input || !f.map) return;
+    if (g_release_input == 2) {
+        // One call per file: the cost of dropping mappings is mostly per call
+        // (every other thread is interrupted), not per page.
+        if (g_chunks_left && g_chunks_left[task.file].fetch_sub(1, std::memory_order_acq_rel) == 1)
+            madvise((void*)f.map, f.size, MADV_DONTNEED);
+        return;
+    }
     const size_t page = 4096;
     const size_t from = (task.begin + page - 1) & ~(page - 1), to = task.end & ~(page - 1);
     if (to > from) madvise((void*)(f.map + from), to - from, MADV_DONTNEED);
@@ -1697,7 +1706,7 @@ static void parse_links(Shared& sh, Reader& reader) {
     links.pairs.reserve(1 << 16);
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop, last;
-        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
         scan_rows<2>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #if defined(SS_SCAN4)
             QUOTED(0) QUOTED(1)
@@ -1737,7 +1746,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
         if (at >= sh.event_tasks.size()) break;
         const Task& task = sh.event_tasks[at];
         const u8* buf; size_t start, stop, last;
-        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
 #if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
@@ -1889,7 +1898,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         if (at >= sh.click_tasks.size()) break;
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
-        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
         scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #if defined(SS_SCAN4)
 #if SS_CLVL == 2
@@ -2952,7 +2961,7 @@ int main() {
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
     cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
-    g_release_input = !env("SS_RELEASE", "").empty();
+    g_release_input = env("SS_RELEASE", "").empty() ? 0 : env("SS_RELEASE", "") == "2" ? 2 : 1;
     g_populate_input = !env("SS_POPULATE", "").empty();
 #ifdef __linux__
     if (!env("SS_PIN", "").empty()) {
@@ -2995,6 +3004,12 @@ int main() {
     list_csv(sh, "links", sh.link_tasks);
     list_csv(sh, "events", sh.event_tasks);
     list_csv(sh, "clicks", sh.click_tasks);
+    if (g_release_input == 2) {
+        g_chunks_left = new std::atomic<u32>[sh.files.size() + 1];
+        for (size_t i = 0; i <= sh.files.size(); i++) g_chunks_left[i].store(0);
+        for (const std::vector<Task>* tasks : {&sh.link_tasks, &sh.event_tasks, &sh.click_tasks})
+            for (const Task& task : *tasks) g_chunks_left[task.file].fetch_add(1);
+    }
     size_t event_bytes = 0;
     for (const Task& task : sh.event_tasks) event_bytes += task.end - task.begin;
     // About 16K events a bucket, so a bucket's dedup table stays in cache.
