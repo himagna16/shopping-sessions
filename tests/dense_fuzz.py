@@ -103,8 +103,10 @@ class State:
         if r < 0.85: return self.user_of(person, rng.randrange(16, 40))
         if r < 0.90: return self.user_of(max(self.people) + rng.randrange(1, 100000), rng.randrange(0, 3))
         if r < 0.93: return "u" + b36((1 << 39) + rng.randrange(1, 4))
-        if r < 0.97: return rng.choice(self.users).upper()
-        return rng.choice(["u0" + rng.choice(self.users)[1:], "x1", "U", "u" + "z" * 8, "u" + "z" * 9, " " + rng.choice(self.users)])
+        if r < 0.95: return rng.choice(self.users).upper()
+        return rng.choice(["u0" + rng.choice(self.users)[1:], "x1", "U", "u" + "z" * 8, "u" + "z" * 9, " " + rng.choice(self.users),
+                           "u" + rng.choice(self.users)[1:].upper(), "u" + "".join(rng.choice("AZ-/:{`") for _ in range(rng.choice([4, 4, 8, rng.randrange(1, 9)]))),
+                           "u" + "".join(rng.choice("AZ-/:{`") for _ in range(4)) + rng.choice(self.users)[1:5]])
 
     def unique_event(self):
         rows = self.rows("events", 7)
@@ -164,7 +166,8 @@ def m_event_id(st):
     elif k == 2: new = "e0" + r[0][1:]
     elif k == 3: new = "e" + b36(scramble(rng.randrange(0, 4 * st.events + 10), st.ekey))     # another number, used or not
     elif k == 4: new = "e" + b36(scramble(rng.randrange(1 << 30, 1 << 40), st.ekey))
-    elif k == 5: new = rng.choice(["x", "E", "e", "ez" + "9" * 8, " " + r[0]])
+    elif k == 5: new = rng.choice(["x", "E", "e", "ez" + "9" * 8, " " + r[0], "e" + r[0][1:].upper(), "e" + "".join(rng.choice("AZ-/:{`") for _ in range(rng.choice([4, 8]))),
+                                  "e" + "".join(rng.choice("AZ-/:{`") for _ in range(rng.randrange(1, 9))), "e" + "".join(rng.choice("AZ-/:{`") for _ in range(4)) + r[0][1:5]])
     else: new = "e" + b36(rng.randrange(MASK + 1, 36 ** 8))                                  # spells a value over 2^40
     if st.set_event_id(r, new): return "event_id"
 
@@ -228,7 +231,7 @@ def fresh_click(st):
         elif k == 2: cid = "k0" + "".join(rng.choice(DIG) for _ in range(rng.randrange(1, 5)))
         elif k == 3: cid = "k" + b36(rng.randrange(MASK + 1, 36 ** 8))
         elif k == 4: cid = "k" + "".join(rng.choice(DIG) for _ in range(rng.randrange(9, 12)))
-        elif k == 5: cid = rng.choice(["a", "j", "l", "kz", "k~", "k "]) + str(rng.randrange(1000))
+        elif k == 5: cid = rng.choice(["a", "j", "l", "kz", "k~", "k ", "kABCD", "k////", "k" + "Z" * 8, "k" + "".join(rng.choice("AZ-/:{`") for _ in range(4))]) + rng.choice(["", str(rng.randrange(1000))])
         else: cid = "k" + b36(rng.randrange(0, 36 ** rng.randrange(1, 8)))
         if cid not in st.click_ids:
             st.click_ids.add(cid)
