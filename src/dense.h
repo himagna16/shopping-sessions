@@ -208,6 +208,7 @@ struct DenseCtx {
     hvec<u64> click_keys, click_tmp;
     hvec<i64> cat_cents;
     hvec<u32> cat_touched, camp_count, camp_slot, stamp, run_day, run_first;
+    hvec<u16> hot;                                  // per campaign and day: sessions, assists (see dense_sessions)
     u32 session_id = 0;
     u32 memo_user = ~0u;
     u64 memo_person = 0;
@@ -589,9 +590,9 @@ static inline SS_HOT bool line2(const u8* p, Fields<2>& f, const u8*& next) {
     return true;
 }
 
-// The same three readers for a line whose newline is already known (the usual
-// way in: line_rows finds the newlines of a batch of lines first, so reading one
-// line does not wait on the line before it). Only commas and quotes are looked for.
+// The same three readers for a line whose newline is already known (used by the
+// batched variants, which find the newlines of a group of lines first). Only
+// commas and quotes are looked for.
 struct CommaQuote { u64 comma, quote; };
 static inline SS_HOT CommaQuote comma_quote(const u8* p) {
 #if defined(__AVX2__)
@@ -684,6 +685,42 @@ static inline SS_HOT bool line_known(const u8* p, const u8* nl, Fields<2>& f) {
     return true;
 }
 
+// Calls rows(fields, n) with the well-formed lines of NF fields that start in
+// [start, stop), up to GROUP at a time: the caller then works through a group
+// one step at a time (all the timestamps, then all the IDs, ...), so that each
+// step is a short loop whose turns do not wait on one another.
+template <int NF, class Rows>
+static inline SS_INLINE void line_groups(const u8* buf, size_t start, size_t stop, size_t last, Rows&& rows) {
+    enum { BATCH = 64, GROUP = 32 };
+    u32 ends[BATCH + 72];
+    Fields<NF> fs[GROUP];
+    size_t block = start, line = start;
+    u32 n = 0;
+    for (;;) {
+        u32 count = 0;
+        while (count < BATCH && block <= last) {
+            __builtin_prefetch(buf + block + 1024);
+            u64 nl = newline_mask(buf + block);
+            const u32 found = u32(__builtin_popcountll(nl));
+            ends[count] = u32(block) + tz64(nl); nl &= nl - 1;
+            ends[count + 1] = u32(block) + tz64(nl); nl &= nl - 1;
+            for (u32 i = 2; i < found; i++) { ends[count + i] = u32(block) + tz64(nl); nl &= nl - 1; }
+            count += found;
+            block += 64;
+        }
+        for (u32 k = 0; k < count; k++) {
+            if (line >= stop) break;
+            const u8* p = buf + line;
+            const u8* nl = buf + ends[k];
+            line = size_t(ends[k]) + 1;
+            if (__builtin_expect(!line_known(p, nl, fs[n]), 0) && !split_exact<NF>(p, nl, fs[n])) continue;
+            if (++n == GROUP) { rows(fs, n); n = 0; }
+        }
+        if (line >= stop || block > last) break;
+    }
+    if (n) rows(fs, n);
+}
+
 // Calls row(fields) for every well-formed line of NF fields that starts in
 // [start, stop); `last` is the newline that ends the last such line, with 64
 // readable bytes after it (as for scan_rows).
@@ -702,9 +739,10 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
         }
         row(f);
     });
-#elif !defined(SS_LINE1)
-    // The newlines of a batch of lines first, 64 bytes at a time; then each line
-    // of the batch on its own, its end already known.
+#elif defined(SS_LINE2)
+    // Measurement: the newlines of a batch of lines first, 64 bytes at a time; then
+    // each line of the batch on its own, its end already known. On the scoring
+    // machine this is slower than reading line after line (the default below).
     (void)fast;
     enum { BATCH = 64 };
     u32 ends[BATCH + 72];
@@ -737,7 +775,12 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
     const u8* const stop_at = buf + stop;
     const u8* const last_nl = buf + last;
     while (p < stop_at) {
-        __builtin_prefetch(p + 1024);
+#ifndef SS_LPF
+#define SS_LPF 1024                  // how far ahead of the line being read the input is asked for
+#endif
+#if SS_LPF > 0
+        __builtin_prefetch(p + SS_LPF);
+#endif
         Fields<NF> f;
         const u8* next;
         if (__builtin_expect(!fast(p, f, next), 0)) {
@@ -940,7 +983,7 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     sh.links_seconds = now() - began;
 }
 
-static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
+[[maybe_unused]] static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
     Dense& D = g_dense;
     DenseCtx& cx = D.ctx[tid];
     const u32 VIEW = rd32((const u8*)"view"), CART = rd32((const u8*)"cart");
@@ -1082,6 +1125,173 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
     }
     if (sink == 1) fprintf(stderr, "sink\n");
 }
+
+#ifdef SS_STAGE
+// The event parser working a group of lines one step at a time. Each step is
+// the same work as in parse_events_dense, row for row.
+static void parse_events_staged(Shared& sh, u32 tid, Reader& reader) {
+    Dense& D = g_dense;
+    DenseCtx& cx = D.ctx[tid];
+    const u32 VIEW = rd32((const u8*)"view"), CART = rd32((const u8*)"cart");
+    const u64 PURCHASE = rd64((const u8*)"purchase");
+    const i64 ws = sh.ws, we = sh.we;
+    const int gshift = 64 - int(sh.abits);
+    const Catalogs& cat = sh.cat;
+    Scatter<RecA>& general = sh.a[tid];
+    Scatter<RecD, 64>& lists = sh.d[tid];
+    const u64 ekey = D.ekey, ukey = D.ukey, nidx = D.nidx, pmax = D.pmax;
+    const i64 ing_base = D.ing_base;
+    const u32 day_lead = ING_LEAD_DAYS * 86400;
+    const i64 day_base = sh.day_base;
+    const u64* day8 = sh.day_text8.data();
+    const u16* day2 = sh.day_text2.data();
+    DateCache dates;
+    [[maybe_unused]] u64 sink = 0;
+    for (;;) {
+        size_t at = sh.next_event.fetch_add(1, std::memory_order_relaxed);
+        if (at >= sh.event_tasks.size()) break;
+        const Task& task = sh.event_tasks[at];
+        const u8* buf; size_t start, stop, last;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+        line_groups<7>(buf, start, stop, last, [&](const Fields<7>* fs, u32 n) SS_INLINE {
+            enum { G = 32 };
+            i64 ts[G];
+            u32 ts32[G], payload[G], ing[G];
+            u64 number[G], who[G];
+            u8 far[G];
+            u32 f1[G], f3[G], other[G];
+#if SS_PL == 2 || SS_PL == 3
+            for (u32 i = 0; i < n; i++) for (int k = 0; k < 7; k++) sink += size_t(fs[i].e[k] - fs[i].s[k]);
+            return;
+#endif
+            // 1. Timestamps, by form: each loop meets one form only.
+            u32 n1 = 0, n3 = 0, n0 = 0;
+            for (u32 i = 0; i < n; i++) {
+                const size_t len = size_t(fs[i].e[2] - fs[i].s[2]);
+                const u32 is1 = u32(len == 20) & u32(fs[i].s[2][19] == 'Z'), is3 = u32(len == 13);
+                f1[n1] = i; n1 += is1;
+                f3[n3] = i; n3 += is3;
+                other[n0] = i; n0 += 1 - (is1 | is3);
+            }
+            for (u32 k = 0; k < n1; k++) {
+                const u32 i = f1[k];
+                const u8* p = fs[i].s[2];
+                const i64 day = g_dates.lookup(p);
+                if (__builtin_expect(day != TS_BAD, 1)) {
+                    const i32 seconds = tod_seconds(p + 11);
+                    ts[i] = seconds < 0 ? TS_BAD : day + i64(seconds) * 1000;
+                } else ts[i] = parse_f1(p, dates);
+            }
+            for (u32 k = 0; k < n3; k++) {
+                const u32 i = f3[k];
+                const u8* p = fs[i].s[2];
+                u64 hi, lo;
+                ts[i] = (parse8(p, hi) && parse8(p + 5, lo)) ? i64(hi * 100000 + lo % 100000) : TS_BAD;
+            }
+            for (u32 k = 0; k < n0; k++) {
+                const u32 i = other[k];
+                ts[i] = parse_ts(fs[i].s[2], size_t(fs[i].e[2] - fs[i].s[2]), dates);
+            }
+            // 2. Ingest time, lateness, type and price.
+            for (u32 i = 0; i < n; i++) {
+                const u8 *s1 = fs[i].s[1], *e1 = fs[i].e[1], *s3 = fs[i].s[3], *e3 = fs[i].e[3], *s4 = fs[i].s[4], *e4 = fs[i].e[4];
+                const u8 *s5 = fs[i].s[5], *e5 = fs[i].e[5], *s6 = fs[i].s[6], *e6 = fs[i].e[6];
+                const i64 t = ts[i];
+                const bool in_window = t != TS_BAD && t >= ws && t < we;
+                bool timely = false, settled = false, off = false;
+                u32 g = ING_NONE;
+                if (in_window && e3 - s3 == 20) {
+                    const u32 d = u32(u64(t - day_base) / u64(DAY));
+                    if (u32(rd64(s3) == day8[d]) & u32(rd16(s3 + 8) == day2[d]) & u32(s3[10] == 'T') & u32(s3[19] == 'Z')) {
+                        const i32 seconds = tod_seconds(s3 + 11);
+                        if (seconds >= 0) { g = day_lead + d * 86400 + u32(seconds); timely = true; }
+                        settled = true;
+                    }
+                }
+                if (!settled) {
+                    const i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
+                    if (ingest != TS_BAD) {
+                        const i64 rel = floor_div(ingest, 1000) - ing_base;
+                        if (rel < 0 || rel >= i64(ING_NONE)) { off = true; g = rel < 0 ? 0 : ING_NONE - 1; }
+                        else g = u32(rel);
+                        timely = in_window && ingest - t <= DAY;
+                    }
+                }
+                u32 valid_ts = DEAD, pay = 0;
+                if (timely && s1 != e1 && s5 != e5) {
+                    const size_t kind = size_t(e4 - s4);
+                    bool ok = false;
+                    if (kind == 4) {
+                        const u32 word = rd32(s4);
+                        ok = (word == VIEW) | (word == CART);
+                    } else if (kind == 8 && rd64(s4) == PURCHASE) {
+                        const u8* p = s6;
+                        while (p < e6 && *p == '0') p++;
+                        u32 price = 0;
+                        bool digits = e6 > s6 && e6 - p <= 8;
+                        for (; digits && p < e6; p++) {
+                            const u32 digit = *p - '0';
+                            if (digit > 9) digits = false;
+                            price = price * 10 + digit;
+                        }
+                        if (digits && price >= 1 && price <= 10'000'000) {
+                            ok = true;
+                            pay = (price << 8) | cat.category(s5, e5);
+                        }
+                    }
+                    if (ok) valid_ts = u32(t - ws);
+                }
+                ts32[i] = valid_ts; payload[i] = pay; ing[i] = g; far[i] = u8(off);
+            }
+#if SS_PL == 4 || SS_PL == 5
+            for (u32 i = 0; i < n; i++) sink += u64(ts32[i]) + payload[i] + ing[i];
+            return;
+#endif
+            // 3. Both IDs of every line, and their numbers.
+            for (u32 i = 0; i < n; i++) {
+                const u8 *s0 = fs[i].s[0], *s1 = fs[i].s[1];
+                const size_t l0 = size_t(fs[i].e[0] - s0), l1 = size_t(fs[i].e[1] - s1);
+                u64 event_value, user_value;
+                b36_pair(s0 + 1, l0 - 1, s1 + 1, l1 - 1, event_value, user_value);
+                const u64 a = unscramble40(event_value, ekey), b = unscramble40(user_value, ukey);
+                number[i] = ((s0[0] == 'e') & (event_value != ~0ULL)) ? a : ~0ULL;
+                who[i] = ((s1[0] == 'u') & (user_value != ~0ULL) & ((b >> 9) < pmax) & ((b & 511) < 16)) ? b : ~0ULL;
+            }
+#if SS_PL == 6 || SS_PL == 7
+            for (u32 i = 0; i < n; i++) sink += number[i] + who[i];
+            return;
+#endif
+            // 4. The records.
+            for (u32 i = 0; i < n; i++) {
+                const u8 *s0 = fs[i].s[0], *e0 = fs[i].e[0];
+                if (s0 == e0) continue;                         // no event_id
+                if (__builtin_expect(number[i] < nidx, 1)) {
+                    u32 user = 0;
+                    if (ts32[i] != DEAD) {
+                        if (who[i] != ~0ULL) user = (u32(who[i] >> 9) << 4) | u32(who[i] & 15);
+                        else user = dense_odd_user(cx, tid, pack_id(fs[i].s[1], size_t(fs[i].e[1] - fs[i].s[1]), 'u'));
+                    }
+                    if (far[i]) dense_bail(1);
+                    lists.push(u32(number[i] >> SS_DW), RecD{(u64(ts32[i]) << 32) | payload[i], (u64(ing[i]) << ING_SHIFT) | ((number[i] & (DWIDTH - 1)) << 28) | user});
+                    continue;
+                }
+                const u8 *s3 = fs[i].s[3], *e3 = fs[i].e[3];
+                RecA rec;
+                rec.ekey = pack_id(s0, size_t(e0 - s0), 'e');
+                const i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
+                rec.ingest = ingest == TS_BAD ? INT64_MAX : floor_div(ingest, DAY) * (1LL << 24) + tod_code(s3 + 11);
+                rec.ukey = 0;
+                rec.ts = ts32[i];
+                rec.payload = payload[i];
+                if (ts32[i] != DEAD) rec.ukey = pack_id(fs[i].s[1], size_t(fs[i].e[1] - fs[i].s[1]), 'u');
+                general.push(u32(hash64(rec.ekey) >> gshift), rec);
+            }
+        });
+        release_chunk(sh.files[task.file], task);
+    }
+    if (sink == 1) fprintf(stderr, "sink\n");
+}
+#endif
 
 static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
     Dense& D = g_dense;
@@ -1235,6 +1445,11 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     hvec<u32>& run_day = cx.run_day;
     hvec<u32>& run_first = cx.run_first;
     UserWriter& writer = cx.writer;
+    // Sessions and assists are counted in 16 bits first, two counters side by side
+    // for each campaign and day: a quarter of the memory of the full counters, so
+    // the counts a thread is adding to stay in its cache. A counter that fills
+    // carries into the full one; the rest is added when the thread is done.
+    [[maybe_unused]] u16* hot = cx.hot.data();
     u64 rows = 0;
 
     // This person's clicks. A handful are simply scanned for every session. More
@@ -1383,7 +1598,17 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             acc1 = acc0;
         }
 #endif
-        for (u32 k = 0; k < m; k++) { totals.assisted[size_t(lcamp[k]) * ndays + size_t(cur_day)] += lacc[k]; lacc[k] = 0; }
+        for (u32 k = 0; k < m; k++) {
+            const size_t slot = size_t(lcamp[k]) * ndays + size_t(cur_day);
+#ifndef SS_NOHOT16
+            const u32 sum = u32(hot[slot * 2 + 1]) + lacc[k];
+            hot[slot * 2 + 1] = u16(sum);
+            if (__builtin_expect(sum > 0xFFFF, 0)) totals.assisted[slot] += sum & ~0xFFFFu;
+#else
+            totals.assisted[slot] += lacc[k];
+#endif
+            lacc[k] = 0;
+        }
     };
     u32 left = 0, right = 0;
     // The same span counting of assists as in process_people.
@@ -1485,7 +1710,11 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             ord++;
         }
         const size_t slot = size_t(credited) * ndays + size_t(day);
+#ifndef SS_NOHOT16
+        if (__builtin_expect(++hot[slot * 2] == 0, 0)) totals.sessions[slot] += 65536;
+#else
         totals.sessions[slot]++;
+#endif
         if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
     }
     if (cur_day >= 0) {
@@ -1595,11 +1824,24 @@ static void dense_ctx_init(Shared& sh, DenseCtx& cx, u32 part) {
     cx.al.resize(DWIDTH);
     cx.runs.resize(DWIDTH + 1);
     cx.cat_cents.assign(sh.cat.categories.size(), 0);
+    cx.hot.assign(size_t(ncamp + 1) * ndays * 2, 0);
     cx.camp_count.assign(ncamp + 1, 0);
     cx.camp_slot.assign(ncamp + 1, 0);
     cx.stamp.assign(ncamp + 1, 0);
     cx.run_day.assign(ndays + 2, 0);
     cx.run_first.assign(ndays + 2, 0);
+}
+
+// A thread's walk is over: its 16-bit counts join the full ones and its file is closed.
+static void dense_ctx_finish(Shared& sh, DenseCtx& cx) {
+    if (!cx.ready) return;
+    Shared::Totals& totals = *cx.totals;
+    for (size_t slot = 0; slot * 2 < cx.hot.size(); slot++) {
+        totals.sessions[slot] += cx.hot[slot * 2];
+        totals.assisted[slot] += cx.hot[slot * 2 + 1];
+    }
+    cx.writer.finish();
+    sh.user_rows.fetch_add(cx.rows);
 }
 
 // Phase 3: one partition of event numbers at a time. Copies go to their slot
@@ -1757,10 +1999,7 @@ static void dense_leftovers(Shared& sh) {
         if (!cx.ready) dense_ctx_init(sh, cx, 2 * T);
         dense_person(sh, cx, person, nullptr, nullptr, 0, 0, 0);
     }
-    if (cx.ready) {
-        cx.writer.finish();
-        sh.user_rows.fetch_add(cx.rows);
-    }
+    dense_ctx_finish(sh, cx);
 }
 
 // Starts the program again with the dense path switched off.

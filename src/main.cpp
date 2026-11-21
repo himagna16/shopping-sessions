@@ -2181,7 +2181,10 @@ static void dedup_buckets(Shared& sh, u32 tid) {
 struct Click { u32 ts; u32 camp; u64 key; };
 
 struct UserWriter {
-    static const u32 GROUP = 1u << 17;
+#ifndef SS_GROUP
+#define SS_GROUP (1u << 17)             // rows in a row group
+#endif
+    static const u32 GROUP = SS_GROUP;
     pq::File file;
     bool opened = false;
     std::string path;
@@ -3285,7 +3288,11 @@ int main(int, char** argv) {
             sh.a[tid].init(1u << sh.abits, &sh.alloc[tid]);
             sh.d[tid].init(D.nparts, &sh.alloc[tid]);
             if (tid == 0) parse_links_dense(sh, reader);
+#ifdef SS_STAGE
+            parse_events_staged(sh, tid, reader);
+#else
             parse_events_dense(sh, tid, reader);
+#endif
             sh.a[tid].finish();
             sh.d[tid].finish();
             sh.k[tid].init(D.cparts, &sh.alloc[tid]);
@@ -3330,8 +3337,7 @@ int main(int, char** argv) {
         D.wall[2] = w2 - w1;
         c3 += run_threads(T, [&](u32 tid) {
             dense_stitch(sh, tid);
-            D.ctx[tid].writer.finish();
-            sh.user_rows.fetch_add(D.ctx[tid].rows);
+            dense_ctx_finish(sh, D.ctx[tid]);
             process_people(sh, tid, 0);
         });
         const double w3 = now();
