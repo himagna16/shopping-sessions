@@ -34,6 +34,10 @@ that works, a canonical ID is turned back into its number at parse time:
 - a user ID gives its person and alias by arithmetic, so links inside one
   person need no hash table.
 
+On this path the CSVs are read a line at a time: the comma, newline and quote
+bits of one or two 64-byte windows give a usual line's fields directly, and any
+other line is decided byte by byte.
+
 Nothing about a dataset is hard-coded and nothing is taken on trust. With no
 key, the general path above runs unchanged. Any ID that does not decode takes
 the general path for that row. People whose links leave their own first 16 IDs
