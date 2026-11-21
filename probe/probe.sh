@@ -47,10 +47,12 @@ r def "$B" /p
 r nohot "$B" /pnh
 r nowalk "$B" /pnw
 r g15 "$B" /p15
+r id2 "$B" /pid2
 r def "$B" /p
 r nohot "$B" /pnh
 r nowalk "$B" /pnw
 r g15 "$B" /p15
+r id2 "$B" /pid2
 st steps "$B" /p
 st nowalk "$B" /pnw
 st d8 "$B" /pd8
@@ -69,6 +71,7 @@ rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
 r 60nohot "$B" /pnh
 r 60g15 "$B" /p15
+r 60id2 "$B" /pid2
 sum 60sha14 "$B" /p
 sum 60sha15 "$B" /p15
 echo "t=$(( $(date +%s) - START ))s"
