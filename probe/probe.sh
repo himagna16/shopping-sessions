@@ -82,6 +82,9 @@ w g2kd13 "$B" /pgd
 w noclick "$B" /dx1
 w nowrite "$B" /dx2
 w noheavy "$B" /dx4
+w noflush "$B" /dx7
+w organic "$B" /dx8
+w gathered "$B" /dx9
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"
 if [ "$G" -le 22 ]; then
