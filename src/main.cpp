@@ -42,6 +42,9 @@
 #ifndef SS_UNIT
 #define SS_UNIT 64          // bytes staged per bucket before they are moved to its block chain
 #endif
+#ifndef SS_X
+#define SS_X 0            // measurement builds only: skip one step (see probe branch)
+#endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
 #endif
@@ -466,6 +469,7 @@ static const size_t BLOCK = 8192;
 static std::mutex g_arena_lock;
 static u8* g_arena_cur = nullptr;
 static u8* g_arena_end = nullptr;
+static std::vector<std::pair<u8*, size_t>> g_arena_regions;
 static size_t g_arena_region = 1ULL << 30;
 
 static u8* slab_alloc() {
@@ -484,6 +488,7 @@ static u8* slab_alloc() {
 #endif
         g_arena_cur = base;
         g_arena_end = base + len;
+        g_arena_regions.emplace_back(base, len);
     }
     u8* out = g_arena_cur;
     g_arena_cur += SLAB;
@@ -917,6 +922,7 @@ struct Shared {
     struct Totals { std::vector<u32> sessions, purchasing, assisted; std::vector<i64> revenue; };
     std::vector<Totals> campaign_totals;
     std::atomic<u64> user_rows{0};
+    double links_seconds = 0;
 };
 
 static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& tasks) {
@@ -946,6 +952,7 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
 
 // ---------------------------------------------------------------- phase 1: parse
 static void parse_links(Shared& sh, Reader& reader) {
+    const double began = now();
     Links links;
     for (const Task& task : sh.link_tasks) {
         const u8* buf; size_t start, stop;
@@ -959,6 +966,7 @@ static void parse_links(Shared& sh, Reader& reader) {
         });
     }
     links.solve(sh.alias);
+    sh.links_seconds = now() - began;
     sh.links_ready.store(true, std::memory_order_release);
 }
 
@@ -1043,6 +1051,9 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 
 static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
+#if SS_PROBE == 5
+    return;
+#endif
     const i64 lo = sh.ws - REACH, hi = sh.we;
     const int shift = 64 - int(sh.bbits);
     const Catalogs& cat = sh.cat;
@@ -1102,7 +1113,11 @@ static void dedup_buckets(Shared& sh, u32 tid) {
         // Smallest ingest_ts wins; equal ingest_ts means identical copies.
         // A slot is a hash tag plus (block << 8 | index) + 1. With at most 256
         // blocks the reference fits 16 bits and the whole slot 4 bytes.
+#if SS_X == 7
+        if (false) {
+#else
         if (blocks.size() <= 256) {
+#endif
             size_t cap = 16;
             while (cap * 2 < total * 3) cap <<= 1;
             small.assign(cap, 0);
@@ -1131,6 +1146,9 @@ static void dedup_buckets(Shared& sh, u32 tid) {
                 }
             }
         } else {
+#if SS_X == 7
+            if (true) goto emit;
+#endif
             size_t cap = 16;
             while (cap < total * 2) cap <<= 1;
             table.assign(cap, 0);
@@ -1159,6 +1177,12 @@ static void dedup_buckets(Shared& sh, u32 tid) {
                 }
             }
         }
+#if SS_X == 7
+    emit:
+#endif
+#if SS_X == 3
+        continue;
+#endif
         // Survivors that are valid get their person and move to a person bucket.
         u32 waiting = 0;
         auto flush = [&]() {
@@ -1174,7 +1198,11 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
                 const u64 hash = mix64(recs[i].ukey);
+#if SS_X == 4
+                if (true) {
+#else
                 if (!alias.maybe(hash)) {                 // not an alias: the ID is the person
+#endif
                     out.push(u32(hash >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
                     continue;
                 }
@@ -1362,6 +1390,9 @@ static void process_people(Shared& sh, u32 tid) {
                 }
             }
         const u32 ncells = u32(cells.size());
+#if SS_X == 2
+        rows += ncells; continue;
+#endif
 
         // 2. Number the people and list each one's cells in slice order.
         size_t pcap = 64;
@@ -1428,6 +1459,9 @@ static void process_people(Shared& sh, u32 tid) {
             for (const Found& f : found) clicks[cursor[f.person]++] = f.click;
         }
 
+#if SS_X == 1
+        rows += nclicks; continue;
+#endif
         // 4. Each person: sessions, click credit and assists, daily rows.
         for (u32 p = 0; p < npeople; p++) {
             u32* mine = order.data() + person_cells[p];
@@ -1444,7 +1478,11 @@ static void process_people(Shared& sh, u32 tid) {
                 std::sort(mine, mine + n, [&](u32 x, u32 y) { return cells[x].bin < cells[y].bin; });
             }
             Click* ck = nclicks ? clicks.data() + click_start[p] : nullptr;
+#if SS_X == 5
+            const u32 m = 0;
+#else
             const u32 m = nclicks ? click_start[p + 1] - click_start[p] : 0;
+#endif
             // Time ascending; at one instant the smallest click_id comes last, so
             // the last click at or before a session start is the one to credit.
             auto before = [](const Click& x, const Click& y) {
@@ -1495,7 +1533,9 @@ static void process_people(Shared& sh, u32 tid) {
                     }
                     cat_touched.clear();
                 }
+#if SS_X != 6
                 writer.add(person_name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+#endif
                 rows++;
             };
             u32 left = 0, right = 0;
@@ -1752,10 +1792,25 @@ int main() {
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load());
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | links %.3f\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), sh.links_seconds);
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
+    if (getenv("SS_ZAP")) {
+        // Hand the record arena back on all threads instead of leaving it to a single-threaded exit.
+        std::vector<std::pair<u8*, size_t>> pieces;
+        for (auto& region : g_arena_regions)
+            for (size_t at = 0; at < region.second; at += 16u << 20)
+                pieces.emplace_back(region.first + at, std::min<size_t>(16u << 20, region.second - at));
+        std::atomic<size_t> next{0};
+        run_threads(T, [&](u32) {
+            for (;;) {
+                size_t i = next.fetch_add(1);
+                if (i >= pieces.size()) return;
+                madvise(pieces[i].first, pieces[i].second, MADV_DONTNEED);
+            }
+        });
+    }
     _exit(0);
 }
