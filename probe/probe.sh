@@ -27,6 +27,8 @@ r old "$B" /pold
 r mixhash "$B" /pmix
 r noinline "$B" /pnoinl
 r nopf "$B" /pnopf
+r oldts "$B" /pts1
+r oldcamp "$B" /pcamp1
 r pin "$B" /p SS_PIN=1
 r t7 "$B" /p SS_THREADS=7
 r t9 "$B" /p SS_THREADS=9
