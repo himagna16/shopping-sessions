@@ -43,22 +43,21 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 }
 /expand "$D" "$S/b" "${PROBE_A:-20}"
 B="$S/b"
-r def "$B" /p
-r alias1 "$B" /pa1
-r noslice "$B" /pns
-r route1 "$B" /pr1
-r id1 "$B" /pid1
 r nohot "$B" /pnh
+r novec "$B" /pnv
+r id1 "$B" /pid1
 r o2 "$B" /po2
 r clake "$B" /pcl
-r novec "$B" /pnv
 r def "$B" /p
 r alias1 "$B" /pa1
 r noslice "$B" /pns
 r route1 "$B" /pr1
-r id1 "$B" /pid1
 r o2 "$B" /po2
 r clake "$B" /pcl
+r def "$B" /p
+r alias1 "$B" /pa1
+r noslice "$B" /pns
+r route1 "$B" /pr1
 st steps "$B" /p
 st alias1 "$B" /pa1
 st noslice "$B" /pns
