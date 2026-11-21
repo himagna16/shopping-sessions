@@ -2724,6 +2724,7 @@ static void process_people(Shared& sh, u32 tid) {
         steps[3] += step2 - step1;
         steps[4] += step3 - step2;
         steps[5] += step4 - step3;
+        steps[7] += double(npeople);
     }
     const double step5 = now();
     writer.finish();
@@ -2964,8 +2965,8 @@ int main() {
     {
         double sum[8] = {};
         for (u32 t = 0; t < T && t < 256; t++) for (int k = 0; k < 8; k++) sum[k] += g_steps[t][k];
-        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f\n",
-                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6]);
+        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f | people %.0f\n",
+                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
     }
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
