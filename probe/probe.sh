@@ -32,19 +32,19 @@ w3() {    # three runs, wall/total each: shows what happens outside the timed ph
 B="$S/b"
 r new "$B" /p
 r people1 "$B" /pp1
+r scan4 "$B" /ps4
 r nohugetab "$B" /p SS_NOHUGE=1
 r release "$B" /p SS_RELEASE=1
-r zap "$B" /p SS_ZAP=1
+r scan4 "$B" /ps4
 r new "$B" /p
 w3 20new "$B" /p
 w3 20rel+zap "$B" /p SS_RELEASE=1 SS_ZAP=1
 rm -rf "$S/b"; /expand "$D" "$S/c" 60; B="$S/c"
 r 60new "$B" /p
-r 60people1 "$B" /pp1
+r 60scan4 "$B" /ps4
 w3 60new "$B" /p
 w3 60rel "$B" /p SS_RELEASE=1
 w3 60zap "$B" /p SS_ZAP=1
 w3 60rel+zap "$B" /p SS_RELEASE=1 SS_ZAP=1
-w3 60pread "$B" /p SS_MMAP=0
 echo "t=$(elapsed)s"
 exit 1

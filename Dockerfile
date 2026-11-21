@@ -6,10 +6,11 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then V3="-march=x86-64-v3 -mtune=skylake-av
  && B="g++ -std=c++20 -fno-plt -static -pthread -O3 $V3 /src/main.cpp" \
  && $B -o /p \
  && $B -DSS_PEOPLE1 -o /pp1 \
+ && $B -DSS_SCAN4 -o /ps4 \
  && g++ -std=c++20 -O2 -static -pthread -o /expand /tools/expand.cpp \
- && strip /p /pp1 /expand
+ && strip /p /pp1 /ps4 /expand
 
 FROM debian:bookworm-slim
-COPY --from=build /p /pp1 /expand /
+COPY --from=build /p /pp1 /ps4 /expand /
 COPY probe/probe.sh /probe.sh
 CMD ["/bin/sh", "/probe.sh"]
