@@ -41,9 +41,11 @@ CL=/pcl
 if [ "$(wc -c < /pcl)" -lt 1000 ]; then echo "clang missing"; CL=/p; fi
 r def "$B" /p
 grep -E '^user' "$S/err" | cut -c1-70
+r nohv "$B" /pnv
 r g15 "$B" /p15
 r clang "$B" "$CL"
 r def "$B" /p
+r nohv "$B" /pnv
 r g15 "$B" /p15
 r clang "$B" "$CL"
 p scan "$B" /pl2
@@ -54,6 +56,7 @@ p rest "$B" /pl7
 p noclicks "$B" /pnc
 p full "$B" /p
 st steps "$B" /p
+st nohv "$B" /pnv
 st noclk "$B" /px5
 st nowr "$B" /px6
 st nosess "$B" /px9
@@ -61,13 +64,12 @@ st noalias "$B" /px4
 st nofilt "$B" /pnf
 r nofilt "$B" /pnf
 r popul "$B" /p SS_POPULATE=1
-r thp "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 r thp2 "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.top_pad=33554432
-st thp2 "$B" /p GLIBC_TUNABLES=glibc.malloc.hugetlb=1:glibc.malloc.mmap_threshold=33554432:glibc.malloc.top_pad=33554432
 r def "$B" /p
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
 grep -E '^user' "$S/err" | cut -c1-70
+r 60nohv "$B" /pnv
 r 60g15 "$B" /p15
 r 60clang "$B" "$CL"
 st 60steps "$B" /p
