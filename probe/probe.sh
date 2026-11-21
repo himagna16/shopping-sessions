@@ -52,18 +52,20 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 E="${PROBE_E:-20000000}"
 /generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
 B="$S/b"
-r pair "$B" /p
+r batch "$B" /p
 dl " "
+r chain "$B" /pc
 r table "$B" /pt
 r a512 "$B" /p512
 r dw15 "$B" /p15
-r pair "$B" /p
+r batch "$B" /p
+r chain "$B" /pc
 r a512 "$B" /p512
 r c512k "$B" /p SS_CHUNK=524288
 r c128k "$B" /p SS_CHUNK=131072
-echo "parse: wall cpu (touch line fields ts type +event +user all table a512)"
+echo "parse: wall cpu (touch line fields ts type +event +user all chain table a512)"
 for round in 1 2; do
-for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pt p512; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p pc pt p512; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 done
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
@@ -77,11 +79,12 @@ if [ "$G" -le 22 ]; then
 E3=$(( E * 3 ))
 /generate --seed 9 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
 B="$S/c"
-r 60pair "$B" /p
+r 60batch "$B" /p
 dl " "
+r 60chain "$B" /pc
 r 60a512 "$B" /p512
 r 60dw15 "$B" /p15
-r 60pair "$B" /p
+r 60batch "$B" /p
 fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
