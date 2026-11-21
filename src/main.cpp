@@ -57,6 +57,10 @@
 #if !defined(SS_ING1) && !defined(SS_ING2)
 #define SS_ING2
 #endif
+// The older people phase expects records that already carry their person.
+#if defined(SS_PEOPLE1) && !defined(SS_ALIAS1)
+#define SS_ALIAS1
+#endif
 // ID keys: the lean form (an ID's bytes as loaded) unless SS_ID1 asks for the
 // 7-bit packed form.
 #if !defined(SS_ID1) && !defined(SS_ID2)
@@ -1486,6 +1490,17 @@ struct AliasMap {
         return (filter[bit >> 6] >> (bit & 63)) & 1;
     }
     inline void prefetch_hash(u64 hash) const { __builtin_prefetch(&slots[hash >> shift]); }
+    // True when `key` is in the map; `name` is then its person's name.
+    inline bool find(u64 key, u64 hash, u64& name) const {
+        if (!maybe(hash)) return false;
+        u64 at = hash >> shift;
+        for (;;) {
+            u64 k = slots[at].key;
+            if (k == key) { name = slots[at].name; return true; }
+            if (!k) return false;
+            at = (at + 1) & mask;
+        }
+    }
     inline u64 person_hashed(u64 key, u64 hash) const {
         u64 at = hash >> shift;
         for (;;) {
@@ -1626,10 +1641,23 @@ struct Links {
         solved_at = now();
         std::pair<u64, u64>* entries = big_alloc<std::pair<u64, u64>>(nnodes + 1);
         size_t nentries = 0;
+#ifdef SS_ALIAS1
         for (u32 i = 0; i < nnodes; i++) {
             u32 root = find(i);
             if (root != i) entries[nentries++] = {nodes[i].key, nodes[root].key};
         }
+#else
+        // Every ID of a person with more than one ID, the name included (it maps
+        // to itself): the people phase asks "is this one of several linked IDs?".
+        for (u32 i = 0; i < nnodes; i++) {
+            u32 root = find(i);
+            if (root != i) nodes[root].pad = 1;
+        }
+        for (u32 i = 0; i < nnodes; i++) {
+            u32 root = nodes[i].parent == i ? i : find(i);
+            if (root != i || nodes[i].pad) entries[nentries++] = {nodes[i].key, nodes[root].key};
+        }
+#endif
         out.build(entries, nentries);
     }
 };
@@ -1664,6 +1692,10 @@ struct Shared {
     std::vector<Scatter<RecA>> a;
     std::vector<Scatter<RecB>> b;
     std::vector<Scatter<RecC>> c;
+    // Events and clicks of people with several linked IDs, by the person's name:
+    // filled by the first round of the people phase, consumed by the second.
+    std::vector<Scatter<RecB>> lb;
+    std::vector<Scatter<RecC>> lc;
     std::vector<BlockAlloc> alloc;
     std::vector<u32> person_order;
     // per thread, indexed campaign * ndays + day
@@ -1885,18 +1917,20 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
 #if SS_PROBE == 5
     return;
 #endif
-    while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
     const i64 lo = sh.ws - REACH, hi = sh.we;
     const int shift = 64 - int(sh.bbits);
     const Catalogs& cat = sh.cat;
-    const AliasMap& alias = sh.alias;
     Scatter<RecC>& lists = sh.c[tid];
     DateCache dates;
     struct Pending { u64 ckey; u32 ts; u32 camp; };
     auto emit = [&lists, shift](u64 person, u64 hash, const Pending& click) {
         lists.push(u32(hash >> shift), RecC{person, click.ckey, click.ts, click.camp});
     };
+#ifdef SS_ALIAS1
+    while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
+    const AliasMap& alias = sh.alias;
     Resolver<Pending, decltype(emit)> resolver(alias, emit);
+#endif
     [[maybe_unused]] u64 sink = 0;
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
@@ -1940,11 +1974,20 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
 #endif
             // Copies of a click are identical (rules.md), so they change neither
             // the credited campaign nor the set of assisting campaigns: no dedup.
+#ifdef SS_ALIAS1
             resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
+#else
+            // The click goes to its user ID's bucket as it is; whose it is gets
+            // settled there, once for each ID (see process_people).
+            const u64 who = pack_id(s1, size_t(e1 - s1), 'u');
+            emit(who, hash64(who), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
+#endif
         });
         release_chunk(sh.files[task.file], task);
     }
+#ifdef SS_ALIAS1
     resolver.finish();
+#endif
     if (sink == 1) fprintf(stderr, "sink\n");
 }
 
@@ -1970,16 +2013,18 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     const u32 nbuckets = 1u << sh.abits;
     const u32 abits = sh.abits;
     const int shift = 64 - int(sh.bbits);
-    const AliasMap& alias = sh.alias;
     Scatter<RecB>& out = sh.b[tid];
     std::vector<Block*> blocks;
     hvec<u64> table;                        // wide slots: (hash tag << 32) | reference
     hvec<u32> small;                        // narrow slots: (hash tag << 16) | reference
+#ifdef SS_ALIAS1
+    const AliasMap& alias = sh.alias;
     struct Survivor { u32 ts; u32 payload; };
     auto emit = [&out, shift](u64 person, u64 hash, const Survivor& event) {
         out.push(u32(hash >> shift), RecB{person, event.ts, event.payload});
     };
     Resolver<Survivor, decltype(emit)> resolver(alias, emit);
+#endif
     for (;;) {
         u32 bucket = u32(sh.next_bucket.fetch_add(1, std::memory_order_relaxed));
         if (bucket >= nbuckets) break;
@@ -2072,14 +2117,18 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             RecA* recs = Scatter<RecA>::items(b);
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
-#if SS_X == 4
+#if SS_X == 4 || !defined(SS_ALIAS1)
+                // To the bucket of the user ID as it is; whose it is gets settled
+                // there, once for each ID (see process_people).
                 out.push(u32(hash64(recs[i].ukey) >> shift), RecB{recs[i].ukey, recs[i].ts, recs[i].payload});
 #else
                 resolver.push(recs[i].ukey, Survivor{recs[i].ts, recs[i].payload});
 #endif
             }
         }
+#ifdef SS_ALIAS1
         resolver.finish();
+#endif
         // This bucket's blocks are finished with: reuse them for person buckets.
         for (Block* b : blocks) sh.alloc[tid].recycle((u8*)b);
         const double step2 = now();
@@ -2484,8 +2533,23 @@ struct Purchase { u32 payload; u32 next; };
 // share a session and a session boundary can only fall between two slices:
 // walking a person's slices in order gives the sessions without sorting events.
 #ifndef SS_PEOPLE1
-static void process_people(Shared& sh, u32 tid) {
+// The people phase runs twice. Round 0 takes the buckets of user IDs: an ID that
+// is not linked to another is a whole person and is finished there; the events
+// and clicks of an ID that is one of several are passed on, under the person's
+// name, to that name's bucket in the "linked" lists. Round 1 takes those. An ID
+// is looked up in the alias map once, when the bucket first meets it.
+// (With SS_ALIAS1 the records arrive resolved and there is only round 0.)
+static void process_people(Shared& sh, u32 tid, u32 round) {
     const u32 nthreads = sh.cfg.threads;
+#ifdef SS_ALIAS1
+    const bool route = false;
+#else
+    const bool route = round == 0;
+#endif
+    std::vector<Scatter<RecB>>& src_b = round ? sh.lb : sh.b;
+    std::vector<Scatter<RecC>>& src_c = round ? sh.lc : sh.c;
+    const int person_shift = 64 - int(sh.bbits);
+    const u32 LINKED = 0x80000000u, NOBODY = 0xFFFFFFFFu;
     const u32 ncamp = u32(sh.cat.campaign_ids.size());
     const u32 organic = ncamp;
     const u32 ndays = sh.ndays;
@@ -2494,7 +2558,7 @@ static void process_people(Shared& sh, u32 tid) {
     const u32 bbits = sh.bbits;
     const u32 SLICE = u32(SESSION_GAP);
     const u32 nslices = u32((sh.we - sh.ws) / SESSION_GAP) + 2;
-    Shared::Totals& totals = sh.campaign_totals[tid];
+    Shared::Totals& totals = sh.campaign_totals[tid + round * nthreads];
     totals.sessions.assign(size_t(ncamp + 1) * ndays, 0);
     totals.assisted.assign(size_t(ncamp + 1) * ndays, 0);
     totals.purchasing.assign(size_t(ncamp + 1) * ndays, 0);
@@ -2502,11 +2566,15 @@ static void process_people(Shared& sh, u32 tid) {
 
     UserWriter writer;
     char name[64];
-    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid);
+    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid + round * nthreads);
     writer.init(sh.cfg.out + name);
     double* steps = g_steps[tid & 255];
 
-    struct Local { u64 key; u32 index; u32 used; };          // a person's number within the bucket
+    // An ID met in this bucket: a person's number within the bucket, or LINKED | n
+    // for one of several linked IDs, whose person's name is link_root[n].
+    struct Local { u64 key; u32 index; u32 used; };
+    hvec<u64> met_key, link_root;                             // everything in the table, to rebuild it when it grows
+    hvec<u32> met_code;
     struct Bought { u64 key; u32 payload; u32 pad; };        // key = person number << 32 | ts
     struct Found { u32 person; Click click; };
     hvec<Local> table;
@@ -2532,8 +2600,13 @@ static void process_people(Shared& sh, u32 tid) {
 
         size_t nev = 0;
         for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) nev += b->n;
-        if (!nev) continue;
+            for (Block* b = src_b[t].head[bucket]; b; b = b->next) nev += b->n;
+        if (!nev) {
+            // No events, but in round 0 there may be clicks to pass on.
+            bool clicks_here = false;
+            for (u32 t = 0; route && t < nthreads; t++) clicks_here = clicks_here || src_c[t].head[bucket];
+            if (!clicks_here) continue;
+        }
         const double step0 = now();
 
         // 1. Number the people and key the events.
@@ -2544,43 +2617,65 @@ static void process_people(Shared& sh, u32 tid) {
         int shift = 64 - __builtin_ctzll(cap);
         persons.clear();
         per_person.clear();
+        met_key.clear();
+        met_code.clear();
+        link_root.clear();
         bought.clear();
         keys.resize(nev);
         memset(per_slice.data(), 0, per_slice.size() * sizeof(u32));
-        auto number = [&](u64 person) -> u32 {
-            u64 at = (hash64(person) << bbits) >> shift;
-            for (;;) {
-                const Local& slot = table[at];
-                if (!slot.used) break;
-                if (slot.key == person) return slot.index;
-                at = (at + 1) & mask;
-            }
-            if ((persons.size() + 1) * 2 > cap) {                 // keep the table at most half full
+        auto remember = [&](u64 id, u32 code) {
+            if ((met_key.size() + 1) * 2 > cap) {                 // keep the table at most half full
                 cap <<= 1;
                 mask = cap - 1;
                 shift--;
                 table.assign(cap, Local{0, 0, 0});
-                for (u32 i = 0; i < persons.size(); i++) {
-                    u64 h = (hash64(persons[i]) << bbits) >> shift;
+                for (size_t i = 0; i < met_key.size(); i++) {
+                    u64 h = (hash64(met_key[i]) << bbits) >> shift;
                     while (table[h].used) h = (h + 1) & mask;
-                    table[h] = {persons[i], i, 1};
+                    table[h] = {met_key[i], met_code[i], 1};
                 }
-                at = (hash64(person) << bbits) >> shift;
-                while (table[at].used) at = (at + 1) & mask;
             }
-            const u32 index = u32(persons.size());
-            table[at] = {person, index, 1};
-            persons.push_back(person);
-            per_person.push_back(0);
-            return index;
+            u64 at = (hash64(id) << bbits) >> shift;
+            while (table[at].used) at = (at + 1) & mask;
+            table[at] = {id, code, 1};
+            met_key.push_back(id);
+            met_code.push_back(code);
+        };
+        // The ID of an event: its person's number here, or LINKED | n.
+        auto number = [&](u64 id) -> u32 {
+            const u64 h = hash64(id);
+            u64 at = (h << bbits) >> shift;
+            for (;;) {
+                const Local& slot = table[at];
+                if (!slot.used) break;
+                if (slot.key == id) return slot.index;
+                at = (at + 1) & mask;
+            }
+            u32 code;
+            u64 root;
+            if (route && sh.alias.find(id, h, root)) {
+                code = LINKED | u32(link_root.size());
+                link_root.push_back(root);
+            } else {
+                code = u32(persons.size());
+                persons.push_back(id);
+                per_person.push_back(0);
+            }
+            remember(id, code);
+            return code;
         };
         size_t j = 0;
         for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.b[t].head[bucket]; b; b = b->next) {
+            for (Block* b = src_b[t].head[bucket]; b; b = b->next) {
                 const RecB* recs = Scatter<RecB>::items(b);
                 prefetch_block(b->next);
                 for (u32 i = 0; i < b->n; i++) {
                     const u32 who = number(recs[i].person);
+                    if (who & LINKED) {
+                        const u64 root = link_root[who & ~LINKED];
+                        sh.lb[tid].push(u32(hash64(root) >> person_shift), RecB{root, recs[i].ts, recs[i].payload});
+                        continue;
+                    }
                     const u32 ts = recs[i].ts;
                     const u32 slice = ts / SLICE;
                     keys[j++] = (u64(who) << 33) | (u64(slice) << 21) | (ts - slice * SLICE);
@@ -2590,6 +2685,7 @@ static void process_people(Shared& sh, u32 tid) {
                 }
             }
         const u32 npeople = u32(persons.size());
+        nev = j;                                                  // without the events passed on
         const double step1 = now();
 
         // 2. Order the keys by slice, then (keeping that order) by person.
@@ -2606,27 +2702,42 @@ static void process_people(Shared& sh, u32 tid) {
         const double step2 = now();
 
         // 3. Clicks of people who have events, grouped by person.
-        auto lookup = [&](u64 person) -> i64 {
-            u64 at = (hash64(person) << bbits) >> shift;
+        // The ID of a click: as for an event, or NOBODY for an ID with no events
+        // here that is not linked to another (its clicks reach no session).
+        auto lookup = [&](u64 id) -> u32 {
+            const u64 h = hash64(id);
+            u64 at = (h << bbits) >> shift;
             for (;;) {
                 const Local& slot = table[at];
-                if (!slot.used) return -1;
-                if (slot.key == person) return slot.index;
+                if (!slot.used) break;
+                if (slot.key == id) return slot.index;
                 at = (at + 1) & mask;
             }
+            u64 root;
+            if (route && sh.alias.find(id, h, root)) {
+                const u32 code = LINKED | u32(link_root.size());
+                link_root.push_back(root);
+                remember(id, code);
+                return code;
+            }
+            return NOBODY;
         };
         click_start.assign(npeople + 1, 0);
         found.clear();
         for (u32 t = 0; t < nthreads; t++)
-            for (Block* b = sh.c[t].head[bucket]; b; b = b->next) {
+            for (Block* b = src_c[t].head[bucket]; b; b = b->next) {
                 const RecC* recs = Scatter<RecC>::items(b);
                 prefetch_block(b->next);
                 for (u32 i = 0; i < b->n; i++) {
-                    i64 id = lookup(recs[i].person);
-                    if (id >= 0) {
-                        click_start[size_t(id)]++;
-                        found.push_back({u32(id), {recs[i].ts, recs[i].camp, recs[i].ckey}});
+                    const u32 id = lookup(recs[i].person);
+                    if (id == NOBODY) continue;
+                    if (id & LINKED) {
+                        const u64 root = link_root[id & ~LINKED];
+                        sh.lc[tid].push(u32(hash64(root) >> person_shift), RecC{root, recs[i].ckey, recs[i].ts, recs[i].camp});
+                        continue;
                     }
+                    click_start[size_t(id)]++;
+                    found.push_back({id, {recs[i].ts, recs[i].camp, recs[i].ckey}});
                 }
             }
         const size_t nclicks = found.size();
@@ -2837,6 +2948,13 @@ static void process_people(Shared& sh, u32 tid) {
             active.clear();
 #endif
         }
+        if (route) {
+            // This bucket's blocks are finished with: reuse them for the linked lists.
+            for (u32 t = 0; t < nthreads; t++) {
+                for (Block* b = src_b[t].head[bucket]; b;) { Block* next = b->next; sh.alloc[tid].recycle((u8*)b); b = next; }
+                for (Block* b = src_c[t].head[bucket]; b;) { Block* next = b->next; sh.alloc[tid].recycle((u8*)b); b = next; }
+            }
+        }
         const double step4 = now();
         steps[2] += step1 - step0;
         steps[3] += step2 - step1;
@@ -2850,7 +2968,7 @@ static void process_people(Shared& sh, u32 tid) {
     sh.user_rows.fetch_add(rows);
 }
 #else
-static void process_people(Shared& sh, u32 tid) { process_people_v1(sh, tid); }
+static void process_people(Shared& sh, u32 tid, u32) { process_people_v1(sh, tid); }
 #endif
 
 // ---------------------------------------------------------------- main
@@ -3033,8 +3151,10 @@ int main() {
     sh.a.resize(T);
     sh.b.resize(T);
     sh.c.resize(T);
+    sh.lb.resize(T);
+    sh.lc.resize(T);
     sh.alloc.resize(T);
-    sh.campaign_totals.resize(T);
+    sh.campaign_totals.resize(2 * size_t(T));
     mkdir(cfg.out.c_str(), 0777);
     mkdir((cfg.out + "/user_daily").c_str(), 0777);
     mkdir((cfg.out + "/campaign_daily").c_str(), 0777);
@@ -3064,17 +3184,35 @@ int main() {
     double t3 = now();
 
     // Largest person buckets first, so a heavy one never ends up running alone at the end.
-    {
+    auto order_buckets = [&](std::vector<Scatter<RecB>>& lists) {
         const u32 nb = 1u << sh.bbits;
         std::vector<u64> size(nb, 0);
         for (u32 t = 0; t < T; t++)
             for (u32 k = 0; k < nb; k++)
-                size[k] += sh.b[t].nblocks[k];
+                size[k] += lists[t].nblocks[k];
         sh.person_order.resize(nb);
         for (u32 k = 0; k < nb; k++) sh.person_order[k] = k;
         std::sort(sh.person_order.begin(), sh.person_order.end(), [&](u32 x, u32 y) { return size[x] > size[y]; });
+        sh.next_person.store(0);
+    };
+    order_buckets(sh.b);
+#ifdef SS_ALIAS1
+    double c3 = run_threads(T3, [&](u32 tid) { process_people(sh, tid, 0); });
+#else
+    for (u32 t = T3; t < T; t++) {
+        sh.lb[t].init(1u << sh.bbits, &sh.alloc[t]); sh.lb[t].finish();
+        sh.lc[t].init(1u << sh.bbits, &sh.alloc[t]); sh.lc[t].finish();
     }
-    double c3 = run_threads(T3, [&](u32 tid) { process_people(sh, tid); });
+    double c3 = run_threads(T3, [&](u32 tid) {
+        sh.lb[tid].init(1u << sh.bbits, &sh.alloc[tid]);
+        sh.lc[tid].init(1u << sh.bbits, &sh.alloc[tid]);
+        process_people(sh, tid, 0);
+        sh.lb[tid].finish();
+        sh.lc[tid].finish();
+    });
+    order_buckets(sh.lb);
+    c3 += run_threads(T3, [&](u32 tid) { process_people(sh, tid, 1); });
+#endif
     double t4 = now();
 
     write_campaigns(sh);
