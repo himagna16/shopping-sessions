@@ -57,11 +57,9 @@ dl " "
 r swar "$B" /psw
 r dense "$B" /p
 r swar "$B" /psw
+echo "parse: wall cpu (touch scan fields ts type +event +user all)"
 for round in 1 2; do
-p ptab "$B" /p
-p pswar "$B" /psw
-p nouser "$B" /px1
-p noevent "$B" /px2
+for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p psw; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 done
 echo "walk: place sweep walk stitch | wall walk stitch"
 w def "$B" /p
@@ -69,9 +67,6 @@ w noclick "$B" /dx1
 w nowrite "$B" /dx2
 w nosess "$B" /dx3
 w noheavy "$B" /dx4
-w nolight "$B" /dx5
-w sm32 "$B" /sm32
-w sm8 "$B" /sm8
 w def "$B" /p
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"
@@ -82,6 +77,7 @@ B="$S/c"
 r 60dense "$B" /p
 dl " "
 r 60swar "$B" /psw
+for v in pl1 pl2 pl4 pl7 p; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
 r 60dense "$B" /p
 fi
 echo "t=$(( $(date +%s) - START ))s"
