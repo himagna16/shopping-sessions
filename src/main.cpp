@@ -104,7 +104,7 @@ static u64 intern_id(const u8* p, size_t n) {
     return key;
 }
 
-static inline u64 compact7(u64 x) {
+[[maybe_unused]] static inline u64 compact7(u64 x) {
 #if defined(__BMI2__)
     return _pext_u64(x, 0x7F7F7F7F7F7F7F7FULL);
 #else
@@ -115,8 +115,44 @@ static inline u64 compact7(u64 x) {
 #endif
 }
 
-// p must be readable for 9 bytes whatever n is.
-static inline u64 pack_id(const u8* p, size_t n) {
+// p must be readable for 9 bytes whatever n is. `prefix` is the letter IDs of
+// this column normally start with ('e', 'u' or 'k').
+#ifdef SS_ID2
+// Lean form: an ID that is its column's letter plus 1 to 8 ASCII bytes (none
+// NUL) is keyed by those bytes as loaded, zero-padded. Byte order is then the
+// order of the byte-swapped keys.
+static inline u64 pack_id(const u8* p, size_t n, u8 prefix) {
+#ifndef SS_FORCE_SLOW
+    if (p[0] == prefix && n - 2 < 8) {
+        const u64 mask = ~0ULL >> (8 * (9 - n));
+        const u64 v = rd64(p + 1) & mask;
+        const u64 t = v | ~mask;
+        const u64 high = 0x8080808080808080ULL;
+        if (!((v & high) | ((t - 0x0101010101010101ULL) & ~t & high))) return v;
+    }
+#endif
+    return intern_id(p, n);
+}
+
+static std::string id_string(u64 key, u8 prefix) {
+    if (key & INTERN_BIT) {
+        std::lock_guard<std::mutex> guard(g_intern_lock);
+        return *g_intern_strs[key & ~INTERN_BIT];
+    }
+    char out[9];
+    int n = 0;
+    out[n++] = char(prefix);
+    for (; key; key >>= 8) out[n++] = char(key & 0xFF);
+    return std::string(out, n);
+}
+
+static bool id_less_slow(u64 a, u64 b, u8 prefix) { return id_string(a, prefix) < id_string(b, prefix); }
+static inline bool id_less(u64 a, u64 b, u8 prefix) {
+    if (!((a | b) & INTERN_BIT)) return __builtin_bswap64(a) < __builtin_bswap64(b);
+    return id_less_slow(a, b, prefix);
+}
+#else
+static inline u64 pack_id(const u8* p, size_t n, u8) {
 #ifdef SS_FORCE_SLOW
     return intern_id(p, n);
 #endif
@@ -139,7 +175,7 @@ static inline u64 pack_id(const u8* p, size_t n) {
     return intern_id(p, n);
 }
 
-static std::string id_string(u64 key) {
+static std::string id_string(u64 key, u8) {
     if (key & INTERN_BIT) {
         std::lock_guard<std::mutex> guard(g_intern_lock);
         return *g_intern_strs[key & ~INTERN_BIT];
@@ -154,11 +190,12 @@ static std::string id_string(u64 key) {
     return std::string(out, n);
 }
 
-static bool id_less_slow(u64 a, u64 b) { return id_string(a) < id_string(b); }   // std::string compares bytes as unsigned
-static inline bool id_less(u64 a, u64 b) {
+static bool id_less_slow(u64 a, u64 b, u8 prefix) { return id_string(a, prefix) < id_string(b, prefix); }   // std::string compares bytes as unsigned
+static inline bool id_less(u64 a, u64 b, u8 prefix) {
     if (!((a | b) & INTERN_BIT)) return a < b;
-    return id_less_slow(a, b);
+    return id_less_slow(a, b, prefix);
 }
+#endif
 
 // ---------------------------------------------------------------- timestamps
 static inline i64 days_from_civil(i64 y, i64 m, i64 d) {
@@ -802,7 +839,7 @@ struct Links {
             u32 a = find(index_of(pair.first)), b = find(index_of(pair.second));
             if (a == b) continue;
             // The root is always the byte-wise smallest ID, so it is the person's name.
-            if (id_less(ids[b], ids[a])) std::swap(a, b);
+            if (id_less(ids[b], ids[a], 'u')) std::swap(a, b);
             parent[b] = a;
         }
         std::vector<std::pair<u64, u64>> entries;
@@ -881,7 +918,7 @@ static void parse_links(Shared& sh, Reader& reader) {
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1)
             if (wrapped != quotes || s0 == e0 || s1 == e1) return;
-            links.add(pack_id(s0, size_t(e0 - s0)), pack_id(s1, size_t(e1 - s1)));
+            links.add(pack_id(s0, size_t(e0 - s0), 'u'), pack_id(s1, size_t(e1 - s1), 'u'));
         });
     }
     links.solve(sh.alias);
@@ -922,7 +959,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
             if (wrapped != quotes || s0 == e0) return;          // malformed, or no event_id
 
             RecA rec;
-            rec.ekey = pack_id(s0, size_t(e0 - s0));
+            rec.ekey = pack_id(s0, size_t(e0 - s0), 'e');
             // rules.md: ingest_ts is always valid F1. If it is not, the copy can never be kept.
             i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
             rec.ingest = ingest == TS_BAD ? INT64_MAX : ingest;
@@ -954,7 +991,7 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
                     }
                     if (ok) {
                         rec.ts = u32(ts - ws);
-                        rec.ukey = pack_id(s1, size_t(e1 - s1));
+                        rec.ukey = pack_id(s1, size_t(e1 - s1), 'u');
                     }
                 }
             }
@@ -996,8 +1033,8 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             // Copies of a click are identical (rules.md), so they change neither
             // the credited campaign nor the set of assisting campaigns: no dedup.
             RecC rec;
-            rec.person = alias.person(pack_id(s1, size_t(e1 - s1)));
-            rec.ckey = pack_id(s0, size_t(e0 - s0));
+            rec.person = alias.person(pack_id(s1, size_t(e1 - s1), 'u'));
+            rec.ckey = pack_id(s0, size_t(e0 - s0), 'k');
             rec.ts = u32(ts - lo);
             rec.camp = u32(campaign);
             lists.push(u32(mix64(rec.person) >> shift), rec);
@@ -1339,7 +1376,7 @@ static void process_people(Shared& sh, u32 tid) {
             // Time ascending; at one instant the smallest click_id comes last, so
             // the last click at or before a session start is the one to credit.
             auto before = [](const Click& x, const Click& y) {
-                return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key));
+                return x.ts < y.ts || (x.ts == y.ts && id_less(y.key, x.key, 'k'));
             };
             if (m <= 32) {
                 for (u32 i = 1; i < m; i++) {
@@ -1357,15 +1394,20 @@ static void process_people(Shared& sh, u32 tid) {
             std::string name_long;
             const char* person_name = name_buf;
             if (persons[p] & INTERN_BIT) {
-                name_long = id_string(persons[p]);
+                name_long = id_string(persons[p], 'u');
                 person_name = name_long.data();
                 name_len = u32(name_long.size());
             } else {
+#ifdef SS_ID2
+                name_buf[name_len++] = 'u';
+                for (u64 key = persons[p]; key; key >>= 8) name_buf[name_len++] = char(key & 0xFF);
+#else
                 for (int shift = 56; shift >= 0; shift -= 7) {
                     char c = char((persons[p] >> shift) & 0x7F);
                     if (!c) break;
                     name_buf[name_len++] = c;
                 }
+#endif
             }
             i64 cur_day = -1;
             i32 d_sessions = 0, d_events = 0;
