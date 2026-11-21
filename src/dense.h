@@ -415,6 +415,28 @@ static bool dense_setup(Shared& sh) {
     return true;
 }
 
+// After the links are read: the links of everyone handed to the general path
+// join the general union-find, and the alias map is built from it. Only links
+// hand people over, so this runs on the links thread while the others parse.
+static void dense_settle(Shared& sh) {
+    Dense& D = g_dense;
+    Links& links = sh.odd_links;
+    for (DenseCtx& cx : D.ctx)
+        for (u32 person : cx.marked) {
+            if (D.complex[person] == 2) continue;
+            D.complex[person] = 2;
+            const u64 parents = D.ptab[person] ^ IDENT;
+            if (parents == IDENT) continue;
+            for (u32 a = 0; a < 16; a++) {
+                const u32 parent = u32((parents >> (4 * a)) & 15);
+                if (parent != a) links.add(dense_user_key(person, a), dense_user_key(person, parent));
+            }
+        }
+    const double began = now();
+    links.solve(sh.alias);
+    sh.links_union = now() - began;
+}
+
 // ---------------------------------------------------------------- parse
 // Links whose two IDs are among one person's first 16 are joined in that
 // person's own little table; any other link goes to the general union-find and
@@ -464,6 +486,8 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     }
     while (out != in) apply(ring[out++ & 63]);
     sh.links_parse = now() - began;
+    dense_settle(sh);
+    sh.links_seconds = now() - began;
 }
 
 static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
@@ -645,27 +669,6 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
 }
 
 // ---------------------------------------------------------------- between the phases
-// After the parse: the links of everyone handed to the general path join the
-// general union-find, and the alias map is built from it.
-static void dense_settle(Shared& sh) {
-    Dense& D = g_dense;
-    Links& links = sh.odd_links;
-    for (DenseCtx& cx : D.ctx)
-        for (u32 person : cx.marked) {
-            if (D.complex[person] == 2) continue;
-            D.complex[person] = 2;
-            const u64 parents = D.ptab[person] ^ IDENT;
-            if (parents == IDENT) continue;
-            for (u32 a = 0; a < 16; a++) {
-                const u32 parent = u32((parents >> (4 * a)) & 15);
-                if (parent != a) links.add(dense_user_key(person, a), dense_user_key(person, parent));
-            }
-        }
-    const double began = now();
-    links.solve(sh.alias);
-    sh.links_union = now() - began;
-}
-
 static inline void dense_hand_event(Shared& sh, DenseCtx& cx, u32 tid, u32 user, u32 ts, u32 payload) {
     u64 person;
     if (user == cx.memo_user) person = cx.memo_person;
