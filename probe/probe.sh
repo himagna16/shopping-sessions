@@ -34,7 +34,7 @@ p() {     # parse only: best of 3 by parse cpu -> "parse parse_cpu"
 st() {    # steps inside dedup and people, ms of thread time, from the last of 2 runs
   label="$1"; shift
   one "$@" > /dev/null; one "$@" > /dev/null
-  awk -v l="$label" '/^steps/{printf "%s tab %d mov %d | key %d ord %d clk %d walk %d\n", l, $5*1000, $7*1000, $11*1000, $13*1000, $15*1000, $17*1000}' "$S/err"
+  awk -v l="$label" '/^steps/{printf "%s tab %d mov %d | key %d ord %d clk %d walk %d fin %d\n", l, $5*1000, $7*1000, $11*1000, $13*1000, $15*1000, $17*1000, $19*1000}' "$S/err"
 }
 sum() {   # one thread, so the files do not depend on timing: a digest of everything written
   label="$1"; shift
@@ -45,6 +45,7 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 B="$S/b"
 r def "$B" /p
 r alias1 "$B" /pa1
+r noslice "$B" /pns
 r id1 "$B" /pid1
 r nohot "$B" /pnh
 r o2 "$B" /po2
@@ -52,6 +53,7 @@ r clake "$B" /pcl
 r novec "$B" /pnv
 r def "$B" /p
 r alias1 "$B" /pa1
+r noslice "$B" /pns
 r id1 "$B" /pid1
 r nohot "$B" /pnh
 r o2 "$B" /po2
@@ -59,8 +61,10 @@ r clake "$B" /pcl
 r novec "$B" /pnv
 st steps "$B" /p
 st alias1 "$B" /pa1
+st noslice "$B" /pns
 st steps "$B" /p
 st alias1 "$B" /pa1
+st noslice "$B" /pns
 p pdef "$B" /p
 p palias1 "$B" /pa1
 one "$B" /p > /dev/null; grep -E '^user' "$S/err" | cut -c1-60
