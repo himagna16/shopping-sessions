@@ -50,13 +50,17 @@ r nostr "$B" /pns
 r jcc "$B" /pjcc
 r o2 "$B" /po2
 r 512 "$B" /p512
+r id2 "$B" /pid2
+r combo "$B" /pc
+r combo-mm "$B" /pc SS_MMAP=1
+r combo-1m "$B" /pc SS_CHUNK=1048576
 r t10 "$B" /p SS_THREADS=10
 r base "$B" /p
 if [ "$(elapsed)" -lt 100 ]; then
   rm -rf "$S/b"; /expand "$D" "$S/c" 60; B="$S/c"
   r 60base "$B" /p
   [ "$(elapsed)" -lt 140 ] && r 60mmap "$B" /p SS_MMAP=1
-  [ "$(elapsed)" -lt 150 ] && r 60u128 "$B" /p128
+  [ "$(elapsed)" -lt 150 ] && r 60combo "$B" /pc
 fi
 echo "t=$(elapsed)s $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | cut -c1-40) cpus $(grep Cpus_allowed_list /proc/self/status | cut -f2) max $(cat /sys/fs/cgroup/cpu.max 2>&1) thp $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>&1 | tr -d ' ' | cut -c1-24) $(cat /sys/kernel/mm/transparent_hugepage/defrag 2>&1 | sed 's/.*\[\(.*\)\].*/\1/') fs $(awk '$5=="/data"||$5=="/output"||$5=="/scratch"{printf "%s=%s ", $5, $(NF-2)}' /proc/self/mountinfo) vbmi $(grep -c -m1 avx512_vbmi2 /proc/cpuinfo)"
 exit 1

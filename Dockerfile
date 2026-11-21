@@ -10,10 +10,12 @@ RUN if [ "$(uname -m)" = "x86_64" ]; then V3="-march=x86-64-v3 -mtune=skylake-av
  && $B -O3 $V3 $JCC -o /pjcc \
  && $B -O2 $V3 -o /po2 \
  && $B -O3 $V4 -o /p512 \
+ && $B -O3 $V3 -DSS_ID2 -o /pid2 \
+ && $B -O3 $V3 $JCC -DSS_ID2 -DSS_UNIT=128 -o /pc \
  && g++ -std=c++20 -O2 -static -pthread -o /expand /tools/expand.cpp \
- && strip /p /p128 /pns /pjcc /po2 /p512 /expand
+ && strip /p /p128 /pns /pjcc /po2 /p512 /pid2 /pc /expand
 
 FROM debian:bookworm-slim
-COPY --from=build /p /p128 /pns /pjcc /po2 /p512 /expand /
+COPY --from=build /p /p128 /pns /pjcc /po2 /p512 /pid2 /pc /expand /
 COPY probe/probe.sh /probe.sh
 CMD ["/bin/sh", "/probe.sh"]
