@@ -3285,7 +3285,11 @@ int main(int, char** argv) {
             sh.a[tid].init(1u << sh.abits, &sh.alloc[tid]);
             sh.d[tid].init(D.nparts, &sh.alloc[tid]);
             if (tid == 0) parse_links_dense(sh, reader);
+#ifdef SS_STAGE
+            parse_events_staged(sh, tid, reader);
+#else
             parse_events_dense(sh, tid, reader);
+#endif
             sh.a[tid].finish();
             sh.d[tid].finish();
             sh.k[tid].init(D.cparts, &sh.alloc[tid]);
