@@ -366,9 +366,76 @@ static inline Masks classify(const u8* p) {
 
 // Calls row(first_byte, comma_positions, newline_position, quotes_in_line) for
 // every line that starts in [start, stop) and has exactly NF fields. buf[start]
-// starts a line; a '\n' exists at or after stop - 1; 64 readable bytes follow it.
+// starts a line; `last` is the index of the first '\n' at or after stop - 1,
+// which ends the last such line; 64 readable bytes follow it.
+#ifdef SS_SCAN2
+static inline u32 tz64(u64 x) {
+#if defined(__BMI__)
+    return u32(_tzcnt_u64(x));
+#else
+    return x ? u32(__builtin_ctzll(x)) : 64;
+#endif
+}
+
+// Two stages per batch of 16 blocks: first every delimiter position is written
+// to an array with no data-dependent branch per delimiter (eight at a time,
+// more only when a block holds more), and each newline notes how many
+// delimiters and quotes came before it; then the rows are walked from that.
 template <int NF, class Row>
-static inline void scan_rows(const u8* buf, size_t start, size_t stop, Row&& row) {
+static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t last, Row&& row) {
+    if (start >= stop) return;
+    static const u32 BLOCKS = 16;
+    u32 pos[BLOCKS * 64 + NF + 32];
+    u32 nl_at[BLOCKS * 64 + 1];
+    u32 nl_quotes[BLOCKS * 64 + 1];
+    u32 n = 0;                          // delimiters held in pos (those of the unfinished line first)
+    u32 quotes = 0;                     // quotes seen since the unfinished line began
+    size_t line = start;
+    size_t block = start;
+    for (;;) {
+        u32 newlines = 0;
+        for (u32 done = 0; done < BLOCKS && block <= last; done++, block += 64) {
+            Masks m = classify(buf + block);
+            u64 delims = m.comma | m.nl;
+            const u32 count = u32(__builtin_popcountll(delims));
+            for (u64 nl = m.nl; nl; nl &= nl - 1) {
+                u64 below = (2ULL << __builtin_ctzll(nl)) - 1;
+                nl_at[newlines] = n + u32(__builtin_popcountll(delims & below)) - 1;
+                nl_quotes[newlines] = quotes + u32(__builtin_popcountll(m.quote & below));
+                newlines++;
+            }
+            quotes += u32(__builtin_popcountll(m.quote));
+            u32* out = pos + n;
+            const u32 base = u32(block);
+            for (int i = 0; i < 8; i++) { out[i] = base + tz64(delims); delims &= delims - 1; }
+            if (count > 8) {
+                for (int i = 8; i < 16; i++) { out[i] = base + tz64(delims); delims &= delims - 1; }
+                for (u32 i = 16; i < count; i++) { out[i] = base + tz64(delims); delims &= delims - 1; }
+            }
+            n += count;
+        }
+        u32 from = 0, counted = 0;
+        for (u32 j = 0; j < newlines; j++) {
+            const u32 at = nl_at[j];
+            const size_t end = pos[at];
+            if (at - from == NF - 1) row(line, pos + from, end, nl_quotes[j] - counted);
+            counted = nl_quotes[j];
+            line = end + 1;
+            from = at + 1;
+            if (end >= last) return;
+        }
+        if (block > last && !newlines) return;      // cannot happen: `last` is a newline
+        // Keep the unfinished line's delimiters; beyond NF the line is malformed anyway.
+        u32 keep = n - from;
+        if (keep > u32(NF)) keep = u32(NF);
+        memmove(pos, pos + from, keep * sizeof(u32));
+        n = keep;
+        quotes -= counted;
+    }
+}
+#else
+template <int NF, class Row>
+static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t, Row&& row) {
     if (start >= stop) return;
     size_t line = start;
     size_t commas[NF];
@@ -399,6 +466,7 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, Row&& row
         quotes += u32(__builtin_popcountll(q));
     }
 }
+#endif
 
 // A field wrapped in quotes loses them and counts 2 toward the line's quotes.
 // If the count does not reach the line's total, a quote sits somewhere else.
@@ -428,7 +496,7 @@ struct Reader {
     u8* data() { return mem + LEAD; }
 
     // Loads the lines of `task`. Returns false when no line starts inside it.
-    bool load(const InputFile& f, const Task& task, const u8*& buf, size_t& start, size_t& stop) {
+    bool load(const InputFile& f, const Task& task, const u8*& buf, size_t& start, size_t& stop, size_t& last_nl) {
         size_t from = task.begin ? task.begin - 1 : 0;
         if (f.map) {
             // Mapped input: usable in place when the chunk's last line ends in a
@@ -439,6 +507,7 @@ struct Reader {
                 const u8* first = (const u8*)memchr(buf, '\n', size_t(last - buf) + 1);
                 start = size_t(first - buf) + 1;
                 stop = task.end - from;
+                last_nl = size_t(last - buf);
                 return start < stop;
             }
         }
@@ -454,8 +523,8 @@ struct Reader {
                 if (got == 0) die("input file shrank while reading");
                 have += size_t(got);
             }
-            if (memchr(data() + need, '\n', have - need)) break;
-            if (from + have == f.size) { data()[have++] = '\n'; break; }   // last line without a newline
+            if (const u8* found = (const u8*)memchr(data() + need, '\n', have - need)) { last_nl = size_t(found - data()); break; }
+            if (from + have == f.size) { last_nl = have; data()[have++] = '\n'; break; }   // last line without a newline
             slack *= 4;
         }
         memset(data() + have, 0, LEAD);
@@ -1027,9 +1096,9 @@ static void parse_links(Shared& sh, Reader& reader) {
     const double began = now();
     Links links;
     for (const Task& task : sh.link_tasks) {
-        const u8* buf; size_t start, stop;
-        if (!reader.load(sh.files[task.file], task, buf, start, stop)) continue;
-        scan_rows<2>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
+        const u8* buf; size_t start, stop, last;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
+        scan_rows<2>(buf, start, stop, last, [&](size_t line, const auto* commas, size_t nl, u32 quotes) {
             const u8 *s0 = buf + line, *e0 = buf + commas[0], *s1 = e0 + 1, *e1 = buf + nl;
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1)
@@ -1055,12 +1124,12 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
         size_t at = sh.next_event.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.event_tasks.size()) break;
         const Task& task = sh.event_tasks[at];
-        const u8* buf; size_t start, stop;
-        if (!reader.load(sh.files[task.file], task, buf, start, stop)) continue;
+        const u8* buf; size_t start, stop, last;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
 #if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
-        scan_rows<7>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
+        scan_rows<7>(buf, start, stop, last, [&](size_t line, const auto* commas, size_t nl, u32 quotes) {
 #if SS_LVL == 2
             sink += commas[0] + commas[5] + nl + quotes + line; return;
 #endif
@@ -1153,9 +1222,9 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
         const Task& task = sh.click_tasks[at];
-        const u8* buf; size_t start, stop;
-        if (!reader.load(sh.files[task.file], task, buf, start, stop)) continue;
-        scan_rows<4>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
+        const u8* buf; size_t start, stop, last;
+        if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
+        scan_rows<4>(buf, start, stop, last, [&](size_t line, const auto* commas, size_t nl, u32 quotes) {
             const u8 *s0 = buf + line, *e0 = buf + commas[0];
             const u8 *s1 = e0 + 1, *e1 = buf + commas[1];
             const u8 *s2 = e1 + 1, *e2 = buf + commas[2];
