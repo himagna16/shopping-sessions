@@ -1123,7 +1123,7 @@ template <class T, class Emit>
 struct Resolver {
     static const u32 DIST = 16, SIZE = 64;          // SIZE is a power of two above DIST
     const AliasMap& alias;
-    Emit emit;                                       // emit(person, item)
+    Emit emit;                                       // emit(person, mix64(person), item)
     T a_item[SIZE]; u64 a_hash[SIZE]; u64 a_key[SIZE];
     T b_item[SIZE]; u64 b_hash[SIZE]; u64 b_key[SIZE];
     u32 a_in = 0, a_out = 0, b_in = 0, b_out = 0;
@@ -1131,11 +1131,12 @@ struct Resolver {
     Resolver(const AliasMap& map, Emit e) : alias(map), emit(e) {}
     inline void step_b() {
         u32 i = b_out++ & (SIZE - 1);
-        emit(alias.person_hashed(b_key[i], b_hash[i]), b_item[i]);
+        const u64 person = alias.person_hashed(b_key[i], b_hash[i]);
+        emit(person, person == b_key[i] ? b_hash[i] : mix64(person), b_item[i]);
     }
     inline void step_a() {
         u32 i = a_out++ & (SIZE - 1);
-        if (!alias.maybe(a_hash[i])) { emit(a_key[i], a_item[i]); return; }     // not an alias: the ID is the person
+        if (!alias.maybe(a_hash[i])) { emit(a_key[i], a_hash[i], a_item[i]); return; }     // not an alias: the ID is the person
         alias.prefetch_hash(a_hash[i]);
         u32 j = b_in++ & (SIZE - 1);
         b_item[j] = a_item[i]; b_hash[j] = a_hash[i]; b_key[j] = a_key[i];
@@ -1454,8 +1455,8 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecC>& lists = sh.c[tid];
     DateCache dates;
     struct Pending { u64 ckey; u32 ts; u32 camp; };
-    auto emit = [&lists, shift](u64 person, const Pending& click) {
-        lists.push(u32(mix64(person) >> shift), RecC{person, click.ckey, click.ts, click.camp});
+    auto emit = [&lists, shift](u64 person, u64 hash, const Pending& click) {
+        lists.push(u32(hash >> shift), RecC{person, click.ckey, click.ts, click.camp});
     };
     Resolver<Pending, decltype(emit)> resolver(alias, emit);
     for (;;) {
@@ -1499,8 +1500,8 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     std::vector<u64> table;                 // wide slots: (hash tag << 32) | reference
     std::vector<u32> small;                 // narrow slots: (hash tag << 16) | reference
     struct Survivor { u32 ts; u32 payload; };
-    auto emit = [&out, shift](u64 person, const Survivor& event) {
-        out.push(u32(mix64(person) >> shift), RecB{person, event.ts, event.payload});
+    auto emit = [&out, shift](u64 person, u64 hash, const Survivor& event) {
+        out.push(u32(hash >> shift), RecB{person, event.ts, event.payload});
     };
     Resolver<Survivor, decltype(emit)> resolver(alias, emit);
     for (;;) {
