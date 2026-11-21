@@ -74,13 +74,11 @@ p cnoalias "$B" /pc6
 p full "$B" /p
 sum sha14 "$B" /p
 sum sha15 "$B" /p15
-sum sha14 "$B" /p
+echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/b"; /expand "$D" "$S/c" "${PROBE_B:-60}"; B="$S/c"
 r 60def "$B" /p
 r 60nohot "$B" /pnh
 r 60g15 "$B" /p15
 r 60id2 "$B" /pid2
-sum 60sha14 "$B" /p
-sum 60sha15 "$B" /p15
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
