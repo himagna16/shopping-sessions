@@ -591,7 +591,26 @@ struct RecB { u64 person; u32 ts; u32 payload; };                          // on
 struct RecC { u64 person; u64 ckey; u32 ts; u32 camp; };                   // one valid click, 24 bytes
 
 // ---------------------------------------------------------------- catalogs
-// Small files (products, campaigns): the same dialect, parsed the plain way.
+// One line of the dialect split the plain way. False if the line is malformed.
+static bool split_line(std::string_view line, std::vector<std::string>& fields) {
+    fields.clear();
+    if (line.empty()) return false;
+    size_t s = 0;
+    for (;;) {
+        size_t c = line.find(',', s);
+        std::string_view field = line.substr(s, c == std::string_view::npos ? std::string_view::npos : c - s);
+        if (field.find('"') != std::string_view::npos) {
+            if (field.size() < 2 || field.front() != '"' || field.back() != '"' ||
+                field.substr(1, field.size() - 2).find('"') != std::string_view::npos) return false;
+            field = field.substr(1, field.size() - 2);
+        }
+        fields.emplace_back(field);
+        if (c == std::string_view::npos) return true;
+        s = c + 1;
+    }
+}
+
+// Small files (campaigns): the same dialect, parsed the plain way.
 static std::vector<std::vector<std::string>> read_small_csv(const std::string& path, size_t width) {
     std::vector<std::vector<std::string>> rows;
     FILE* f = fopen(path.c_str(), "rb");
@@ -610,21 +629,7 @@ static std::vector<std::vector<std::string>> read_small_csv(const std::string& p
         at = nl + 1;
         if (header) { header = false; continue; }
         std::vector<std::string> fields;
-        bool ok = !line.empty();
-        size_t s = 0;
-        while (ok) {
-            size_t c = line.find(',', s);
-            std::string_view field = line.substr(s, c == std::string_view::npos ? std::string_view::npos : c - s);
-            if (field.find('"') != std::string_view::npos) {
-                if (field.size() < 2 || field.front() != '"' || field.back() != '"' ||
-                    field.substr(1, field.size() - 2).find('"') != std::string_view::npos) { ok = false; break; }
-                field = field.substr(1, field.size() - 2);
-            }
-            fields.emplace_back(field);
-            if (c == std::string_view::npos) break;
-            s = c + 1;
-        }
-        if (ok && fields.size() == width) rows.push_back(std::move(fields));
+        if (split_line(line, fields) && fields.size() == width) rows.push_back(std::move(fields));
     }
     return rows;
 }
@@ -656,30 +661,55 @@ struct Catalogs {
     std::unordered_map<std::string, i32> campaign_other;
 
     void load(const std::string& dir) {
-        // Products: one pass, numbering categories as they first appear; a
-        // repeated product ID keeps its last row. Then renumber in byte order.
-        auto products = read_small_csv(dir + "/products.csv", 2);
-        std::unordered_map<std::string, u32> seen_category;
-        std::vector<std::string> names;
-        auto category_id = [&](const std::string& name) -> u32 {
-            auto it = seen_category.find(name);
-            if (it != seen_category.end()) return it->second;
-            names.push_back(name);
-            seen_category.emplace(name, u32(names.size() - 1));
+        // Products: one pass over the file, numbering categories as they first
+        // appear; a repeated product ID keeps its last row. Then renumber in byte order.
+        std::vector<std::string> names{"unknown"};
+        auto category_id = [&](const char* p, size_t n) -> u32 {
+            for (size_t i = names.size(); i-- > 0;)
+                if (names[i].size() == n && memcmp(names[i].data(), p, n) == 0) return u32(i);
+            if (names.size() >= 255) die("more than 255 categories");
+            names.emplace_back(p, n);
             return u32(names.size() - 1);
         };
-        category_id("unknown");
         std::vector<u32> dense;                    // provisional category + 1
         std::unordered_map<std::string, u32> other;
-        for (auto& row : products) {
-            const u8* s = (const u8*)row[0].data();
-            i64 number = (row[0].size() >= 2 && s[0] == 'p') ? canonical_number(s, s + row[0].size(), 1) : -1;
-            u32 id = category_id(row[1]);
+        auto add_product = [&](const char* id, size_t id_len, const char* cat, size_t cat_len) {
+            const u8* s = (const u8*)id;
+            i64 number = (id_len >= 2 && s[0] == 'p') ? canonical_number(s, s + id_len, 1) : -1;
+            u32 category = category_id(cat, cat_len);
             if (number >= 0) {
                 if (size_t(number) >= dense.size()) dense.resize(size_t(number) + 1 + dense.size() / 2, 0);
-                dense[size_t(number)] = id + 1;
+                dense[size_t(number)] = category + 1;
             } else {
-                other[row[0]] = id;
+                other[std::string(id, id_len)] = category;
+            }
+        };
+        {
+            std::string data;
+            if (FILE* f = fopen((dir + "/products.csv").c_str(), "rb")) {
+                char tmp[1 << 16];
+                size_t got;
+                while ((got = fread(tmp, 1, sizeof tmp, f)) > 0) data.append(tmp, got);
+                fclose(f);
+            }
+            const char* p = data.data();
+            const char* end = p + data.size();
+            const char* header = (const char*)memchr(p, '\n', size_t(end - p));
+            p = header ? header + 1 : end;
+            while (p < end) {
+                const char* nl = (const char*)memchr(p, '\n', size_t(end - p));
+                if (!nl) nl = end;
+                const char* comma = (const char*)memchr(p, ',', size_t(nl - p));
+                // The plain shape `id,category` with no quote and one comma is handled here.
+                if (comma && !memchr(p, '"', size_t(nl - p)) && !memchr(comma + 1, ',', size_t(nl - comma - 1))) {
+                    add_product(p, size_t(comma - p), comma + 1, size_t(nl - comma - 1));
+                } else {
+                    std::string_view line(p, size_t(nl - p));
+                    std::vector<std::string> fields;
+                    if (split_line(line, fields) && fields.size() == 2)
+                        add_product(fields[0].data(), fields[0].size(), fields[1].data(), fields[1].size());
+                }
+                p = nl + 1;
             }
         }
         if (names.size() > 255) die("more than 255 categories");
