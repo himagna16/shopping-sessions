@@ -427,7 +427,7 @@ struct DateTable {
         }
         memset(slot, 0, sizeof slot);
     }
-    inline i64 lookup(const u8* p) const {
+    inline SS_HOT i64 lookup(const u8* p) const {
         const u64 a = rd64(p);
         const u32 b = rd32(p + 8) & 0xFFFFFF;
         const Entry& e = slot[index(a, b, seed)];

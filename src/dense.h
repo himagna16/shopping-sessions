@@ -911,6 +911,9 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
         D.ptab[l.person] = parents ^ IDENT;
     };
     for (const Task& task : sh.link_tasks) {
+#ifdef SS_NOLINKS                    // measurement builds only
+        break;
+#endif
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
         line_rows<2>(buf, start, stop, last, line2, [&](const Fields<2>& f) SS_INLINE {
@@ -1088,6 +1091,9 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecK, 64>& lists = sh.k[tid];
     const u64 ukey = D.ukey, pmax = D.pmax;
     DateCache dates;
+#ifdef SS_NOCLICKS                   // measurement builds only
+    return;
+#endif
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
@@ -1306,24 +1312,31 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     // a campaign assists once for each click in the run whose previous click of
     // the same campaign lies before the run. Assists are counted per click and
     // added to the totals when the day changes.
+    // From 17 to 64 clicks the same is done over as many 8-click groups as needed.
+    static_assert(SS_SCANMAX <= 16, "the one-compare path holds 16 clicks");
     const bool light = scan_clicks && m > 0;
-    alignas(32) u32 lts[16];
-    alignas(32) i32 lprev[16];
-    alignas(32) u32 lacc[16];
-    u32 lcamp[17];
+    const bool medium = !scan_clicks && m <= 64;
+    const u32 groups = (m + 7) / 8;
+    alignas(32) u32 lts[64];
+    alignas(32) i32 lprev[64];
+    alignas(32) u32 lacc[64];
+    u32 lcamp[65];
 #if defined(__AVX2__)
     __m256i lt0 = _mm256_setzero_si256(), lt1 = lt0, lp0 = lt0, lp1 = lt0, acc0 = lt0, acc1 = lt0;
 #endif
-    if (light) {
-        for (u32 i = 1; i < m; i++) {
-            const Click v = ck[i];
-            u32 j = i;
-            while (j > 0 && (v.ts < ck[j - 1].ts || (v.ts == ck[j - 1].ts && dense_click_less(ck[j - 1].key, v.key)))) { ck[j] = ck[j - 1]; j--; }
-            ck[j] = v;
-        }
+    if (light | medium) {
+        if (light)
+            for (u32 i = 1; i < m; i++) {
+                const Click v = ck[i];
+                u32 j = i;
+                while (j > 0 && (v.ts < ck[j - 1].ts || (v.ts == ck[j - 1].ts && dense_click_less(ck[j - 1].key, v.key)))) { ck[j] = ck[j - 1]; j--; }
+                ck[j] = v;
+            }
         const u32 tag = ++cx.session_id;
-        for (u32 k = 0; k < 16; k++) { lts[k] = 0xFFFFFFFFu; lprev[k] = -1; lacc[k] = 0; lcamp[k] = organic; }
-        lcamp[16] = organic;
+        const u32 padded = light ? 16 : groups * 8;
+        for (u32 k = 0; k < padded; k++) { lts[k] = 0xFFFFFFFFu; lprev[k] = -1; lacc[k] = 0; lcamp[k] = organic; }
+        if (light) lcamp[16] = organic;
+        lcamp[64] = organic;
         for (u32 k = 0; k < m; k++) {
             const u32 c = ck[k].camp;
             lts[k] = ck[k].ts;
@@ -1363,10 +1376,12 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     };
     auto flush_assists = [&]() SS_WALK {
 #if defined(__AVX2__)
-        _mm256_store_si256((__m256i*)lacc, acc0);
-        _mm256_store_si256((__m256i*)(lacc + 8), acc1);
-        acc0 = _mm256_setzero_si256();
-        acc1 = acc0;
+        if (light) {
+            _mm256_store_si256((__m256i*)lacc, acc0);
+            _mm256_store_si256((__m256i*)(lacc + 8), acc1);
+            acc0 = _mm256_setzero_si256();
+            acc1 = acc0;
+        }
 #endif
         for (u32 k = 0; k < m; k++) { totals.assisted[size_t(lcamp[k]) * ndays + size_t(cur_day)] += lacc[k]; lacc[k] = 0; }
     };
@@ -1390,7 +1405,7 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         const i64 day = i64((start + day_shift) / u32(DAY));
         if (day != cur_day) {
             if (cur_day >= 0) {
-                if (light) flush_assists();
+                if (light | medium) flush_assists();
                 emit();
             }
             cur_day = day; d_sessions = 0; d_events = 0; d_revenue = 0;
@@ -1434,6 +1449,27 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             for (u32 k = 0; k < m; k++) lacc[k] += ((inmask >> k) & 1) & u32(lprev[k] < first);
 #endif
             credited = lcamp[inmask ? 31 - __builtin_clz(inmask) : 16];
+        } else if (medium) {
+            u64 inmask = 0;
+#if defined(__AVX2__)
+            const __m256i from = _mm256_set1_epi32(int(start)), reach = _mm256_set1_epi32(int(REACH));
+            __m256i in[8];
+            for (u32 g = 0; g < groups; g++) {
+                const __m256i d = _mm256_sub_epi32(_mm256_load_si256((const __m256i*)(lts + 8 * g)), from);
+                in[g] = _mm256_cmpeq_epi32(_mm256_min_epu32(d, reach), d);
+                inmask |= u64(u32(_mm256_movemask_ps(_mm256_castsi256_ps(in[g])))) << (8 * g);
+            }
+            const __m256i first = _mm256_set1_epi32(inmask ? int(__builtin_ctzll(inmask)) : 64);
+            for (u32 g = 0; g < groups; g++) {
+                const __m256i hit = _mm256_and_si256(in[g], _mm256_cmpgt_epi32(first, _mm256_load_si256((const __m256i*)(lprev + 8 * g))));
+                _mm256_store_si256((__m256i*)(lacc + 8 * g), _mm256_sub_epi32(_mm256_load_si256((const __m256i*)(lacc + 8 * g)), hit));
+            }
+#else
+            for (u32 k = 0; k < m; k++) inmask |= u64(u32(lts[k] - start) <= u32(REACH)) << k;
+            const i32 first = inmask ? i32(__builtin_ctzll(inmask)) : 64;
+            for (u32 k = 0; k < m; k++) lacc[k] += u32((inmask >> k) & 1) & u32(lprev[k] < first);
+#endif
+            credited = lcamp[inmask ? 63 - __builtin_clzll(inmask) : 64];
         } else if (!scan_clicks) {
             const u64 upto = u64(start) + u64(REACH);
             while (right < m && ck[right].ts <= upto) {
@@ -1453,7 +1489,7 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
     }
     if (cur_day >= 0) {
-        if (light) flush_assists();
+        if (light | medium) flush_assists();
         emit();
     }
     for (u32 k = left; k < right; k++) {                  // the spans still open at the person's last session
