@@ -45,6 +45,15 @@
 #ifndef SS_UNIT
 #define SS_UNIT 128         // bytes staged per bucket before they are moved to its block chain
 #endif
+// Build variants kept for measurement. Defaults: the block-level quote scanner
+// and the sortable ingest key. SS_SCAN1 / SS_SCAN2 select the older scanners,
+// SS_ING1 the full ingest_ts conversion.
+#if !defined(SS_SCAN1) && !defined(SS_SCAN2) && !defined(SS_SCAN3)
+#define SS_SCAN3
+#endif
+#if !defined(SS_ING1) && !defined(SS_ING2)
+#define SS_ING2
+#endif
 #ifndef SS_X
 #define SS_X 0            // measurement builds only: skip one step (see probe branch)
 #endif
