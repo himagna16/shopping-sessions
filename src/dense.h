@@ -63,7 +63,8 @@ static inline SS_HOT u64 unscramble40(u64 value, u64 key) { return ((scramble_z(
 // 2^40. Anything else gives ~0. p must be readable for 8 bytes.
 #ifndef SS_B36_SWAR
 // One table row per place: a character's digit times that place's power of 36,
-// or a value far out of range for a character that is no digit. The eight
+// or a value far out of range for a character that is no digit (small enough
+// that eight of them cannot wrap round to a valid sum). The eight
 // lookups replace the checks and all but two of the multiplications.
 struct B36Table {
     u64 row[8][128];
@@ -72,7 +73,7 @@ struct B36Table {
         for (int place = 7; place >= 0; place--, power *= 36)
             for (int c = 0; c < 128; c++) {
                 const int digit = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'z') ? c - 'a' + 10 : -1;
-                row[place][c] = digit < 0 ? (1ULL << 62) : u64(digit) * power;
+                row[place][c] = digit < 0 ? (1ULL << 56) : u64(digit) * power;      // eight of these still do not wrap
             }
     }
 };
@@ -106,6 +107,35 @@ static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
     return value > MASK40 ? ~0ULL : value;
 }
 #endif
+
+// Two IDs at once: the na bytes at pa and the nb bytes at pb, each as b36_value
+// reads them. Both fit one 16-byte register: digits by range, then pairs, fours
+// and the two halves by multiply-add, with no table and no loop.
+static inline SS_HOT void b36_pair(const u8* pa, size_t na, const u8* pb, size_t nb, u64& va, u64& vb) {
+#if defined(__SSE4_1__) && !defined(SS_B36_SWAR) && !defined(SS_B36_TABLE)
+    const u64 ZERO = 0x3030303030303030ULL;
+    const u64 ra = rd64(pa), rb = rd64(pb);
+    const unsigned sa = unsigned(8 * (8 - na)) & 63, sb = unsigned(8 * (8 - nb)) & 63;
+    const u64 ta = (ra << sa) | (ZERO & ((1ULL << sa) - 1)), tb = (rb << sb) | (ZERO & ((1ULL << sb) - 1));
+    const __m128i x = _mm_set_epi64x((long long)tb, (long long)ta);
+    const __m128i x1 = _mm_sub_epi8(x, _mm_set1_epi8('0')), x2 = _mm_sub_epi8(x, _mm_set1_epi8('a'));
+    const __m128i ok1 = _mm_cmpeq_epi8(_mm_min_epu8(x1, _mm_set1_epi8(9)), x1);
+    const __m128i ok2 = _mm_cmpeq_epi8(_mm_min_epu8(x2, _mm_set1_epi8(25)), x2);
+    const u32 good = u32(_mm_movemask_epi8(_mm_or_si128(ok1, ok2)));
+    const __m128i digit = _mm_sub_epi8(x1, _mm_and_si128(ok2, _mm_set1_epi8(39)));
+    const __m128i pairs = _mm_maddubs_epi16(digit, _mm_set1_epi16(0x0124));                 // 36 * first + second
+    const __m128i fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010510));                // 1296 * first + second
+    const __m128i value = _mm_add_epi64(_mm_mul_epu32(fours, _mm_set1_epi64x(1679616)), _mm_srli_epi64(fours, 32));
+    const u64 a = u64(_mm_cvtsi128_si64(value)), b = u64(_mm_extract_epi64(value, 1));
+    const bool bad_a = ((good & 0xFF) != 0xFF) | (na - 1 >= 8) | (a > MASK40) | (((ra & 0xFF) == '0') & (na > 1));
+    const bool bad_b = ((good >> 8) != 0xFF) | (nb - 1 >= 8) | (b > MASK40) | (((rb & 0xFF) == '0') & (nb > 1));
+    va = bad_a ? ~0ULL : a;
+    vb = bad_b ? ~0ULL : b;
+#else
+    va = b36_value(pa, na);
+    vb = b36_value(pb, nb);
+#endif
+}
 
 static inline u32 b36_text(char* out, u64 v) {
     char tmp[16];
@@ -262,17 +292,10 @@ static inline bool dense_click_less(u64 a, u64 b) {
 // ---------------------------------------------------------------- keys
 // Reads the start of the largest event file, recovers both keys from it and
 // sizes the tables. False leaves the run on the general path.
-static bool dense_setup(Shared& sh) {
-    Dense& D = g_dense;
-    const double began = now();
-    {
-        const char* v = getenv("SS_DENSE");
-        if (v && *v == '0') return false;
-    }
+// Recovers both keys from the start of the largest event file. False if the
+// data does not show them plainly.
+static bool dense_recover(Shared& sh, u64& ukey_out, u64& ekey_out, double& rows_out) {
     const u32 T = sh.cfg.threads;
-    if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
-    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
-
     size_t total_bytes = 0, best_size = 0;
     i64 best = -1;
     for (const Task& task : sh.event_tasks) {
@@ -395,8 +418,43 @@ static bool dense_setup(Shared& sh) {
     }
     if (keys.size() != 1) return false;
 
+    ukey_out = ukey;
+    ekey_out = keys[0];
+    rows_out = rows_est;
+    return true;
+}
+
+// Recovers the keys and sizes the tables. False leaves the run on the general path.
+// SS_DENSE=0 switches the dense path off; SS_DENSE=2 (tests) takes it even when
+// no key is found, with arbitrary keys: every ID then decodes to some number,
+// nearly all of them out of range, and the result must still be exact.
+static bool dense_setup(Shared& sh) {
+    Dense& D = g_dense;
+    const double began = now();
+    bool forced = false;
+    {
+        const char* v = getenv("SS_DENSE");
+        if (v && *v == '0') return false;
+        forced = v && *v == '2';
+    }
+    const u32 T = sh.cfg.threads;
+    if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
+    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
+    u64 ukey = 0, ekey = 0;
+    double rows_est = 0;
+    if (!dense_recover(sh, ukey, ekey, rows_est)) {
+        if (!forced) return false;
+        size_t total_bytes = 0;
+        for (const Task& task : sh.event_tasks) total_bytes += task.end - task.begin;
+        rows_est = double(total_bytes) / 40 + 16;
+        if (rows_est > 4.0e9) return false;
+        ukey = 0x5DEECE66DULL;
+        ekey = 0x2545F4914FULL;
+    }
+    const u64 pmax = std::min<u64>(1u << 23, u64(rows_est / 30 + rows_est / 300) + 256);
+    const u64 nidx = u64(rows_est + rows_est / 32) + 4096;
     D.ukey = ukey;
-    D.ekey = keys[0];
+    D.ekey = ekey;
     D.nidx = nidx;
     D.nparts = u32(nidx >> SS_DW) + 1;
     D.pmax = u32(pmax);
@@ -568,6 +626,108 @@ static inline SS_INLINE void line_rows(const u8* buf, size_t start, size_t stop,
 #endif
 }
 
+#ifdef SS_SELFTEST
+// Test builds only (SS_LINETEST=N): random lines, mostly well-formed, some
+// broken; whenever a fast line reader accepts a line, the byte-by-byte reader
+// must accept it too and give the same fields and the same next line.
+template <int NF, class Fast>
+static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) {
+    auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+    std::vector<u8> buf;
+    u64 failures = 0;
+    for (u64 done = 0; done < lines;) {
+        buf.clear();
+        std::vector<size_t> starts;
+        for (int k = 0; k < 64; k++) {
+            starts.push_back(buf.size());
+            const int nf = rnd() % 10 < 9 ? NF : int(rnd() % 10) + 1;
+            for (int i = 0; i < nf; i++) {
+                if (i) buf.push_back(',');
+                size_t len = rnd() % 14;
+                if (rnd() % 40 == 0) len = rnd() % 90;
+                const bool quote = rnd() % 4 == 0;
+                if (quote) buf.push_back('"');
+                for (size_t j = 0; j < len; j++) buf.push_back(u8("abcxyz0189 :-TZ"[rnd() % 15]));
+                if (quote) buf.push_back('"');
+            }
+            const size_t from = starts.back();
+            if (rnd() % 6 == 0 && buf.size() > from) {
+                const size_t at = from + rnd() % (buf.size() - from);
+                switch (rnd() % 5) {
+                    case 0: buf[at] = '"'; break;
+                    case 1: buf[at] = ','; break;
+                    case 2: buf.insert(buf.begin() + long(at), '"'); break;
+                    case 3: buf.erase(buf.begin() + long(at)); break;
+                    default: buf[at] = '\r'; break;
+                }
+            }
+            buf.push_back('\n');
+        }
+        const size_t last = buf.size() - 1;
+        buf.resize(buf.size() + 256, 'x');
+        for (size_t line : starts) {
+            const u8* p = buf.data() + line;
+            const u8* nl = (const u8*)memchr(p, '\n', last - line + 1);
+            Fields<NF> exact, quick;
+            const bool exact_ok = split_exact<NF>(p, nl, exact);
+            const u8* next = nullptr;
+            const bool quick_ok = fast(p, quick, next);
+            done++;
+            if (!quick_ok) continue;
+            accepted++;
+            bool same = exact_ok && next == nl + 1;
+            for (int i = 0; same && i < NF; i++) same = exact.s[i] == quick.s[i] && exact.e[i] == quick.e[i];
+            if (!same) {
+                if (failures++ < 5) fprintf(stderr, "line test: %d fields, mismatch on [%.*s]\n", NF, int(nl - p), (const char*)p);
+            }
+        }
+    }
+    return failures;
+}
+static void line_selftest(u64 lines) {
+    u64 state = 0x9E3779B97F4A7C15ULL ^ lines, a7 = 0, a4 = 0, a2 = 0;
+    {
+        // The paired ID decode against the single one, on IDs of every shape.
+        auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+        u64 wrong = 0, valid = 0;
+        for (u64 i = 0; i < lines; i++) {
+            u8 text[2][32];
+            size_t len[2];
+            for (int k = 0; k < 2; k++) {
+                memset(text[k], 0, sizeof text[k]);
+                len[k] = rnd() % 11;
+                const u64 kind = rnd() % 8;
+                for (size_t j = 0; j < 16; j++) text[k][j] = u8(kind == 0 ? "0123456789abcdefghijklmnopqrstuvwxyzAZ ,\"/:`{"[rnd() % 45] : kind == 1 ? rnd() & 0xFF : kind == 2 ? "AZ/:`{ -"[rnd() % 8] : "0123456789abcdefghijklmnopqrstuvwxyz"[rnd() % 36]);
+            }
+            u64 a, b;
+            b36_pair(text[0], len[0], text[1], len[1], a, b);
+            const u64 wa = b36_value(text[0], len[0]), wb = b36_value(text[1], len[1]);
+            for (int k = 0; k < 2; k++) {
+                // the plain definition: 1 to 8 of 0-9a-z, no leading zero, below 2^40
+                u64 plain = 0;
+                bool fine = len[k] >= 1 && len[k] <= 8 && !(len[k] > 1 && text[k][0] == '0');
+                for (size_t j = 0; fine && j < len[k]; j++) {
+                    const u8 c = text[k][j];
+                    if (c >= '0' && c <= '9') plain = plain * 36 + (c - '0');
+                    else if (c >= 'a' && c <= 'z') plain = plain * 36 + (c - 'a' + 10);
+                    else fine = false;
+                }
+                if (!fine || plain > MASK40) plain = ~0ULL;
+                if (plain != (k ? wb : wa)) { if (wrong++ < 5) fprintf(stderr, "single decode mismatch: [%.*s] got %llx want %llx\n", int(len[k]), (const char*)text[k], (unsigned long long)(k ? wb : wa), (unsigned long long)plain); }
+            }
+            valid += (wa != ~0ULL) + (wb != ~0ULL);
+            if (a != wa || b != wb) { if (wrong++ < 5) fprintf(stderr, "pair decode mismatch: [%.*s] [%.*s] got %llx %llx want %llx %llx\n", int(len[0]), (const char*)text[0], int(len[1]), (const char*)text[1], (unsigned long long)a, (unsigned long long)b, (unsigned long long)wa, (unsigned long long)wb); }
+        }
+        fprintf(stderr, "pair decode: %llu pairs, %llu valid IDs, %llu mismatches\n", (unsigned long long)lines, (unsigned long long)valid, (unsigned long long)wrong);
+        if (wrong) _exit(1);
+    }
+    const u64 bad = line_selftest_one<7>(state, lines, line7, a7) + line_selftest_one<4>(state, lines, line4, a4) + line_selftest_one<2>(state, lines, line2, a2);
+    fprintf(stderr, "line test: %llu lines each; accepted %llu / %llu / %llu; %llu mismatches\n", (unsigned long long)lines,
+            (unsigned long long)a7, (unsigned long long)a4, (unsigned long long)a2, (unsigned long long)bad);
+    _exit(bad ? 1 : 0);
+}
+#endif
+
 // After the links are read: the links of everyone handed to the general path
 // join the general union-find, and the alias map is built from it. Only links
 // hand people over, so this runs on the links thread while the others parse.
@@ -736,11 +896,11 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
             sink += u64(ts32) + payload + ing; return;
 #endif
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
+            // Both IDs are decoded together; the user's number is only used for a valid copy.
+            u64 event_value, user_value;
+            b36_pair(s0 + 1, n0 - 1, s1 + 1, n1 - 1, event_value, user_value);
             u64 number = ~0ULL;
-            if (s0[0] == 'e') {
-                const u64 value = b36_value(s0 + 1, n0 - 1);
-                if (value != ~0ULL) number = unscramble40(value, ekey);
-            }
+            if ((s0[0] == 'e') & (event_value != ~0ULL)) number = unscramble40(event_value, ekey);
 #if SS_PL == 6
             sink += u64(ts32) + payload + ing + number; return;
 #endif
@@ -756,7 +916,11 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                 user = u32(rd64(s1 + 1) & 0xFFFFF0) | 1;
                 if (false)
 #endif
-                if (ts32 != DEAD && !dense_user(s1, n1, ukey, pmax, user)) user = dense_odd_user(cx, tid, pack_id(s1, n1, 'u'));
+                if (ts32 != DEAD) {
+                    const u64 who = unscramble40(user_value, ukey);
+                    if ((s1[0] == 'u') & (user_value != ~0ULL) & ((who >> 9) < pmax) & ((who & 511) < 16)) user = (u32(who >> 9) << 4) | u32(who & 15);
+                    else user = dense_odd_user(cx, tid, pack_id(s1, n1, 'u'));
+                }
                 if (far) dense_bail(1);                         // an ingest time this record cannot hold
 #if SS_PL == 7
                 sink += u64(ts32) + payload + ing + number + user; return;
@@ -803,9 +967,12 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
             const i32 campaign = cat.campaign(s2, e2);
             if (campaign < 0) return;
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
-            u32 user = 0;
-            if (dense_user(s1, n1, ukey, pmax, user)) {
-                u64 key = s0[0] == 'k' ? b36_value(s0 + 1, n0 - 1) : ~0ULL;
+            u64 key, user_value;
+            b36_pair(s0 + 1, n0 - 1, s1 + 1, n1 - 1, key, user_value);
+            const u64 who = unscramble40(user_value, ukey);
+            if ((s1[0] == 'u') & (user_value != ~0ULL) & ((who >> 9) < pmax) & ((who & 511) < 16)) {
+                const u32 user = (u32(who >> 9) << 4) | u32(who & 15);
+                if (s0[0] != 'k') key = ~0ULL;
                 if (key == ~0ULL) {
                     key = KODD | (u64(tid) << 40) | u64(cx.odd_clicks.size());
                     cx.odd_clicks.push_back(pack_id(s0, n0, 'k'));
@@ -935,9 +1102,6 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     // ties settled afterwards.
     Click* ck = nullptr;
     u32 m = 0;
-#ifndef SS_DX
-#define SS_DX 0                      // measurement builds only: leave one step of the walk out
-#endif
 #if SS_DX == 3
     cx.rows += n; return;
 #endif
@@ -1001,6 +1165,43 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     if (m <= SS_SCANMAX) m = 0;
 #endif
     const bool scan_clicks = m <= SS_SCANMAX;
+    // Up to 16 clicks: put in time order (at one instant the smallest click_id
+    // last), they sit one to a bit. For a session, the clicks in reach are then a
+    // run of bits found with one compare; the highest is the click to credit, and
+    // a campaign assists once for each click in the run whose previous click of
+    // the same campaign lies before the run. Assists are counted per click and
+    // added to the totals when the day changes.
+    const bool light = scan_clicks && m > 0;
+    alignas(32) u32 lts[16];
+    alignas(32) i32 lprev[16];
+    alignas(32) u32 lacc[16];
+    u32 lcamp[17];
+#if defined(__AVX2__)
+    __m256i lt0 = _mm256_setzero_si256(), lt1 = lt0, lp0 = lt0, lp1 = lt0, acc0 = lt0, acc1 = lt0;
+#endif
+    if (light) {
+        for (u32 i = 1; i < m; i++) {
+            const Click v = ck[i];
+            u32 j = i;
+            while (j > 0 && (v.ts < ck[j - 1].ts || (v.ts == ck[j - 1].ts && dense_click_less(ck[j - 1].key, v.key)))) { ck[j] = ck[j - 1]; j--; }
+            ck[j] = v;
+        }
+        const u32 tag = ++cx.session_id;
+        for (u32 k = 0; k < 16; k++) { lts[k] = 0xFFFFFFFFu; lprev[k] = -1; lacc[k] = 0; lcamp[k] = organic; }
+        lcamp[16] = organic;
+        for (u32 k = 0; k < m; k++) {
+            const u32 c = ck[k].camp;
+            lts[k] = ck[k].ts;
+            lcamp[k] = c;
+            lprev[k] = stamp[c] == tag ? i32(camp_slot[c]) : -1;
+            stamp[c] = tag;
+            camp_slot[c] = k;
+        }
+#if defined(__AVX2__)
+        lt0 = _mm256_load_si256((const __m256i*)lts); lt1 = _mm256_load_si256((const __m256i*)(lts + 8));
+        lp0 = _mm256_load_si256((const __m256i*)lprev); lp1 = _mm256_load_si256((const __m256i*)(lprev + 8));
+#endif
+    }
 
     char name[24];
     name[0] = 'u';
@@ -1025,6 +1226,15 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
 #endif
         rows++;
     };
+    auto flush_assists = [&]() SS_WALK {
+#if defined(__AVX2__)
+        _mm256_store_si256((__m256i*)lacc, acc0);
+        _mm256_store_si256((__m256i*)(lacc + 8), acc1);
+        acc0 = _mm256_setzero_si256();
+        acc1 = acc0;
+#endif
+        for (u32 k = 0; k < m; k++) { totals.assisted[size_t(lcamp[k]) * ndays + size_t(cur_day)] += lacc[k]; lacc[k] = 0; }
+    };
     u32 left = 0, right = 0;
     // The same span counting of assists as in process_people.
     u32 ord = 0, nruns = 0;
@@ -1044,7 +1254,10 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         const u32 start = u32(ev[i] >> 32);
         const i64 day = i64((start + day_shift) / u32(DAY));
         if (day != cur_day) {
-            if (cur_day >= 0) emit();
+            if (cur_day >= 0) {
+                if (light) flush_assists();
+                emit();
+            }
             cur_day = day; d_sessions = 0; d_events = 0; d_revenue = 0;
         }
         // The session's events: each within 30 minutes of the one before.
@@ -1070,18 +1283,23 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         u32 credited = organic;
         // Click times count from window_start - 7 days, event times from
         // window_start, so the clicks in reach are those in [start, start + 7 days].
-        if (scan_clicks) {
-            const u32 session_id = ++cx.session_id;
-            i64 best = -1;
-            for (u32 k = 0; k < m; k++) {
-                const u32 t = ck[k].ts;
-                if (u32(t - start) > u32(REACH)) continue;            // before start, or over 7 days back
-                const u32 c = ck[k].camp;
-                if (stamp[c] != session_id) { stamp[c] = session_id; totals.assisted[size_t(c) * ndays + size_t(day)]++; }
-                if (best < 0 || t > ck[best].ts || (t == ck[best].ts && dense_click_less(ck[k].key, ck[best].key))) best = k;
-            }
-            if (best >= 0) credited = ck[best].camp;
-        } else {
+        if (light) {
+#if defined(__AVX2__)
+            const __m256i from = _mm256_set1_epi32(int(start)), reach = _mm256_set1_epi32(int(REACH));
+            const __m256i d0 = _mm256_sub_epi32(lt0, from), d1 = _mm256_sub_epi32(lt1, from);
+            const __m256i in0 = _mm256_cmpeq_epi32(_mm256_min_epu32(d0, reach), d0), in1 = _mm256_cmpeq_epi32(_mm256_min_epu32(d1, reach), d1);
+            const u32 inmask = u32(_mm256_movemask_ps(_mm256_castsi256_ps(in0))) | (u32(_mm256_movemask_ps(_mm256_castsi256_ps(in1))) << 8);
+            const __m256i first = _mm256_set1_epi32(int(__builtin_ctz(inmask | 0x10000)));
+            acc0 = _mm256_sub_epi32(acc0, _mm256_and_si256(in0, _mm256_cmpgt_epi32(first, lp0)));
+            acc1 = _mm256_sub_epi32(acc1, _mm256_and_si256(in1, _mm256_cmpgt_epi32(first, lp1)));
+#else
+            u32 inmask = 0;
+            for (u32 k = 0; k < m; k++) inmask |= u32(u32(lts[k] - start) <= u32(REACH)) << k;
+            const i32 first = i32(__builtin_ctz(inmask | 0x10000));
+            for (u32 k = 0; k < m; k++) lacc[k] += ((inmask >> k) & 1) & u32(lprev[k] < first);
+#endif
+            credited = lcamp[inmask ? 31 - __builtin_clz(inmask) : 16];
+        } else if (!scan_clicks) {
             const u64 upto = u64(start) + u64(REACH);
             while (right < m && ck[right].ts <= upto) {
                 const u32 c = ck[right++].camp;
@@ -1099,7 +1317,10 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
         totals.sessions[slot]++;
         if (cents > 0) { totals.purchasing[slot]++; totals.revenue[slot] += cents; }
     }
-    if (cur_day >= 0) emit();
+    if (cur_day >= 0) {
+        if (light) flush_assists();
+        emit();
+    }
     for (u32 k = left; k < right; k++) {                  // the spans still open at the person's last session
         const u32 c = ck[k].camp;
         if (camp_count[c]) { close_span(c, camp_slot[c]); camp_count[c] = 0; }

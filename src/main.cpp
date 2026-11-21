@@ -107,6 +107,9 @@
 #ifndef SS_PROBE
 #define SS_PROBE 0
 #endif
+#ifndef SS_DX
+#define SS_DX 0           // measurement builds only: leave one step of the dense walk out (dense.h)
+#endif
 
 typedef uint8_t u8;
 typedef uint16_t u16;
@@ -2234,7 +2237,9 @@ struct UserWriter {
         parts[4].values = revenue.data(); parts[4].values_len = size_t(n) * 8;
         parts[5].levels = levels.data(); parts[5].levels_len = levels.size();
         parts[5].values = cats.data(); parts[5].values_len = cats_len;
+#if SS_DX != 6
         file.row_group(n, parts);
+#endif
         memset(nulls.data(), 0, groups);
         n = 0; ids_len = 0; cats_len = 0;
     }
@@ -3227,6 +3232,9 @@ int main(int, char** argv) {
 
     const u32 T = cfg.threads;
     bool dense = false;
+#if defined(SS_DENSE_BUILD) && defined(SS_SELFTEST)
+    if (!env("SS_LINETEST", "").empty()) line_selftest(u64(atoll(env("SS_LINETEST", "0").c_str())));
+#endif
 #ifdef SS_DENSE_BUILD
     g_dense.argv = argv;
     dense = dense_setup(sh);
