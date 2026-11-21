@@ -27,9 +27,8 @@
 
 #ifdef SS_DENSE_BUILD
 
-#ifndef SS_DW
-#define SS_DW 14                    // log2 of the event numbers in one partition
-#endif
+// SS_DW (tests): a fixed log2 of the event numbers in one partition. Otherwise
+// it is chosen by size, see dense_width.
 #ifndef SS_RADIXMIN
 #define SS_RADIXMIN 4096           // a person with more clicks than this has them ordered by counting passes
 #endif
@@ -161,11 +160,21 @@ static inline u64 b36_order(u64 v) {
 // RecK.x = ts << 32 | person << 4 | alias.
 // RecK.y = campaign << 48 | click key; the key is the value a canonical click ID
 //          spells, or KODD | thread << 40 | index into that thread's odd_clicks.
-static const u32 DWIDTH = 1u << SS_DW;
-static const u32 ING_SHIFT = 28 + SS_DW;
-static const u32 ING_BITS = 64 - ING_SHIFT;
-static const u32 ING_NONE = (1u << ING_BITS) - 1;
-static const u32 ING_LEAD_DAYS = SS_DW <= 14 ? 12 : 2;      // how far before the window's first day ingest times can be held
+// The partition width is set once, before the parse (dense_width); the hot loops
+// take these into locals of the same names without the g_.
+static u32 g_dw = 14;                   // log2 of the event numbers in one partition
+static u32 g_dwidth = 1u << 14;
+static u32 g_ing_shift = 28 + 14;       // the ingest field takes what the number within the partition leaves
+static u32 g_ing_none = (1u << 22) - 1;
+static u32 g_ing_lead_days = 12;        // how far before the window's first day ingest times can be held
+static void dense_width(u32 dw) {
+    g_dw = dw;
+    g_dwidth = 1u << dw;
+    g_ing_shift = 28 + dw;
+    const u32 bits = std::min<u32>(64 - g_ing_shift, 31);
+    g_ing_none = (1u << bits) - 1;
+    g_ing_lead_days = dw <= 14 ? 12 : 2;
+}
 static const u32 ODD = 1u << 27, USER_MASK = (1u << 28) - 1;
 static const u64 KODD = 1ULL << 47, KEY_MASK = (1ULL << 48) - 1;
 static const u64 EMPTY_SLOT = ~0ULL;
@@ -440,7 +449,6 @@ static bool dense_setup(Shared& sh) {
     }
     const u32 T = sh.cfg.threads;
     if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
-    if ((u64(ING_LEAD_DAYS) + sh.ndays + 2) * 86400 >= ING_NONE) return false;      // the window's ingest times must fit their field
     u64 ukey = 0, ekey = 0;
     double rows_est = 0;
     if (!dense_recover(sh, ukey, ekey, rows_est)) {
@@ -454,10 +462,24 @@ static bool dense_setup(Shared& sh) {
     }
     const u64 pmax = std::min<u64>(1u << 23, u64(rows_est / 30 + rows_est / 300) + 256);
     const u64 nidx = u64(rows_est + rows_est / 32) + 4096;
+    // Partitions of 2^14 numbers, or 2^15 when that still leaves over a thousand of
+    // them: at the final's size the narrower ones need more staging memory than
+    // the parse has cache for (measured: 2^15 is 1 to 2% faster at 60M events and
+    // no different at 20M). The window's ingest times must fit their field.
+    auto fits = [&]() { return (u64(g_ing_lead_days) + sh.ndays + 2) * 86400 < g_ing_none; };
+#ifdef SS_DW
+    dense_width(SS_DW);
+    if (!fits()) return false;
+#else
+    dense_width(nidx > (1ULL << 25) ? 15 : 14);
+    if (!fits()) dense_width(14);
+    if (!fits()) return false;
+#endif
+    const u32 DW = g_dw, ING_LEAD_DAYS = g_ing_lead_days;
     D.ukey = ukey;
     D.ekey = ekey;
     D.nidx = nidx;
-    D.nparts = u32(nidx >> SS_DW) + 1;
+    D.nparts = u32(nidx >> DW) + 1;
     D.pmax = u32(pmax);
     D.cparts = (D.pmax >> SS_CW) + 1;
     D.ptab = big_alloc<u64>(D.pmax + 1);
@@ -995,6 +1017,7 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     Scatter<RecD, 64>& lists = sh.d[tid];
     const u64 ekey = D.ekey, ukey = D.ukey, nidx = D.nidx, pmax = D.pmax;
     const i64 ing_base = D.ing_base;
+    const u32 DW = g_dw, DWIDTH = g_dwidth, ING_SHIFT = g_ing_shift, ING_NONE = g_ing_none, ING_LEAD_DAYS = g_ing_lead_days;
     const u32 day_lead = ING_LEAD_DAYS * 86400;
     DateCache dates;
 #ifndef SS_PL
@@ -1106,7 +1129,7 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
 #if SS_PL == 7
                 sink += u64(ts32) + payload + ing + number + user; return;
 #endif
-                lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << ING_SHIFT) | ((number & (DWIDTH - 1)) << 28) | user});
+                lists.push(u32(number >> DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << ING_SHIFT) | ((number & (DWIDTH - 1)) << 28) | user});
                 return;
             }
             // An event ID that does not decode: the general dedup, exactly as parse_events
@@ -1141,6 +1164,7 @@ static void parse_events_staged(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecD, 64>& lists = sh.d[tid];
     const u64 ekey = D.ekey, ukey = D.ukey, nidx = D.nidx, pmax = D.pmax;
     const i64 ing_base = D.ing_base;
+    const u32 DW = g_dw, DWIDTH = g_dwidth, ING_SHIFT = g_ing_shift, ING_NONE = g_ing_none, ING_LEAD_DAYS = g_ing_lead_days;
     const u32 day_lead = ING_LEAD_DAYS * 86400;
     const i64 day_base = sh.day_base;
     const u64* day8 = sh.day_text8.data();
@@ -1272,7 +1296,7 @@ static void parse_events_staged(Shared& sh, u32 tid, Reader& reader) {
                         else user = dense_odd_user(cx, tid, pack_id(fs[i].s[1], size_t(fs[i].e[1] - fs[i].s[1]), 'u'));
                     }
                     if (far[i]) dense_bail(1);
-                    lists.push(u32(number[i] >> SS_DW), RecD{(u64(ts32[i]) << 32) | payload[i], (u64(ing[i]) << ING_SHIFT) | ((number[i] & (DWIDTH - 1)) << 28) | user});
+                    lists.push(u32(number[i] >> DW), RecD{(u64(ts32[i]) << 32) | payload[i], (u64(ing[i]) << ING_SHIFT) | ((number[i] & (DWIDTH - 1)) << 28) | user});
                     continue;
                 }
                 const u8 *s3 = fs[i].s[3], *e3 = fs[i].e[3];
@@ -1829,6 +1853,7 @@ static void dense_ctx_init(Shared& sh, DenseCtx& cx, u32 part) {
     char name[64];
     snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", part);
     cx.writer.init(sh.cfg.out + name);
+    const u32 DWIDTH = g_dwidth;
     cx.slots.assign(DWIDTH, RecD{0, EMPTY_SLOT});
     cx.ev.resize(DWIDTH);
     cx.al.resize(DWIDTH);
@@ -1864,6 +1889,7 @@ static void dense_walk(Shared& sh, u32 tid) {
     DenseCtx& cx = D.ctx[tid];
     const u32 nthreads = sh.cfg.threads;
     dense_ctx_init(sh, cx, tid);
+    const u32 DWIDTH = g_dwidth, ING_SHIFT = g_ing_shift;
     RecD* slots = cx.slots.data();
     u64* ev = cx.ev.data();
     u8* al = cx.al.data();
