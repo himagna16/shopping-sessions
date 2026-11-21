@@ -477,16 +477,31 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
     const i64 ing_base = D.ing_base;
     const u32 day_lead = ING_LEAD_DAYS * 86400;
     DateCache dates;
+#ifndef SS_PL
+#define SS_PL 0                      // measurement builds only: stop the event row handler after step N
+#endif
+    [[maybe_unused]] u64 sink = 0;
     for (;;) {
         size_t at = sh.next_event.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.event_tasks.size()) break;
         const Task& task = sh.event_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+#if SS_PL == 1
+        for (size_t i = start; i < last; i += 64) sink += buf[i];
+        release_chunk(sh.files[task.file], task);
+        continue;
+#endif
         scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
+#if SS_PL == 2
+            sink += a[0] + a[6] + nlpos; return;
+#endif
             QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3) QUOTED(4) QUOTED(5) QUOTED(6)
             FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD(3, 4) FIELD(4, 5) FIELD(5, 6) FIELD_LAST(6)
             if (s0 == e0) return;                               // no event_id
+#if SS_PL == 3
+            sink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3) + size_t(e4 - s4) + size_t(e5 - s5) + size_t(e6 - s6); return;
+#endif
             // As in parse_events: is the copy valid and on time, and where does its
             // ingest_ts stand among the copies of its event. Here the ingest time is
             // kept as whole seconds from a little before the window.
@@ -511,6 +526,9 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                     timely = in_window && ingest - ts <= DAY;
                 }
             }
+#if SS_PL == 4
+            sink += u64(ts) + ing + u64(timely) + size_t(e6 - s6); return;
+#endif
             u32 ts32 = DEAD, payload = 0;
             if (timely && s1 != e1 && s5 != e5) {
                 const size_t kind = size_t(e4 - s4);
@@ -535,12 +553,18 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                 }
                 if (ok) ts32 = u32(ts - ws);
             }
+#if SS_PL == 5
+            sink += u64(ts32) + payload + ing; return;
+#endif
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
             u64 number = ~0ULL;
             if (s0[0] == 'e') {
                 const u64 value = b36_value(s0 + 1, n0 - 1);
                 if (value != ~0ULL) number = unscramble40(value, ekey);
             }
+#if SS_PL == 6
+            sink += u64(ts32) + payload + ing + number; return;
+#endif
 #ifndef SS_PX
 #define SS_PX 0                      // measurement builds only: leave one decode of the parse out
 #endif
@@ -555,6 +579,9 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
 #endif
                 if (ts32 != DEAD && !dense_user(s1, n1, ukey, pmax, user)) user = dense_odd_user(cx, tid, pack_id(s1, n1, 'u'));
                 if (far) dense_bail(1);                         // an ingest time this record cannot hold
+#if SS_PL == 7
+                sink += u64(ts32) + payload + ing + number + user; return;
+#endif
                 lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << ING_SHIFT) | ((number & (DWIDTH - 1)) << 28) | user});
                 return;
             }
@@ -572,6 +599,7 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
         });
         release_chunk(sh.files[task.file], task);
     }
+    if (sink == 1) fprintf(stderr, "sink\n");
 }
 
 static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
