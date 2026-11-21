@@ -55,6 +55,8 @@ r nowalk "$B" /pnw
 r g15 "$B" /p15
 r id2 "$B" /pid2
 r rel2 "$B" /p SS_RELEASE=2
+r t2x4 "$B" /p SS_T2=4
+r t3x4 "$B" /p SS_T3=4
 st steps "$B" /p
 st nowalk "$B" /pnw
 st assist1 "$B" /pa1
