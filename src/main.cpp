@@ -1490,6 +1490,28 @@ struct AliasMap {
         return (filter[bit >> 6] >> (bit & 63)) & 1;
     }
     inline void prefetch_hash(u64 hash) const { __builtin_prefetch(&slots[hash >> shift]); }
+    // IDs whose hash starts with the `bits`-bit number `bucket` all sit in one
+    // stretch of the table and of the filter. Asking for the whole stretch up
+    // front lets the lookups of a bucket's IDs find it in cache.
+    void prefetch_bucket(u32 bucket, u32 bits) const {
+#ifndef SS_NOSLICEPF
+        const int table_bits = 64 - shift, filter_bits = 64 - filter_shift;
+        if (table_bits >= int(bits)) {
+            const u64 first = u64(bucket) << (table_bits - int(bits));
+            const u64 bytes = std::min<u64>((sizeof(Slot) << (table_bits - int(bits))) + 256, 1u << 20);
+            const char* base = (const char*)&slots[first];
+            const char* limit = (const char*)(slots + mask + 1);
+            for (u64 off = 0; off < bytes && base + off < limit; off += 64) __builtin_prefetch(base + off);
+        }
+        if (filter_bits >= int(bits) + 6) {
+            const u64 first = (u64(bucket) << (filter_bits - int(bits))) >> 6;
+            const u64 words = std::min<u64>(1ULL << (filter_bits - int(bits) - 6), 1u << 14);
+            for (u64 w = 0; w < words; w += 8) __builtin_prefetch(&filter[first + w]);
+        }
+#else
+        (void)bucket; (void)bits;
+#endif
+    }
     // True when `key` is in the map; `name` is then its person's name.
     inline bool find(u64 key, u64 hash, u64& name) const {
         if (!maybe(hash)) return false;
@@ -2005,7 +2027,7 @@ static inline void prefetch_block(const void* block) {
 
 // Where the time inside phases 2 and 3 goes: CPU seconds per step, per thread.
 // Two clock reads per step per bucket; printed with the other figures on stderr.
-static double g_steps[256][8];
+static double g_steps[256][12];
 
 // ---------------------------------------------------------------- phase 2: dedup
 static void dedup_buckets(Shared& sh, u32 tid) {
@@ -2608,6 +2630,7 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
             if (!clicks_here) continue;
         }
         const double step0 = now();
+        if (route) sh.alias.prefetch_bucket(bucket, bbits);
 
         // 1. Number the people and key the events.
         size_t cap = 64;
@@ -2664,7 +2687,7 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
             remember(id, code);
             return code;
         };
-        size_t j = 0;
+        size_t j = 0, passed_on = 0;
         for (u32 t = 0; t < nthreads; t++)
             for (Block* b = src_b[t].head[bucket]; b; b = b->next) {
                 const RecB* recs = Scatter<RecB>::items(b);
@@ -2674,6 +2697,7 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
                     if (who & LINKED) {
                         const u64 root = link_root[who & ~LINKED];
                         sh.lb[tid].push(u32(hash64(root) >> person_shift), RecB{root, recs[i].ts, recs[i].payload});
+                        passed_on++;
                         continue;
                     }
                     const u32 ts = recs[i].ts;
@@ -2961,6 +2985,8 @@ static void process_people(Shared& sh, u32 tid, u32 round) {
         steps[4] += step3 - step2;
         steps[5] += step4 - step3;
         steps[7] += double(npeople);
+        steps[8] += double(passed_on);
+        steps[9] += double(link_root.size());
     }
     const double step5 = now();
     writer.finish();
@@ -3232,10 +3258,10 @@ int main() {
     fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links parse %.3f union %.3f | links %.3f\n",
             T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_parse, sh.links_union, sh.links_seconds);
     {
-        double sum[8] = {};
-        for (u32 t = 0; t < T && t < 256; t++) for (int k = 0; k < 8; k++) sum[k] += g_steps[t][k];
-        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f | people %.0f\n",
-                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7]);
+        double sum[12] = {};
+        for (u32 t = 0; t < T && t < 256; t++) for (int k = 0; k < 12; k++) sum[k] += g_steps[t][k];
+        fprintf(stderr, "steps | dedup table %.3f move %.3f | people key %.3f order %.3f clicks %.3f walk %.3f finish %.3f | people %.0f | linked events %.0f ids %.0f\n",
+                sum[0], sum[1], sum[2], sum[3], sum[4], sum[5], sum[6], sum[7], sum[8], sum[9]);
     }
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
