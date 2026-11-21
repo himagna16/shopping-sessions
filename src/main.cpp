@@ -28,6 +28,9 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/vfs.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -44,6 +47,9 @@
 #endif
 #ifndef SS_X
 #define SS_X 0            // measurement builds only: skip one step (see probe branch)
+#endif
+#ifndef SS_LVL
+#define SS_LVL 0          // measurement builds only: stop the event row handler after step N
 #endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
@@ -953,7 +959,10 @@ struct Config {
     std::string data, out;
     u32 threads = 8;
     size_t chunk = 256 << 10;
-    bool use_mmap = true;       // map inputs and parse in place; SS_MMAP=0 reads them into buffers instead
+    // 1: map an input file and parse it in place when it lives in memory (tmpfs);
+    // files on disk are read into buffers, which copes far better with a cold cache.
+    // 0: always read. 2: always map (tests).
+    int use_mmap = 1;
 };
 
 struct Shared {
@@ -996,7 +1005,13 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
         if (fd < 0) die("cannot open an input file");
         u32 index = u32(sh.files.size());
         const u8* map = nullptr;
-        if (sh.cfg.use_mmap) {
+        bool in_memory = sh.cfg.use_mmap == 2;
+#ifdef __linux__
+        struct statfs fs;
+        if (sh.cfg.use_mmap == 1 && fstatfs(fd, &fs) == 0)
+            in_memory = fs.f_type == 0x01021994 || fs.f_type == 0x858458f6;      // tmpfs, ramfs
+#endif
+        if (in_memory) {
             void* p = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
             if (p != MAP_FAILED) map = (const u8*)p;
         }
@@ -1046,8 +1061,8 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
         continue;
 #endif
         scan_rows<7>(buf, start, stop, [&](size_t line, const size_t* commas, size_t nl, u32 quotes) {
-#if SS_PROBE == 2
-            sink += (commas[0] + nl + quotes + line) & 0; return;
+#if SS_LVL == 2
+            sink += commas[0] + commas[5] + nl + quotes + line; return;
 #endif
             const u8 *s0 = buf + line, *e0 = buf + commas[0];
             const u8 *s1 = e0 + 1, *e1 = buf + commas[1];
@@ -1059,17 +1074,29 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
             u32 wrapped = 0;
             UNQUOTE(s0, e0) UNQUOTE(s1, e1) UNQUOTE(s2, e2) UNQUOTE(s3, e3) UNQUOTE(s4, e4) UNQUOTE(s5, e5) UNQUOTE(s6, e6)
             if (wrapped != quotes || s0 == e0) return;          // malformed, or no event_id
+#if SS_LVL == 3
+            sink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3) + size_t(e4 - s4) + size_t(e5 - s5) + size_t(e6 - s6); return;
+#endif
 
             RecA rec;
             rec.ekey = pack_id(s0, size_t(e0 - s0), 'e');
+#if SS_LVL == 4
+            sink += rec.ekey + size_t(e6 - s6); return;
+#endif
             // rules.md: ingest_ts is always valid F1. If it is not, the copy can never be kept.
             i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
             rec.ingest = ingest == TS_BAD ? INT64_MAX : ingest;
             rec.ukey = 0;
             rec.ts = DEAD;
             rec.payload = 0;
+#if SS_LVL == 5
+            sink += rec.ekey + u64(rec.ingest) + size_t(e6 - s6); return;
+#endif
             if (ingest != TS_BAD && s1 != e1 && s5 != e5) {
                 i64 ts = parse_ts(s2, size_t(e2 - s2), dates);
+#if SS_LVL == 6
+                sink += rec.ekey + u64(rec.ingest) + u64(ts) + size_t(e6 - s6); return;
+#endif
                 if (ts != TS_BAD && ts >= ws && ts < we && ingest - ts <= DAY) {
                     size_t kind = size_t(e4 - s4);
                     bool ok = false;
@@ -1107,10 +1134,10 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 }
 
 static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
-    while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
 #if SS_PROBE == 5
     return;
 #endif
+    while (!sh.links_ready.load(std::memory_order_acquire)) std::this_thread::yield();
     const i64 lo = sh.ws - REACH, hi = sh.we;
     const int shift = 64 - int(sh.bbits);
     const Catalogs& cat = sh.cat;
@@ -1745,7 +1772,7 @@ int main() {
     if (cfg.threads > 256) cfg.threads = 256;
     std::string chunk = env("SS_CHUNK", "");
     if (!chunk.empty()) cfg.chunk = size_t(std::max(1LL, atoll(chunk.c_str())));
-    cfg.use_mmap = env("SS_MMAP", "1") != "0";
+    cfg.use_mmap = atoi(env("SS_MMAP", "1").c_str());
 
     {
         std::string text;
@@ -1828,13 +1855,15 @@ int main() {
         file.close();
     }
     double t5 = now();
+    size_t mapped = 0;
+    for (const InputFile& f : sh.files) mapped += f.map != nullptr;
     rusage ru;
     getrusage(RUSAGE_SELF, &ru);
     fprintf(stderr, "user %.2f sys %.2f faults %ld/%ld maxrss %ld MB\n",
             double(ru.ru_utime.tv_sec) + double(ru.ru_utime.tv_usec) * 1e-6, double(ru.ru_stime.tv_sec) + double(ru.ru_stime.tv_usec) * 1e-6,
             long(ru.ru_minflt), long(ru.ru_majflt), long(ru.ru_maxrss >> 10));
-    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | links %.3f\n",
-            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), sh.links_seconds);
+    fprintf(stderr, "threads %u buckets %u | setup %.3f parse %.3f dedup %.3f people %.3f write %.3f | total %.3f s | cpu parse %.2f dedup %.2f people %.2f | user rows %llu | mapped %zu of %zu | links %.3f\n",
+            T, 1u << sh.abits, t1 - t0, t2 - t1, t3 - t2, t4 - t3, t5 - t4, t5 - t0, c1, c2, c3, (unsigned long long)sh.user_rows.load(), mapped, sh.files.size(), sh.links_seconds);
 #ifdef __linux__
     if (__gcov_dump) __gcov_dump();
 #endif
