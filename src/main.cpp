@@ -159,6 +159,10 @@ static inline u64 hash64(u64 x) {
 #endif
 }
 
+// The dense path (dense.h): whether this run uses it, and its hook in the general dedup.
+static bool g_dense_on = false;
+static bool dense_extra(u32 tid, u64 ukey, u32 ts, u32 payload);
+
 static inline i64 floor_div(i64 a, i64 b) { i64 q = a / b; return q - ((a % b != 0) && ((a < 0) != (b < 0))); }
 
 // ---------------------------------------------------------------- IDs
@@ -2045,6 +2049,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
     const u32 abits = sh.abits;
     const int shift = 64 - int(sh.bbits);
     Scatter<RecB>& out = sh.b[tid];
+    const bool dense_on = g_dense_on;
     std::vector<Block*> blocks;
     hvec<u64> table;                        // wide slots: (hash tag << 32) | reference
     hvec<u32> small;                        // narrow slots: (hash tag << 16) | reference
@@ -2148,6 +2153,7 @@ static void dedup_buckets(Shared& sh, u32 tid) {
             RecA* recs = Scatter<RecA>::items(b);
             for (u32 i = 0; i < b->n; i++) {
                 if (recs[i].ts == DEAD) continue;
+                if (dense_on && dense_extra(tid, recs[i].ukey, recs[i].ts, recs[i].payload)) continue;
 #if SS_X == 4 || !defined(SS_ALIAS1)
                 // To the bucket of the user ID as it is; whose it is gets settled
                 // there, once for each ID (see process_people).
@@ -3244,7 +3250,7 @@ int main(int, char** argv) {
     sh.lb.resize(T);
     sh.lc.resize(T);
     sh.alloc.resize(T);
-    sh.campaign_totals.resize(2 * size_t(T));
+    sh.campaign_totals.resize(2 * size_t(T) + 1);
     mkdir(cfg.out.c_str(), 0777);
     mkdir((cfg.out + "/user_daily").c_str(), 0777);
     mkdir((cfg.out + "/campaign_daily").c_str(), 0777);
@@ -3280,8 +3286,10 @@ int main(int, char** argv) {
         });
         if (env("SS_DENSE_BAIL", "") == "2") dense_bail(9);
         if (D.bail.load()) dense_restart(sh, false);
+        const double w0 = now();
         dense_settle(sh);
         t2 = now();
+        D.wall[0] = t2 - w0;
         // Phase 2: the general dedup (few events) and the clicks grouped by person.
         c2 = run_threads(T, [&](u32 tid) {
             DenseCtx& cx = D.ctx[tid];
@@ -3296,21 +3304,29 @@ int main(int, char** argv) {
             dense_group_clicks(sh, tid);
             sh.c[tid].finish();
         });
+        dense_gather_extras();
         t3 = now();
         // Phase 3: events by number. Phase 4: the stretches that cross partitions, then the general people phase.
         c3 = run_threads(T, [&](u32 tid) {
             dense_walk(sh, tid);
             sh.b[tid].finish();
         });
+        const double w1 = now();
         dense_groups();
         order_buckets(sh.b);
+        const double w2 = now();
+        D.wall[1] = w1 - t3;
+        D.wall[2] = w2 - w1;
         c3 += run_threads(T, [&](u32 tid) {
             dense_stitch(sh, tid);
             D.ctx[tid].writer.finish();
             sh.user_rows.fetch_add(D.ctx[tid].rows);
             process_people(sh, tid, 0);
         });
+        const double w3 = now();
+        dense_leftovers(sh);
         t4 = now();
+        D.wall[3] = w3 - w2;
         if (env("SS_DENSE_BAIL", "") == "1") dense_bail(9);
         if (D.bail.load()) dense_restart(sh, true);
     } else
@@ -3393,10 +3409,10 @@ int main(int, char** argv) {
             for (int k = 0; k < 4; k++) cpu[k] += cx.cpu[k];
         }
         fprintf(stderr, "dense keys e %llx u %llx\n", (unsigned long long)D.ekey, (unsigned long long)D.ukey);
-        fprintf(stderr, "dense | setup %.4f | numbers %llu parts %u people %u | walked %llu split %llu sorted %llu stitched events %llu groups %zu | handed events %llu odd users %llu odd clicks %llu pending clicks %llu marked %llu | cpu place %.3f sweep %.3f walk %.3f stitch %.3f\n",
+        fprintf(stderr, "dense | setup %.4f | numbers %llu parts %u people %u | walked %llu split %llu sorted %llu stitched events %llu groups %zu | handed events %llu odd users %llu odd clicks %llu pending clicks %llu marked %llu | cpu place %.3f sweep %.3f walk %.3f stitch %.3f | wall settle %.4f walk %.4f join %.4f stitch %.4f\n",
                 D.setup_seconds, (unsigned long long)D.nidx, D.nparts, D.pmax, (unsigned long long)people, (unsigned long long)split, (unsigned long long)sorted,
                 (unsigned long long)stitched, D.gstart.size(), (unsigned long long)handed, (unsigned long long)odd_users, (unsigned long long)odd_clicks,
-                (unsigned long long)pending, (unsigned long long)marked, cpu[0], cpu[1], cpu[2], cpu[3]);
+                (unsigned long long)pending, (unsigned long long)marked, cpu[0], cpu[1], cpu[2], cpu[3], D.wall[0], D.wall[1], D.wall[2], D.wall[3]);
     }
 #endif
 #ifdef __linux__

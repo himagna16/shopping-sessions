@@ -256,7 +256,16 @@ def m_click_at_event(st):
     st.any_file("clicks").append([fresh_click(st), ev[1] if st.rng.random() < 0.8 else st.some_user(), st.rng.choice(clicks)[2], str(ts)])
     return "click_at"
 
-MUTATIONS = [m_event_user, m_event_user, m_event_alias, m_event_alias, m_event_ts, m_event_ts, m_event_id, m_copy, m_copy,
+def m_person_odd_ids(st):
+    """every event of one user ID gets an event ID that does not decode"""
+    user = st.rng.choice(st.users)
+    n = 0
+    for r in st.rows("events", 7):
+        if r[1] == user and len(st.ingests.get(r[0], [])) == 1 and r[0] and n < 400:
+            if st.set_event_id(r, r[0].upper() if st.rng.random() < 0.7 else "e0" + r[0][1:]): n += 1
+    if n: return "person_odd_ids"
+
+MUTATIONS = [m_person_odd_ids, m_event_user, m_event_user, m_event_alias, m_event_alias, m_event_ts, m_event_ts, m_event_id, m_copy, m_copy,
              m_link_add, m_link_add, m_link_del, m_click_user, m_click_tie, m_click_tie, m_click_at_event]
 
 def write(st):

@@ -12,9 +12,10 @@
 // time; with no key, or for any ID that does not decode, today's general path
 // does the work. Decoding is a bijection whatever the key, so copies of one
 // event always meet. A person is finished here only when every link of theirs
-// stays among their own first 16 IDs and every event of theirs has a decoded
-// event ID; everyone else (shared devices, long chains, odd IDs) is handed to
-// the general people phase by name. Each person is claimed exactly once: if
+// stays among their own first 16 IDs; everyone else (shared devices, long chains, odd IDs) is handed to
+// the general people phase by name. An event whose own ID does not decode is
+// deduplicated the general way and then joins its person here. Each person is
+// claimed exactly once: if
 // the data ever shows the same person in two places, the whole run starts again
 // on the general path.
 #ifndef SS_DENSE_H
@@ -110,18 +111,34 @@ static const u32 CPER = 1u << SS_CW;
 static const u32 UNORDERED = 1;
 
 struct DenseFrag { u32 person, n, amask, flags; u64* ev; u8* al; };
+struct DenseExtra { u32 person, alias; u64 ev; };      // a surviving event whose own ID did not decode
+
+// The aliases whose 4-bit entry in `parents` is `root`, one bit each.
+static inline u32 nibbles_equal(u64 parents, u32 root) {
+    const u64 eq = parents ^ (u64(root) * 0x1111111111111111ULL);
+    const u64 zero = ~(((eq & 0x7777777777777777ULL) + 0x7777777777777777ULL) | eq) & 0x8888888888888888ULL;
+#if defined(__BMI2__)
+    return u32(_pext_u64(zero, 0x8888888888888888ULL));
+#else
+    u32 mask = 0;
+    for (u32 a = 0; a < 16; a++) mask |= u32((zero >> (4 * a + 3)) & 1) << a;
+    return mask;
+#endif
+}
 
 struct DenseCtx {
     // filled while parsing
     std::vector<u64> odd_users, odd_clicks;         // IDs that do not decode, as packed keys
     std::vector<RecC> pending;                      // clicks of such users; `person` holds the ID as written
     std::vector<u32> marked;                        // people this thread handed to the general path
+    std::vector<DenseExtra> extras;                 // from the general dedup, for people walked here
     // the walk
     UserWriter writer;
     Shared::Totals* totals = nullptr;
     hvec<RecD> slots;
-    hvec<u64> ev, tmp_ev, part_ev, sort_ev, sort_keys;
-    hvec<u8> al, tmp_al, sort_al;
+    hvec<u64> ev, tmp_ev, part_ev, sort_ev, sort_keys, more_ev;
+    hvec<u8> al, tmp_al, sort_al, more_al;
+    bool ready = false;
     struct Run { u32 person, start, amask, flags; };
     hvec<Run> runs;
     hvec<Click> clicks;
@@ -142,9 +159,10 @@ struct Dense {
     u32 nparts = 0;
     u32 pmax = 0;                   // person numbers below this are known here
     u32 cparts = 0;
-    u64* ptab = nullptr;            // per person: the parent alias of each alias, 4 bits each, XOR IDENT
+    u64* ptab = nullptr;            // per person: the first-linked alias each alias is joined to, 4 bits each, XOR IDENT
     u8* complex = nullptr;          // per person: handed to the general path
-    u8* claimed = nullptr;          // per person: already walked
+    u8* claimed = nullptr;          // per person: 1 already walked, 2 has events waiting in `extras`
+    std::vector<DenseExtra> extras; // by person
     u32* cstart = nullptr;          // per click partition: CPER + 1 offsets into its grouped clicks
     RecK** cdata = nullptr;
     DenseFrag* frags = nullptr;     // per event partition: its first and last person's events
@@ -154,6 +172,7 @@ struct Dense {
     std::atomic<u32> next_part{0}, next_cpart{0}, next_group{0};
     std::vector<DenseCtx> ctx;
     double setup_seconds = 0;
+    double wall[4] = {0, 0, 0, 0};
     char** argv = nullptr;
 };
 static Dense g_dense;
@@ -354,8 +373,9 @@ static bool dense_setup(Shared& sh) {
     D.cdata = big_alloc<RecK*>(D.cparts);
     D.frags = big_alloc<DenseFrag>(size_t(D.nparts) * 2);
     D.ing_base = (sh.day0 - i64(ING_LEAD_DAYS)) * 86400;
-    D.ctx.resize(T);
+    D.ctx.resize(T + 1);            // one per thread, and a spare for dense_leftovers
     D.on = true;
+    g_dense_on = true;
     D.setup_seconds = now() - began;
     return true;
 }
@@ -374,12 +394,15 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
     Local ring[64];
     u32 in = 0, out = 0;
     auto apply = [&](const Local& l) {
+        // Kept flat: every alias holds its group's first alias directly.
         u64 parents = D.ptab[l.person] ^ IDENT;
-        u32 a = l.a, b = l.b;
-        while (((parents >> (4 * a)) & 15) != a) a = u32((parents >> (4 * a)) & 15);
-        while (((parents >> (4 * b)) & 15) != b) b = u32((parents >> (4 * b)) & 15);
+        const u32 a = u32((parents >> (4 * l.a)) & 15), b = u32((parents >> (4 * l.b)) & 15);
         if (a == b) return;
-        parents = (parents & ~(15ULL << (4 * b))) | (u64(a) << (4 * b));
+        const u64 ONES = 0x1111111111111111ULL;
+        const u64 eq = parents ^ (u64(b) * ONES);
+        const u64 zero = ~(((eq & 0x7777777777777777ULL) + 0x7777777777777777ULL) | eq) & 0x8888888888888888ULL;
+        const u64 moved = (zero >> 3) * 15;
+        parents = (parents & ~moved) | ((u64(a) * ONES) & moved);
         D.ptab[l.person] = parents ^ IDENT;
     };
     for (const Task& task : sh.link_tasks) {
@@ -493,8 +516,8 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                 lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << 42) | ((number & (DWIDTH - 1)) << 28) | user});
                 return;
             }
-            // An event ID that does not decode: the general path, exactly as parse_events
-            // does it. Its user, if known here, has to be walked there as well.
+            // An event ID that does not decode: the general dedup, exactly as parse_events
+            // does it. If it survives, dense_extra hands it to its person.
             RecA rec;
             rec.ekey = pack_id(s0, n0, 'e');
             const i64 ingest = (e3 - s3 == 20) ? parse_f1(s3, dates) : TS_BAD;
@@ -502,11 +525,7 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
             rec.ukey = 0;
             rec.ts = ts32;
             rec.payload = payload;
-            if (ts32 != DEAD) {
-                rec.ukey = pack_id(s1, n1, 'u');
-                u32 user = 0;
-                if (dense_user(s1, n1, ukey, pmax, user)) dense_mark(cx, user >> 4);
-            }
+            if (ts32 != DEAD) rec.ukey = pack_id(s1, n1, 'u');
             general.push(u32(hash64(rec.ekey) >> gshift), rec);
         });
         release_chunk(sh.files[task.file], task);
@@ -585,6 +604,33 @@ static inline void dense_hand_event(Shared& sh, DenseCtx& cx, u32 tid, u32 user,
     }
     cx.n_handed++;
     sh.b[tid].push(u32(hash64(person) >> (64 - int(sh.bbits))), RecB{person, ts, payload});
+}
+
+// Called by the general dedup for each event it keeps: true when the event's
+// user is a person walked here, who then gets the event through `extras`.
+static bool dense_extra(u32 tid, u64 ukey, u32 ts, u32 payload) {
+    Dense& D = g_dense;
+    if (ukey & INTERN_BIT) return false;
+    u8 text[16] = {0};
+    memcpy(text, &ukey, 8);                                    // the bytes after the letter, as loaded
+    size_t len = 0;
+    while (len < 8 && text[len]) len++;
+    const u64 value = b36_value(text, len);
+    if (value == ~0ULL) return false;
+    const u64 number = unscramble40(value, D.ukey);
+    if ((number >> 9) >= D.pmax || (number & 511) >= 16) return false;
+    const u32 person = u32(number >> 9);
+    if (D.complex[person]) return false;
+    D.ctx[tid].extras.push_back({person, u32(number & 15), (u64(ts) << 32) | payload});
+    return true;
+}
+
+// After phase 2: every waiting event, by person; their people are flagged.
+static void dense_gather_extras() {
+    Dense& D = g_dense;
+    for (DenseCtx& cx : D.ctx) D.extras.insert(D.extras.end(), cx.extras.begin(), cx.extras.end());
+    std::sort(D.extras.begin(), D.extras.end(), [](const DenseExtra& x, const DenseExtra& y) { return x.person < y.person; });
+    for (const DenseExtra& e : D.extras) D.claimed[e.person] = 2;
 }
 
 // Phase 2: the clicks of each partition of people, grouped by person. Clicks of
@@ -790,7 +836,32 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
 // aliases among them. Their links decide how many people that is (nearly always one).
 static void dense_person(Shared& sh, DenseCtx& cx, u32 person, const u64* ev, const u8* al, u32 n, u32 amask, u32 flags) {
     Dense& D = g_dense;
-    if (__atomic_exchange_n(&D.claimed[person], u8(1), __ATOMIC_RELAXED)) { dense_bail(3); return; }
+    const u8 before = __atomic_exchange_n(&D.claimed[person], u8(1), __ATOMIC_RELAXED);
+    if (__builtin_expect(before != 0, 0)) {
+        if (before == 1) { dense_bail(3); return; }
+        // Events of this person whose own IDs did not decode: they join the rest.
+        auto from = std::lower_bound(D.extras.begin(), D.extras.end(), person, [](const DenseExtra& x, u32 p) { return x.person < p; });
+        size_t count = 0;
+        while (from + count != D.extras.end() && from[count].person == person) count++;
+        cx.more_ev.resize(n + count);
+        cx.more_al.resize(n + count);
+        std::vector<DenseExtra> extra(from, from + count);
+        std::sort(extra.begin(), extra.end(), [](const DenseExtra& x, const DenseExtra& y) { return x.ev < y.ev; });
+        for (const DenseExtra& e : extra) amask |= 1u << e.alias;
+        // A merge keeps a long ordered stretch ordered (one stray event must not cost a sort of a heavy user).
+        size_t i = 0, j = 0, k = 0;
+        if (!(flags & UNORDERED))
+            while (i < n && j < count) {
+                if (u32(extra[j].ev >> 32) < u32(ev[i] >> 32)) { cx.more_ev[k] = extra[j].ev; cx.more_al[k] = u8(extra[j].alias); j++; }
+                else { cx.more_ev[k] = ev[i]; cx.more_al[k] = al[i]; i++; }
+                k++;
+            }
+        for (; i < n; i++, k++) { cx.more_ev[k] = ev[i]; cx.more_al[k] = al[i]; }
+        for (; j < count; j++, k++) { cx.more_ev[k] = extra[j].ev; cx.more_al[k] = u8(extra[j].alias); }
+        n += u32(count);
+        ev = cx.more_ev.data();
+        al = cx.more_al.data();
+    }
     cx.n_people++;
     if (flags & UNORDERED) {
         // Not in time order by number: order by time (then by number), keeping each event's alias.
@@ -801,9 +872,9 @@ static void dense_person(Shared& sh, DenseCtx& cx, u32 person, const u64* ev, co
         cx.sort_ev.resize(n);
         cx.sort_al.resize(n);
         for (u32 i = 0; i < n; i++) {
-            const u32 from = u32(cx.sort_keys[i]);
-            cx.sort_ev[i] = ev[from];
-            cx.sort_al[i] = al[from];
+            const u32 at = u32(cx.sort_keys[i]);
+            cx.sort_ev[i] = ev[at];
+            cx.sort_al[i] = al[at];
         }
         ev = cx.sort_ev.data();
         al = cx.sort_al.data();
@@ -814,27 +885,24 @@ static void dense_person(Shared& sh, DenseCtx& cx, u32 person, const u64* ev, co
         dense_sessions(sh, cx, person, u32(__builtin_ctz(amask)), amask, ev, n);
         return;
     }
-    u32 comp[16];
-    for (u32 a = 0; a < 16; a++) {
-        u32 r = a;
-        while (((parents >> (4 * r)) & 15) != r) r = u32((parents >> (4 * r)) & 15);
-        comp[a] = r;
-    }
+    // The groups of linked aliases that have events here: nearly always one.
     u32 present = 0;
-    for (u32 a = 0; a < 16; a++) if ((amask >> a) & 1) present |= 1u << comp[a];
+    for (u32 m = amask; m; m &= m - 1) present |= 1u << ((parents >> (4 * __builtin_ctz(m))) & 15);
     const bool one = !(present & (present - 1));
     if (!one) cx.n_split++;
-    for (u32 c = 0; c < 16; c++) {
-        if (!((present >> c) & 1)) continue;
+    for (u32 left = present; left; left &= left - 1) {
+        const u32 c = u32(__builtin_ctz(left));
         // The person's name: the byte-wise smallest of the linked IDs, used or not.
-        u32 members = 0, name_alias = c;
-        u64 best = ~0ULL;
-        for (u32 a = 0; a < 16; a++)
-            if (comp[a] == c) {
-                members |= 1u << a;
+        const u32 members = nibbles_equal(parents, c);
+        u32 name_alias = c;
+        if (members & (members - 1)) {
+            u64 best = ~0ULL;
+            for (u32 m = members; m; m &= m - 1) {
+                const u32 a = u32(__builtin_ctz(m));
                 const u64 order = b36_order(scramble40(u64(person) * 512 + a, D.ukey));
                 if (order < best) { best = order; name_alias = a; }
             }
+        }
         if (one) { dense_sessions(sh, cx, person, name_alias, members, ev, n); return; }
         if (cx.part_ev.size() < n) cx.part_ev.resize(n);
         u32 count = 0;
@@ -843,16 +911,17 @@ static void dense_person(Shared& sh, DenseCtx& cx, u32 person, const u64* ev, co
     }
 }
 
-static void dense_ctx_init(Shared& sh, DenseCtx& cx, u32 tid) {
+static void dense_ctx_init(Shared& sh, DenseCtx& cx, u32 part) {
     const u32 ncamp = u32(sh.cat.campaign_ids.size());
     const u32 ndays = sh.ndays;
-    cx.totals = &sh.campaign_totals[tid];
+    cx.ready = true;
+    cx.totals = &sh.campaign_totals[part];
     cx.totals->sessions.assign(size_t(ncamp + 1) * ndays, 0);
     cx.totals->assisted.assign(size_t(ncamp + 1) * ndays, 0);
     cx.totals->purchasing.assign(size_t(ncamp + 1) * ndays, 0);
     cx.totals->revenue.assign(size_t(ncamp + 1) * ndays, 0);
     char name[64];
-    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", tid);
+    snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", part);
     cx.writer.init(sh.cfg.out + name);
     cx.slots.assign(DWIDTH, RecD{0, EMPTY_SLOT});
     cx.ev.resize(DWIDTH);
@@ -1006,12 +1075,30 @@ static void dense_stitch(Shared& sh, u32 tid) {
     cx.cpu[3] += thread_cpu() - began;
 }
 
+// After phase 4: people whose only events are ones whose own IDs did not decode
+// were never met by the walk. They are walked here, into a file of their own.
+static void dense_leftovers(Shared& sh) {
+    Dense& D = g_dense;
+    const u32 T = sh.cfg.threads;
+    DenseCtx& cx = D.ctx[T];
+    for (size_t i = 0; i < D.extras.size(); i++) {
+        const u32 person = D.extras[i].person;
+        if ((i && D.extras[i - 1].person == person) || D.claimed[person] != 2) continue;
+        if (!cx.ready) dense_ctx_init(sh, cx, 2 * T);
+        dense_person(sh, cx, person, nullptr, nullptr, 0, 0, 0);
+    }
+    if (cx.ready) {
+        cx.writer.finish();
+        sh.user_rows.fetch_add(cx.rows);
+    }
+}
+
 // Starts the program again with the dense path switched off.
 [[noreturn]] static void dense_restart(Shared& sh, bool wrote) {
     Dense& D = g_dense;
     fprintf(stderr, "dense path abandoned (reason %u): running the general path\n", D.bail.load());
     if (wrote)
-        for (u32 part = 0; part < 2 * sh.cfg.threads; part++) {
+        for (u32 part = 0; part <= 2 * sh.cfg.threads; part++) {
             char name[64];
             snprintf(name, sizeof name, "/user_daily/part-%03u.parquet", part);
             unlink((sh.cfg.out + name).c_str());
@@ -1027,5 +1114,7 @@ static void dense_stitch(Shared& sh, u32 tid) {
     die("could not restart on the general path");
 }
 
+#else  // no dense path in this build
+static bool dense_extra(u32, u64, u32, u32) { return false; }
 #endif // SS_DENSE_BUILD
 #endif // SS_DENSE_H
