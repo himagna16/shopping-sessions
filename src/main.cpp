@@ -81,6 +81,9 @@
 #ifndef SS_LVL
 #define SS_LVL 0          // measurement builds only: stop the event row handler after step N
 #endif
+#ifndef SS_CLVL
+#define SS_CLVL 0         // measurement builds only: stop the click row handler after step N
+#endif
 #ifndef SS_PROBE
 #define SS_PROBE 0
 #endif
@@ -1489,7 +1492,10 @@ struct AliasMap {
 // after that. Both memory accesses are thus under way long before they are needed.
 template <class T, class Emit>
 struct Resolver {
-    static const u32 DIST = 16, SIZE = 64;          // SIZE is a power of two above DIST
+#ifndef SS_DIST
+#define SS_DIST 16
+#endif
+    static const u32 DIST = SS_DIST, SIZE = SS_DIST < 48 ? 64 : 256;    // SIZE is a power of two above DIST
     const AliasMap& alias;
     Emit emit;                                       // emit(person, hash64(person), item)
     T a_item[SIZE]; u64 a_hash[SIZE]; u64 a_key[SIZE];
@@ -1874,6 +1880,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         lists.push(u32(hash >> shift), RecC{person, click.ckey, click.ts, click.camp});
     };
     Resolver<Pending, decltype(emit)> resolver(alias, emit);
+    [[maybe_unused]] u64 sink = 0;
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
@@ -1882,6 +1889,9 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) continue;
         scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
 #if defined(SS_SCAN4)
+#if SS_CLVL == 2
+            sink += a[0] + a[3] + nlpos; return;
+#endif
             QUOTED(0) QUOTED(1) QUOTED(2) QUOTED(3)
             FIELD(0, 1) FIELD(1, 2) FIELD(2, 3) FIELD_LAST(3)
 #elif defined(SS_SCAN3)
@@ -1898,8 +1908,19 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             if (s0 == e0 || s1 == e1) return;
             i64 ts = parse_ts(s3, size_t(e3 - s3), dates);
             if (ts == TS_BAD || ts < lo || ts >= hi) return;
+#if SS_CLVL == 3
+            sink += u64(ts); return;
+#endif
             i32 campaign = cat.campaign(s2, e2);
             if (campaign < 0) return;
+#if SS_CLVL == 4
+            sink += u64(ts) + u64(campaign); return;
+#elif SS_CLVL == 5
+            sink += u64(ts) + u64(campaign) + pack_id(s1, size_t(e1 - s1), 'u') + pack_id(s0, size_t(e0 - s0), 'k'); return;
+#elif SS_CLVL == 6
+            { const u64 who = pack_id(s1, size_t(e1 - s1), 'u');       // no alias lookup: the ID stands for the person
+              emit(who, hash64(who), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)}); return; }
+#endif
             // Copies of a click are identical (rules.md), so they change neither
             // the credited campaign nor the set of assisting campaigns: no dedup.
             resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
@@ -1907,6 +1928,7 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         release_chunk(sh.files[task.file], task);
     }
     resolver.finish();
+    if (sink == 1) fprintf(stderr, "sink\n");
 }
 
 // Where the time inside phases 2 and 3 goes: CPU seconds per step, per thread.
