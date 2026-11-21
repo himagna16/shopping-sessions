@@ -58,6 +58,34 @@ static inline SS_HOT u64 unscramble40(u64 value, u64 key) { return ((scramble_z(
 // The n bytes at p (the part of an ID after its letter) as a base-36 number,
 // if they are its canonical spelling: 1 to 8 of 0-9a-z, no leading zero, below
 // 2^40. Anything else gives ~0. p must be readable for 8 bytes.
+#ifndef SS_B36_SWAR
+// One table row per place: a character's digit times that place's power of 36,
+// or a value far out of range for a character that is no digit. The eight
+// lookups replace the checks and all but two of the multiplications.
+struct B36Table {
+    u64 row[8][128];
+    B36Table() {
+        u64 power = 1;
+        for (int place = 7; place >= 0; place--, power *= 36)
+            for (int c = 0; c < 128; c++) {
+                const int digit = (c >= '0' && c <= '9') ? c - '0' : (c >= 'a' && c <= 'z') ? c - 'a' + 10 : -1;
+                row[place][c] = digit < 0 ? (1ULL << 62) : u64(digit) * power;
+            }
+    }
+};
+alignas(64) static const B36Table g_b36;
+static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
+    if (n - 1 >= 8) return ~0ULL;
+    const u64 raw = rd64(p);
+    const unsigned s = unsigned(8 * (8 - n));
+    const u64 t = (raw << s) | (0x3030303030303030ULL & ((1ULL << s) - 1));    // right-aligned, padded with '0'
+    const u64 value = g_b36.row[0][t & 0x7F] + g_b36.row[1][(t >> 8) & 0x7F] + g_b36.row[2][(t >> 16) & 0x7F] + g_b36.row[3][(t >> 24) & 0x7F]
+                    + g_b36.row[4][(t >> 32) & 0x7F] + g_b36.row[5][(t >> 40) & 0x7F] + g_b36.row[6][(t >> 48) & 0x7F] + g_b36.row[7][t >> 56 & 0x7F];
+    // a byte over 127, a character that is no digit (its entry puts the sum out of range), a value over 2^40, or a leading zero
+    if (((t & 0x8080808080808080ULL) != 0) | (value > MASK40) | (((raw & 0xFF) == '0') & (n > 1))) return ~0ULL;
+    return value;
+}
+#else
 static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
     if (n - 1 >= 8) return ~0ULL;
     const u64 raw = rd64(p);
@@ -74,6 +102,7 @@ static inline SS_HOT u64 b36_value(const u8* p, size_t n) {
     const u64 value = (quad & 0xFFFFFFFFULL) * 1679616 + (quad >> 32);
     return value > MASK40 ? ~0ULL : value;
 }
+#endif
 
 static inline u32 b36_text(char* out, u64 v) {
     char tmp[16];
@@ -143,6 +172,7 @@ struct DenseCtx {
     struct Run { u32 person, start, amask, flags; };
     hvec<Run> runs;
     hvec<Click> clicks;
+    hvec<u64> click_keys;
     hvec<i64> cat_cents;
     hvec<u32> cat_touched, camp_count, camp_slot, stamp, run_day, run_first;
     u32 session_id = 0;
@@ -511,8 +541,18 @@ static void parse_events_dense(Shared& sh, u32 tid, Reader& reader) {
                 const u64 value = b36_value(s0 + 1, n0 - 1);
                 if (value != ~0ULL) number = unscramble40(value, ekey);
             }
+#ifndef SS_PX
+#define SS_PX 0                      // measurement builds only: leave one decode of the parse out
+#endif
+#if SS_PX == 2
+            number = (((rd64(s0 + 1) * 0x9E3779B97F4A7C15ULL) >> 32) * nidx) >> 32;
+#endif
             if (__builtin_expect(number < nidx, 1)) {
                 u32 user = 0;
+#if SS_PX == 1
+                user = u32(rd64(s1 + 1) & 0xFFFFF0) | 1;
+                if (false)
+#endif
                 if (ts32 != DEAD && !dense_user(s1, n1, ukey, pmax, user)) user = dense_odd_user(cx, tid, pack_id(s1, n1, 'u'));
                 if (far) dense_bail(1);                         // an ingest time this record cannot hold
                 lists.push(u32(number >> SS_DW), RecD{(u64(ts32) << 32) | payload, (u64(ing) << ING_SHIFT) | ((number & (DWIDTH - 1)) << 28) | user});
@@ -704,32 +744,63 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
     UserWriter& writer = cx.writer;
     u64 rows = 0;
 
-    // This person's clicks.
+    // This person's clicks. A handful are simply scanned for every session. More
+    // are put in time order (at one instant the smallest click_id last) for a
+    // sliding window: ordered as plain numbers (time, then place), with the rare
+    // ties settled afterwards.
     Click* ck = nullptr;
     u32 m = 0;
+#ifndef SS_DX
+#define SS_DX 0                      // measurement builds only: leave one step of the walk out
+#endif
+#if SS_DX == 3
+    cx.rows += n; return;
+#endif
     {
         const u32 part = person >> SS_CW;
         const u32* starts = D.cstart + size_t(part) * (CPER + 1) + (person & (CPER - 1));
+#if SS_DX == 1
+        const u32 all = 0;
+#else
         const u32 all = starts[1] - starts[0];
+#endif
         if (all) {
-            if (cx.clicks.size() < all) cx.clicks.resize(size_t(all) + all / 2 + 64);
+            if (cx.clicks.size() < all) { cx.clicks.resize(size_t(all) + all / 2 + 64); cx.click_keys.resize(cx.clicks.size()); }
             ck = cx.clicks.data();
             const RecK* src = D.cdata[part] + starts[0];
-            for (u32 i = 0; i < all; i++) {
-                ck[m] = Click{u32(src[i].x >> 32), u32(src[i].y >> 48), src[i].y & KEY_MASK};
-                m += (members >> (u32(src[i].x) & 15)) & 1;
+            if (all <= SS_SCANMAX) {
+                for (u32 i = 0; i < all; i++) {
+                    ck[m] = Click{u32(src[i].x >> 32), u32(src[i].y >> 48), src[i].y & KEY_MASK};
+                    m += (members >> (u32(src[i].x) & 15)) & 1;
+                }
+            } else {
+                u64* keys = cx.click_keys.data();
+                for (u32 i = 0; i < all; i++) {
+                    keys[m] = (src[i].x & ~0xFFFFFFFFULL) | i;
+                    m += (members >> (u32(src[i].x) & 15)) & 1;
+                }
+                if (m > SS_SCANMAX) std::sort(keys, keys + m);
+                for (u32 i = 0; i < m; i++) {
+                    const RecK& from = src[u32(keys[i])];
+                    ck[i] = Click{u32(from.x >> 32), u32(from.y >> 48), from.y & KEY_MASK};
+                }
+                if (m > SS_SCANMAX)
+                    for (u32 i = 1; i < m; i++) {
+                        if (ck[i].ts != ck[i - 1].ts) continue;
+                        u32 end = i + 1;
+                        while (end < m && ck[end].ts == ck[i].ts) end++;
+                        std::sort(ck + i - 1, ck + end, [](const Click& x, const Click& y) { return dense_click_less(y.key, x.key); });
+                        i = end;
+                    }
             }
         }
     }
-    // A handful of clicks are simply scanned for every session. More are put in
-    // time order (at one instant the smallest click_id last) for a sliding window.
+#if SS_DX == 4
+    if (m > SS_SCANMAX) m = 0;
+#elif SS_DX == 5
+    if (m <= SS_SCANMAX) m = 0;
+#endif
     const bool scan_clicks = m <= SS_SCANMAX;
-    if (!scan_clicks) {
-        auto before = [](const Click& x, const Click& y) {
-            return x.ts < y.ts || (x.ts == y.ts && dense_click_less(y.key, x.key));
-        };
-        std::sort(ck, ck + m, before);
-    }
 
     char name[24];
     name[0] = 'u';
@@ -749,7 +820,9 @@ static void dense_sessions(Shared& sh, DenseCtx& cx, u32 person, u32 name_alias,
             }
             cat_touched.clear();
         }
+#if SS_DX != 2
         writer.add(name, name_len, i32(day0 + cur_day), d_sessions, d_events, d_revenue, top);
+#endif
         rows++;
     };
     u32 left = 0, right = 0;
