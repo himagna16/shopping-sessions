@@ -1,6 +1,6 @@
 #!/bin/sh
-# Diagnostic run (never scored): the general path on long-ID data, step by step (each lN build
-# stops the event row after step N), and the ID tables on 2 MB pages against small ones.
+# Diagnostic run (never scored): the general path on long-ID data, long click IDs keyed by their place in the input
+# (/p) against stored ones (/plz).
 # Output stays under ~1,900 characters.
 exec 1>&2
 S="${SCRATCH_DIR:-/scratch}"
@@ -60,12 +60,10 @@ E="${PROBE_E:-20000000}"
 echo "wall total parse dedup people parse_cpu links user sys"
 r warm "$S/L" /p > /dev/null
 for round in 1 2 3; do
-r huge "$S/L" /p
-r lazy "$S/L" /plz
+r pos "$S/L" /p
+r stored "$S/L" /plz
 done
 grep -E '^threads' "$S/err" | cut -c1-260
-echo "steps (parse wall, parse cpu): touch, line+fields, +event key, +times, all but push, full, no clicks"
-for v in l1 l3 l4 l5 l7 p pnc; do echo "$v $(r $v "$S/L" /$v | awk '{print $4, $7}')"; done | tr '\n' ',' ; echo
 r t1 "$S/L" /p SS_THREADS=1
 echo "t=$(( $(date +%s) - START ))s"
 rm -rf "$S/L"
@@ -75,8 +73,8 @@ E3=$(( E * 3 ))
 /longids "$S/c" "$S/L"; rm -rf "$S/c"; sync; echo "t=$(( $(date +%s) - START ))s"
 r warm "$S/L" /p > /dev/null
 for round in 1 2; do
-r 60huge "$S/L" /p
-r 60lazy "$S/L" /plz
+r 60pos "$S/L" /p
+r 60stored "$S/L" /plz
 done
 fi
 echo "t=$(( $(date +%s) - START ))s"
