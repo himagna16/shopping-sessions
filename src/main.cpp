@@ -1993,6 +1993,8 @@ static void list_csv(Shared& sh, const std::string& folder, std::vector<Task>& t
     closedir(d);
 }
 
+#include "lines.h"
+
 // ---------------------------------------------------------------- phase 1: parse
 static void parse_links(Shared& sh, Reader& reader) {
     const double began = now();
@@ -2049,8 +2051,16 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #if SS_PROBE == 1 || SS_LVL == 1
         continue;
 #endif
+#if !defined(SS_FORCE_SLOW) && !defined(SS_BLOCKSCAN)
+        // One line at a time (lines.h); a line the reader does not take is split byte by byte.
+        line_rows<7>(buf, start, stop, last, line7w, [&](const Fields<7>& f) SS_INLINE {
+            const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
+            const u8 *s4 = f.s[4], *e4 = f.e[4], *s5 = f.s[5], *e5 = f.e[5], *s6 = f.s[6], *e6 = f.e[6];
+#else
         scan_rows<7>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-#if defined(SS_SCAN4)
+#endif
+#if !defined(SS_FORCE_SLOW) && !defined(SS_BLOCKSCAN)
+#elif defined(SS_SCAN4)
 #if SS_LVL == 2
             sink += a[0] + a[6] + nlpos; return;
 #endif
@@ -2237,8 +2247,14 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+#if !defined(SS_FORCE_SLOW) && !defined(SS_BLOCKSCAN)
+        line_rows<4>(buf, start, stop, last, line4w, [&](const Fields<4>& f) SS_INLINE {
+            const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
+#else
         scan_rows<4>(buf, start, stop, last, [&](ROW_PARAMS) SS_INLINE {
-#if defined(SS_SCAN4)
+#endif
+#if !defined(SS_FORCE_SLOW) && !defined(SS_BLOCKSCAN)
+#elif defined(SS_SCAN4)
 #if SS_CLVL == 2
             sink += a[0] + a[3] + nlpos; return;
 #endif
