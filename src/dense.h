@@ -472,7 +472,7 @@ static bool dense_recover(Shared& sh, u64& ukey_out, u64& ekey_out, double& rows
 }
 
 // Recovers the keys and sizes the tables. False leaves the run on the general path.
-// SS_DENSE=0 switches the dense path off; SS_DENSE=2 (tests) takes it even when
+// Off by default (SS_DENSE=1 switches it on); SS_DENSE=2 (tests) takes it even when
 // no key is found, with arbitrary keys: every ID then decodes to some number,
 // nearly all of them out of range, and the result must still be exact.
 static bool dense_setup(Shared& sh) {
@@ -480,9 +480,12 @@ static bool dense_setup(Shared& sh) {
     const double began = now();
     bool forced = false;
     {
+        // Off unless asked for: since scorer version 5 the rules say IDs are opaque
+        // strings, not generator numbers to be inverted, so the general path is the
+        // entry. SS_DENSE=1 or 2 still runs this path (tests keep it honest).
         const char* v = getenv("SS_DENSE");
-        if (v && *v == '0') return false;
-        forced = v && *v == '2';
+        if (!v || *v == '0') return false;
+        forced = *v == '2';
     }
     const u32 T = sh.cfg.threads;
     if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
