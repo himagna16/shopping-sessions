@@ -136,6 +136,43 @@ static inline SS_HOT void b36_pair(const u8* pa, size_t na, const u8* pb, size_t
 #endif
 }
 
+// The same two IDs given as whole fields (letter included), read from their
+// ends: the eight bytes that end where the field ends hold the digits already
+// in place, and the bytes in front of them are swapped for '0' by a mask. One
+// flag says whether both are canonical; if not, b36_pair decides each as before.
+// A field must start at `floor` or later so that the read stays inside the input.
+alignas(64) static const u64 g_b36_keep[16] = {0,
+    0xFF00000000000000ULL, 0xFFFF000000000000ULL, 0xFFFFFF0000000000ULL, 0xFFFFFFFF00000000ULL,
+    0xFFFFFFFFFF000000ULL, 0xFFFFFFFFFFFF0000ULL, 0xFFFFFFFFFFFFFF00ULL, ~0ULL, 0, 0, 0, 0, 0, 0, 0};
+// the smallest number of n digits that has no leading zero (36^(n-1)); any one-digit number will do
+alignas(64) static const u64 g_b36_least[16] = {0, 0, 36, 1296, 46656, 1679616, 60466176, 2176782336ULL, 78364164096ULL, 0, 0, 0, 0, 0, 0, 0};
+static inline SS_HOT void b36_fields(const u8* s0, const u8* e0, const u8* s1, const u8* e1, const u8* floor, u64& va, u64& vb) {
+    const size_t na = size_t(e0 - s0) - 1, nb = size_t(e1 - s1) - 1;
+#if defined(__SSE4_1__) && !defined(SS_B36_SWAR) && !defined(SS_B36_TABLE) && !defined(SS_OLDIDS)
+    if (__builtin_expect(s0 >= floor, 1)) {
+        const u64 ZERO = 0x3030303030303030ULL;
+        const u64 ka = g_b36_keep[na & 15], kb = g_b36_keep[nb & 15];
+        const u64 ta = (rd64(e0 - 8) & ka) | (ZERO & ~ka), tb = (rd64(e1 - 8) & kb) | (ZERO & ~kb);
+        const __m128i x = _mm_set_epi64x((long long)tb, (long long)ta);
+        const __m128i x1 = _mm_sub_epi8(x, _mm_set1_epi8('0')), x2 = _mm_sub_epi8(x, _mm_set1_epi8('a'));
+        const __m128i ok1 = _mm_cmpeq_epi8(_mm_min_epu8(x1, _mm_set1_epi8(9)), x1);
+        const __m128i ok2 = _mm_cmpeq_epi8(_mm_min_epu8(x2, _mm_set1_epi8(25)), x2);
+        const u32 good = u32(_mm_movemask_epi8(_mm_or_si128(ok1, ok2)));
+        const __m128i digit = _mm_sub_epi8(x1, _mm_and_si128(ok2, _mm_set1_epi8(39)));
+        const __m128i pairs = _mm_maddubs_epi16(digit, _mm_set1_epi16(0x0124));                 // 36 * first + second
+        const __m128i fours = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010510));                // 1296 * first + second
+        const __m128i value = _mm_add_epi64(_mm_mul_epu32(fours, _mm_set1_epi64x(1679616)), _mm_srli_epi64(fours, 32));
+        const u64 a = u64(_mm_cvtsi128_si64(value)), b = u64(_mm_extract_epi64(value, 1));
+        // every character a digit; both lengths 1 to 8; both under 2^40; neither with a leading zero
+        const bool bad = (good != 0xFFFF) | (((na - 1) | (nb - 1)) > 7) | ((a | b) > MASK40) | (a < g_b36_least[na & 15]) | (b < g_b36_least[nb & 15]);
+        if (__builtin_expect(!bad, 1)) { va = a; vb = b; return; }
+    }
+#else
+    (void)floor;
+#endif
+    b36_pair(s0 + 1, na, s1 + 1, nb, va, vb);
+}
+
 static inline u32 b36_text(char* out, u64 v) {
     char tmp[16];
     int at = 16;
@@ -435,7 +472,7 @@ static bool dense_recover(Shared& sh, u64& ukey_out, u64& ekey_out, double& rows
 }
 
 // Recovers the keys and sizes the tables. False leaves the run on the general path.
-// SS_DENSE=0 switches the dense path off; SS_DENSE=2 (tests) takes it even when
+// Off by default (SS_DENSE=1 switches it on); SS_DENSE=2 (tests) takes it even when
 // no key is found, with arbitrary keys: every ID then decodes to some number,
 // nearly all of them out of range, and the result must still be exact.
 static bool dense_setup(Shared& sh) {
@@ -443,9 +480,12 @@ static bool dense_setup(Shared& sh) {
     const double began = now();
     bool forced = false;
     {
+        // Off unless asked for: since scorer version 5 the rules say IDs are opaque
+        // strings, not generator numbers to be inverted, so the general path is the
+        // entry. SS_DENSE=1 or 2 still runs this path (tests keep it honest).
         const char* v = getenv("SS_DENSE");
-        if (v && *v == '0') return false;
-        forced = v && *v == '2';
+        if (!v || *v == '0') return false;
+        forced = *v == '2';
     }
     const u32 T = sh.cfg.threads;
     if (T > 64 || sh.cat.campaign_ids.size() + 1 >= 65535 || sh.ndays > 30 || sh.we <= sh.ws) return false;
@@ -886,6 +926,39 @@ static u64 line_selftest_one(u64& state, u64 lines, Fast&& fast, u64& accepted) 
 static void line_selftest(u64 lines) {
     u64 state = 0x9E3779B97F4A7C15ULL ^ lines, a7 = 0, a4 = 0, a2 = 0;
     {
+        // The paired time-of-day conversion against the single one.
+        auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
+        u64 wrong = 0, valid = 0;
+        for (u64 i = 0; i < lines; i++) {
+            u8 text[2][16];
+            for (int k = 0; k < 2; k++) {
+                const u64 kind = rnd() % 6;
+                for (int j = 0; j < 16; j++) text[k][j] = u8(kind == 0 ? rnd() & 0xFF : "0123456789:/;0123456"[rnd() % 20]);
+                if (kind >= 2) {
+                    const u32 h = u32(rnd() % (kind == 2 ? 30 : 24)), m = u32(rnd() % (kind == 3 ? 70 : 60)), sec = u32(rnd() % (kind == 4 ? 70 : 60));
+                    snprintf((char*)text[k], 16, "%02u:%02u:%02u", h, m, sec);
+                    if (rnd() % 16 == 0) text[k][rnd() % 8] = u8("0123456789:/;T Z-"[rnd() % 17]);
+                }
+            }
+            i32 a, b;
+            tod_pair(text[0], text[1], a, b);
+            const i32 wa = tod_seconds(text[0]), wb = tod_seconds(text[1]);
+            valid += (wa >= 0) + (wb >= 0);
+#if defined(__SSE4_1__)
+            {
+                // the raw form: all 16 bits and a sum under 86,400 must mean exactly "a time of day", with that sum
+                u32 ra, rb;
+                const u32 good = tod_pair_raw(text[0], text[1], ra, rb);
+                const i32 fa = ((good & 0xFF) == 0xFF && ra < 86400) ? i32(ra) : -1, fb = ((good >> 8) == 0xFF && rb < 86400) ? i32(rb) : -1;
+                if (fa != wa || fb != wb) { if (wrong++ < 5) fprintf(stderr, "raw time pair mismatch: [%.8s] [%.8s] got %d %d want %d %d\n", (const char*)text[0], (const char*)text[1], fa, fb, wa, wb); }
+            }
+#endif
+            if (a != wa || b != wb) { if (wrong++ < 5) fprintf(stderr, "time pair mismatch: [%.8s] [%.8s] got %d %d want %d %d\n", (const char*)text[0], (const char*)text[1], a, b, wa, wb); }
+        }
+        fprintf(stderr, "time pair: %llu pairs, %llu valid times, %llu mismatches\n", (unsigned long long)lines, (unsigned long long)valid, (unsigned long long)wrong);
+        if (wrong) _exit(1);
+    }
+    {
         // The paired ID decode against the single one, on IDs of every shape.
         auto rnd = [&state]() { state ^= state << 13; state ^= state >> 7; state ^= state << 17; return state; };
         u64 wrong = 0, valid = 0;
@@ -914,6 +987,25 @@ static void line_selftest(u64 lines) {
                 if (!fine || plain > MASK40) plain = ~0ULL;
                 if (plain != (k ? wb : wa)) { if (wrong++ < 5) fprintf(stderr, "single decode mismatch: [%.*s] got %llx want %llx\n", int(len[k]), (const char*)text[k], (unsigned long long)(k ? wb : wa), (unsigned long long)plain); }
             }
+            {
+                // The same two IDs as whole fields in one line, read from their ends:
+                // whatever stands in front of a field must not matter.
+                u8 lineb[96];
+                for (size_t j = 0; j < sizeof lineb; j++) lineb[j] = u8(rnd() % 3 ? "0123456789abcdefghijklmnopqrstuvwxyz"[rnd() % 36] : rnd() & 0xFF);
+                const size_t gap = rnd() % 9;                            // bytes in front of the first field (0 to 8)
+                u8* s0 = lineb + 8 + gap;                                // the buffer starts 8 or more bytes before it
+                s0[0] = u8("eukE0"[rnd() % 5]);
+                memcpy(s0 + 1, text[0], len[0]);
+                u8* e0 = s0 + 1 + len[0];
+                e0[0] = u8(",\"0"[rnd() % 3]);
+                u8* s1 = e0 + 1 + rnd() % 2;
+                s1[0] = u8("eukE0"[rnd() % 5]);
+                memcpy(s1 + 1, text[1], len[1]);
+                u8* e1 = s1 + 1 + len[1];
+                u64 fa, fb;
+                b36_fields(s0, e0, s1, e1, rnd() % 4 ? lineb : s0 + rnd() % 3, fa, fb);    // now and then a floor that forbids the read
+                if (fa != wa || fb != wb) { if (wrong++ < 5) fprintf(stderr, "field decode mismatch: [%.*s] [%.*s] got %llx %llx want %llx %llx\n", int(len[0]), (const char*)text[0], int(len[1]), (const char*)text[1], (unsigned long long)fa, (unsigned long long)fb, (unsigned long long)wa, (unsigned long long)wb); }
+            }
             valid += (wa != ~0ULL) + (wb != ~0ULL);
             if (a != wa || b != wb) { if (wrong++ < 5) fprintf(stderr, "pair decode mismatch: [%.*s] [%.*s] got %llx %llx want %llx %llx\n", int(len[0]), (const char*)text[0], int(len[1]), (const char*)text[1], (unsigned long long)a, (unsigned long long)b, (unsigned long long)wa, (unsigned long long)wb); }
         }
@@ -931,6 +1023,13 @@ static void line_selftest(u64 lines) {
 // After the links are read: the links of everyone handed to the general path
 // join the general union-find, and the alias map is built from it. Only links
 // hand people over, so this runs on the links thread while the others parse.
+// Where a field must start for b36_fields to read the seven bytes in front of it:
+// anywhere in a thread's own buffer (it has spare bytes in front), but not within
+// the first seven bytes of a mapped file.
+static inline const u8* id_read_floor(const InputFile& f, const u8* buf) {
+    return (f.map && buf >= f.map && buf < f.map + f.size) ? f.map + 7 : buf;
+}
+
 static void dense_settle(Shared& sh) {
     Dense& D = g_dense;
     Links& links = sh.odd_links;
@@ -1030,6 +1129,7 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
         const Task& task = sh.event_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+        const u8* const id_floor = id_read_floor(sh.files[task.file], buf);
 #if SS_PL == 1
         for (size_t i = start; i < last; i += 64) sink += buf[i];
         release_chunk(sh.files[task.file], task);
@@ -1048,16 +1148,51 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
             // As in parse_events: is the copy valid and on time, and where does its
             // ingest_ts stand among the copies of its event. Here the ingest time is
             // kept as whole seconds from a little before the window.
-            const i64 ts = parse_ts(s2, size_t(e2 - s2), dates);
-            const bool in_window = ts != TS_BAD && ts >= ws && ts < we;
-            bool timely = false, settled = false, far = false;
+            i64 ts;
+            bool in_window, timely = false, settled = false, far = false;
             u32 ing = ING_NONE;
-            if (in_window && e3 - s3 == 20) {
-                const u32 d = u32(u64(ts - sh.day_base) / u64(DAY));
-                if (u32(rd64(s3) == sh.day_text8[d]) & u32(rd16(s3 + 8) == sh.day_text2[d]) & u32(s3[10] == 'T') & u32(s3[19] == 'Z')) {
-                    const i32 seconds = tod_seconds(s3 + 11);
-                    if (seconds >= 0) { ing = day_lead + d * 86400 + u32(seconds); timely = true; }
+            const size_t n2 = size_t(e2 - s2), n3 = size_t(e3 - s3);
+            const DateTable::Entry* day = nullptr;
+#ifndef SS_NOFUSE
+            if (((n2 == 20) & (n3 == 20)) && s2[19] == 'Z' && (day = g_dates.find(s2)) != nullptr) {
+                // Both times in the usual form, the commonest line: one look-up of the
+                // date and both times of day converted together. The ingest time is
+                // settled here when it carries the same date as ts (then it cannot be late).
+#if defined(__AVX2__) && !defined(SS_NOTODPAIR) && !defined(SS_OLDTS)
+                // Both times of day good (nearly always): no markers to test, the window
+                // as one compare, and the two dates compared 32 bytes at once (the look-up
+                // has shown bytes 0-10 of ts to be a date and 'T', and byte 19 is 'Z').
+                u32 ts_sec, ing_sec;
+                const u32 good = tod_pair_raw(s2 + 11, s3 + 11, ts_sec, ing_sec);
+                if (__builtin_expect((good == 0xFFFF) & (ts_sec < 86400) & (ing_sec < 86400), 1)) {
+                    const u32 same = u32(_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256((const __m256i*)s2), _mm256_loadu_si256((const __m256i*)s3))));
+                    ts = day->ms + i64(ts_sec) * 1000;
+                    in_window = u64(ts - ws) < u64(we - ws);
+                    if (in_window & ((same & 0x807FF) == 0x807FF)) { ing = u32(day->sec - ing_base) + ing_sec; timely = true; settled = true; }
+                } else
+#endif
+                {
+                i32 ts_seconds, ing_seconds;
+                tod_pair(s2 + 11, s3 + 11, ts_seconds, ing_seconds);
+                ts = ts_seconds < 0 ? TS_BAD : day->ms + i64(ts_seconds) * 1000;
+                in_window = ts != TS_BAD && ts >= ws && ts < we;
+                if (in_window && (u32(rd64(s3) == rd64(s2)) & u32(rd16(s3 + 8) == rd16(s2 + 8)) & u32(s3[10] == 'T') & u32(s3[19] == 'Z'))) {
+                    if (ing_seconds >= 0) { ing = u32(day->sec - ing_base) + u32(ing_seconds); timely = true; }
                     settled = true;
+                }
+                }
+            } else
+#endif
+            {
+                ts = parse_ts(s2, n2, dates);
+                in_window = ts != TS_BAD && ts >= ws && ts < we;
+                if (in_window && n3 == 20) {
+                    const u32 d = u32(u64(ts - sh.day_base) / u64(DAY));
+                    if (u32(rd64(s3) == sh.day_text8[d]) & u32(rd16(s3 + 8) == sh.day_text2[d]) & u32(s3[10] == 'T') & u32(s3[19] == 'Z')) {
+                        const i32 seconds = tod_seconds(s3 + 11);
+                        if (seconds >= 0) { ing = day_lead + d * 86400 + u32(seconds); timely = true; }
+                        settled = true;
+                    }
                 }
             }
             if (!settled) {
@@ -1102,7 +1237,7 @@ static void parse_links_dense(Shared& sh, Reader& reader) {
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
             // Both IDs are decoded together; the user's number is only used for a valid copy.
             u64 event_value, user_value;
-            b36_pair(s0 + 1, n0 - 1, s1 + 1, n1 - 1, event_value, user_value);
+            b36_fields(s0, e0, s1, e1, id_floor, event_value, user_value);
             u64 number = ~0ULL;
             if ((s0[0] == 'e') & (event_value != ~0ULL)) number = unscramble40(event_value, ekey);
 #if SS_PL == 6
@@ -1325,6 +1460,7 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecK, 64>& lists = sh.k[tid];
     const u64 ukey = D.ukey, pmax = D.pmax;
     DateCache dates;
+    [[maybe_unused]] u64 csink = 0;
 #ifdef SS_NOCLICKS                   // measurement builds only
     return;
 #endif
@@ -1334,17 +1470,38 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+        const u8* const id_floor = id_read_floor(sh.files[task.file], buf);
+#ifndef SS_CL
+#define SS_CL 0                      // measurement builds only: stop the click row handler after step N
+#endif
+#if SS_CL == 1
+        for (size_t i = start; i < last; i += 64) csink += buf[i];
+        release_chunk(sh.files[task.file], task);
+        continue;
+#endif
         line_rows<4>(buf, start, stop, last, line4, [&](const Fields<4>& f) SS_INLINE {
             const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
+#if SS_CL == 2
+            csink += size_t(e0 - s0) + size_t(e1 - s1) + size_t(e2 - s2) + size_t(e3 - s3); return;
+#endif
             if (s0 == e0 || s1 == e1) return;
             const i64 ts = parse_ts(s3, size_t(e3 - s3), dates);
             if (ts == TS_BAD || ts < lo || ts >= hi) return;
+#if SS_CL == 3
+            csink += u64(ts); return;
+#endif
             const i32 campaign = cat.campaign(s2, e2);
             if (campaign < 0) return;
+#if SS_CL == 4
+            csink += u64(ts) + u64(campaign); return;
+#endif
             const size_t n0 = size_t(e0 - s0), n1 = size_t(e1 - s1);
             u64 key, user_value;
-            b36_pair(s0 + 1, n0 - 1, s1 + 1, n1 - 1, key, user_value);
+            b36_fields(s0, e0, s1, e1, id_floor, key, user_value);
             const u64 who = unscramble40(user_value, ukey);
+#if SS_CL == 5
+            csink += u64(ts) + u64(campaign) + key + who; return;
+#endif
             if ((s1[0] == 'u') & (user_value != ~0ULL) & ((who >> 9) < pmax) & ((who & 511) < 16)) {
                 const u32 user = (u32(who >> 9) << 4) | u32(who & 15);
                 if (s0[0] != 'k') key = ~0ULL;
@@ -1359,6 +1516,7 @@ static void parse_clicks_dense(Shared& sh, u32 tid, Reader& reader) {
         });
         release_chunk(sh.files[task.file], task);
     }
+    if (csink == 1) fprintf(stderr, "sink\n");
 }
 
 // ---------------------------------------------------------------- between the phases
