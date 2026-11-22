@@ -28,6 +28,9 @@ is packed into a 64-bit key that keeps the byte order. Any other ID (since
 scorer version 5 one in eight is the letter plus 32 hexadecimal characters) is
 interned: stored once in a table split in 256 parts, read without locks, and
 keyed by the address of its copy, so comparing and writing it needs no look-up.
+A look-up is one hash and one table slot; the slot holds the whole 64-bit hash
+and a hit is taken on it (`-DSS_INTERN_VERIFY` compares the bytes as well: two
+different long IDs with one hash are one chance in a few million per run).
 An `event_id` is only ever compared for equality, so a long one is keyed by a
 63-bit hash of its bytes instead of being stored (build with `-DSS_EVENT_INTERN`
 to intern those too; two different long event IDs meeting in one key would take
