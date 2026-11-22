@@ -1,6 +1,6 @@
 #!/bin/sh
-# Diagnostic run (never scored): the general path on long-ID data (scorer version 5 shape):
-# first-generator data with one ID in eight rewritten to the long form by /longids.
+# Diagnostic run (never scored): the general path on long-ID data, step by step (each lN build
+# stops the event row after step N), and the ID tables on 2 MB pages against small ones.
 # Output stays under ~1,900 characters.
 exec 1>&2
 S="${SCRATCH_DIR:-/scratch}"
@@ -56,31 +56,28 @@ sum() {   # one thread, so the files do not depend on timing: a digest of everyt
 }
 E="${PROBE_E:-20000000}"
 /generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
-/longids "$S/b" "$S/L"; echo "longids rc$? t=$(( $(date +%s) - START ))s $(du -sm "$S/b" | cut -f1)MB -> $(du -sm "$S/L" | cut -f1)MB"
-sync
+/longids "$S/b" "$S/L"; rm -rf "$S/b"; sync
 echo "wall total parse dedup people parse_cpu links user sys"
 r warm "$S/L" /p > /dev/null
-for round in 1 2; do
-r short "$S/b" /p
-r long "$S/L" /p
-r longBS "$S/L" /pei
+for round in 1 2 3; do
+r huge "$S/L" /p
+r lazy "$S/L" /plz
 done
-grep -E '^threads' "$S/err" | cut -c1-300
-r long-t1 "$S/L" /p SS_THREADS=1
-r short-t1 "$S/b" /p SS_THREADS=1
-echo "parse only: wall cpu"
-for v in "short $S/b" "long $S/L"; do set -- $v; p $1 "$2" /p; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+grep -E '^threads' "$S/err" | cut -c1-260
+echo "steps (parse wall, parse cpu): touch, line+fields, +event key, +times, all but push, full, no clicks"
+for v in l1 l3 l4 l5 l7 p pnc; do echo "$v $(r $v "$S/L" /$v | awk '{print $4, $7}')"; done | tr '\n' ',' ; echo
+r t1 "$S/L" /p SS_THREADS=1
 echo "t=$(( $(date +%s) - START ))s"
-rm -rf "$S/b" "$S/L"
+rm -rf "$S/L"
 if [ "$G" -le 22 ]; then
 E3=$(( E * 3 ))
-/generate --seed 17 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
+/generate --seed 17 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$?"
 /longids "$S/c" "$S/L"; rm -rf "$S/c"; sync; echo "t=$(( $(date +%s) - START ))s"
 r warm "$S/L" /p > /dev/null
-r 60long "$S/L" /p
-r 60long "$S/L" /p
-r 60longBS "$S/L" /pei
-grep -E '^threads' "$S/err" | cut -c1-300
+for round in 1 2; do
+r 60huge "$S/L" /p
+r 60lazy "$S/L" /plz
+done
 fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
