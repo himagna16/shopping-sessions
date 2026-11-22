@@ -1,53 +1,83 @@
 #!/bin/sh
-# Diagnostic run (never scored): Team 67's two newest builds at 20M and 60M,
-# and an output comparison with ours on the organizers' fixtures.
+# Diagnostic run (never scored): where the dense path's time goes, on a dataset
+# the organizers' generator writes here. Variants leave one step out.
+# Output stays under ~1,900 characters.
 exec 1>&2
 S="${SCRATCH_DIR:-/scratch}"
 START=$(date +%s)
-run() {   # label out-dir data bin env... -> "label wall-ms t<own total>"
-  label="$1"; out="$S/$2"; data="$3"; bin="$4"; shift 4
-  rm -rf "$out"; mkdir -p "$out"
+one() {   # one run -> "wall total parse dedup people parse_cpu links user sys"
+  data="$1"; bin="$2"; shift 2
+  rm -rf "$S/out"; mkdir -p "$S/out"
   t0=$(date +%s%N)
-  env NCPU=8 XL_TIMING=1 SS_MMAP=2 DATA_DIR="$data" OUTPUT_DIR="$out" "$@" "$bin" 2> "$S/err"; rc=$?
+  env SS_MMAP=2 "$@" DATA_DIR="$data" OUTPUT_DIR="$S/out" "$bin" 2> "$S/err"; rc=$?
   t1=$(date +%s%N)
-  echo "$label $(( (t1 - t0) / 1000000 ))$([ $rc = 0 ] || echo " rc$rc") t$(grep -m1 'ms: ' "$S/err" | sed 's/.*total=\([0-9]*\).*/\1/')"
+  awk -v w=$(( (t1 - t0) / 1000000 )) -v rc=$rc '/^user/{u=$2*1000; s=$4*1000} /^threads/{printf "%d %d %d %d %d %d %d %d %d", w, $18*1000, $9*1000, $11*1000, $13*1000, $23*1000, $NF*1000, u, s} END{if (rc) printf " rc%d", rc}' "$S/err"
 }
-ok=0; bad=""
-for d in /fx/*/; do
-  n=$(basename "$d")
-  rm -rf "$S/a" "$S/b"; mkdir -p "$S/a" "$S/b"
-  NCPU=8 DATA_DIR="$d" OUTPUT_DIR="$S/a" /xn > /dev/null 2>&1; ra=$?
-  NCPU=8 DATA_DIR="$d" OUTPUT_DIR="$S/b" /p > /dev/null 2>&1; rb=$?
-  r=$(python3 /cmp.py "$S/a" "$S/b" 2>&1 | tail -1 | cut -c1-4)
-  if [ "$r" = SAME ] && [ $ra = 0 ] && [ $rb = 0 ]; then ok=$(( ok + 1 )); else bad="$bad $n:$r$ra$rb"; fi
-done
-echo "fx same $ok, not:$(echo "$bad" | cut -c1-420)"
+r() {     # best of 3 by wall -> "wall total parse dedup people parse_cpu links user sys"
+  label="$1"; shift
+  best=""; bw=999999
+  for i in 1 2 3; do
+    line=$(one "$@"); w=${line%% *}
+    if [ -n "$w" ] && [ "$w" -lt "$bw" ]; then bw=$w; best="$line"; fi
+  done
+  echo "$label $best"
+}
+p() {     # parse only: best of 3 by parse cpu -> "parse parse_cpu"
+  label="$1"; shift
+  best=""; bc=999999
+  for i in 1 2 3; do
+    line=$(one "$@" SS_STOP=1); c=$(echo "$line" | awk '{print $6}')
+    if [ -n "$c" ] && [ "$c" -lt "$bc" ]; then bc=$c; best=$(echo "$line" | awk '{print $3, $6}'); fi
+  done
+  echo "$label $best"
+}
+w() {     # the walk: cpu ms per step, lowest walk of 3 runs
+  label="$1"; shift
+  best=""; bw=999999
+  for i in 1 2 3; do
+    one "$@" > /dev/null
+    line=$(awk '/^dense \|/{printf "%d %d %d %d %.0f %.0f", $42*1000, $44*1000, $46*1000, $48*1000, $54*1000, $58*1000}' "$S/err"); k=$(echo "$line" | awk '{print $3}')
+    if [ -n "$k" ] && [ "$k" -lt "$bw" ]; then bw=$k; best="$line"; fi
+  done
+  echo "$label $best"
+}
+dl() {    # the dense path's own line from the last run, numbers only (ms)
+  awk -v l="$1" '/^dense \|/{printf "%s set %.1f hand %s cpu pl %d sw %d wk %d st %d wall se %.1f wk %.1f jn %.1f st %.1f\n", l, $4*1000, $27, $42*1000, $44*1000, $46*1000, $48*1000, $52*1000, $54*1000, $56*1000, $58*1000}' "$S/err"
+}
+dg() {    # the output digest of one run (dense and general must agree)
+  label="$1"; shift
+  one "$@" > /dev/null
+  awk -v l="$label" '/^digest/{print l, substr($3, 9), substr($5, 9), $7}' "$S/err"
+}
+sum() {   # one thread, so the files do not depend on timing: a digest of everything written
+  label="$1"; shift
+  one "$@" SS_THREADS=1 > /dev/null
+  echo "$label $(cd "$S/out" && find . -type f | sort | xargs cat | sha256sum | cut -c1-12) $(find "$S/out" -type f | wc -l)"
+}
 E="${PROBE_E:-20000000}"
-/generate --seed 13 --events "$E" --clicks $(( E / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen20 rc$?"
-sync
-B="$S/c"
-run 20xn o1 "$B" /xn
-run 20xl o1 "$B" /xl
-run 20xn o1 "$B" /xn
-run 20xl o1 "$B" /xl
-run 20xn o1 "$B" /xn
-run 20ours o2 "$B" /p
-echo "cmp20 $(python3 /cmp.py "$S/o1" "$S/o2" 2>&1 | tail -1 | cut -c1-100)"
-rm -rf "$S/c"
-E3=$(( E * 3 ))
-/generate --seed 21 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$?"
-sync; echo "t=$(( $(date +%s) - START ))s"
-run w o1 "$B" /xn
-run w o1 "$B" /xl
-for i in 1 2 3 4 5; do
-run xl o1 "$B" /xl
-run xn o1 "$B" /xn
-run xn13 o1 "$B" /xn13
-run n12 o1 "$B" /xn NCPU=12
-run p0 o1 "$B" /xn XL_PIN=0
+/generate --seed 7 --events "$E" --clicks $(( E / 4 )) --output "$S/b" > /dev/null 2>&1; G=$(( $(date +%s) - START )); echo "gen rc$? ${G}s"
+B="$S/b"
+for round in 1 2 3; do
+r fuse "$B" /p
+r nofuse "$B" /pnf
+r notod "$B" /pnt
 done
-run xn o1 "$B" /xn
-run ours o2 "$B" /p
-echo "cmp60 $(python3 /cmp.py "$S/o1" "$S/o2" 2>&1 | tail -1 | cut -c1-100)"
+echo "parse: wall cpu (fields ts type | same without the fused lane)"
+for v in pl3 pl4 pl5 pn3 pn4 pn5 p pnf; do p $v "$B" /$v; done | awk '{printf "%s %s %s, ", $1, $2, $3} END{print ""}'
+dg d20 "$B" /pdg
+dg g20 "$B" /pdg SS_DENSE=0
+echo "t=$(( $(date +%s) - START ))s"
+rm -rf "$S/b"
+if [ "$G" -le 22 ]; then
+E3=$(( E * 3 ))
+/generate --seed 13 --events "$E3" --clicks $(( E3 / 4 )) --output "$S/c" > /dev/null 2>&1; echo "gen60 rc$? t=$(( $(date +%s) - START ))s"
+B="$S/c"
+for round in 1 2 3; do
+r 60fuse "$B" /p
+r 60nofuse "$B" /pnf
+done
+dg d60 "$B" /pdg
+dg g60 "$B" /pdg SS_DENSE=0
+fi
 echo "t=$(( $(date +%s) - START ))s"
 exit 1
