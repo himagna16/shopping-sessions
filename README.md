@@ -21,34 +21,24 @@ One C++ program, no dependencies, built into a static binary on an empty image.
    into daily rows. Each worker writes its own `user_daily` Parquet file; the
    small campaign table is merged and written once.
 
-### The dense path (`src/dense.h`)
+### IDs
 
-The generator writes each ID as a letter plus base 36 of a scrambled number,
-and the scramble is a bijection (`generator/src/text.rs`). At start-up the
-program reads a sample of one event file and recovers the two keys from it. If
-that works, a canonical ID is turned back into its number at parse time:
+IDs are opaque strings. One that is its column's letter plus 1 to 8 ASCII bytes
+is packed into a 64-bit key that keeps the byte order. Any other ID (since
+scorer version 5 one in eight is the letter plus 32 hexadecimal characters) is
+interned: stored once in a table split in 256 parts, read without locks, and
+keyed by the address of its copy, so comparing and writing it needs no look-up.
+An `event_id` is only ever compared for equality, so a long one is keyed by a
+63-bit hash of its bytes instead of being stored (build with `-DSS_EVENT_INTERN`
+to intern those too; two different long event IDs meeting in one key would take
+about one run in 400,000 at the final's size).
 
-- event copies are placed by event number, so de-duplication is an array store,
-  and reading the array in order meets each person's events together and in
-  time order;
-- a user ID gives its person and alias by arithmetic, so links inside one
-  person need no hash table.
+`src/dense.h` holds an earlier experiment that turned the generator's short IDs
+back into numbers. The rules now say IDs must not be treated that way, so it is
+off; it only runs when asked for (`SS_DENSE=1`), and the tests still check it
+against the reference.
 
-On this path the CSVs are read a line at a time: the comma, newline and quote
-bits of one or two 64-byte windows give a usual line's fields directly, and any
-other line is decided byte by byte.
-
-Nothing about a dataset is hard-coded and nothing is taken on trust. With no
-key, the general path above runs unchanged. Any ID that does not decode takes
-the general path for that row. People whose links leave their own first 16 IDs
-(shared devices, long chains, odd IDs) are handed to the general people phase
-by name. Decoding is a bijection whatever the key, so copies of one event
-always meet. Every person is claimed exactly once; if the data ever shows one
-person in two places, the run starts again on the general path.
-`SS_DENSE=0` switches the dense path off.
-
-IDs of up to 9 ASCII bytes are packed into 63-bit integers that sort the same
-way as the bytes; anything else goes through an exact slow path. Parquet is
+Parquet is
 written by a small hand-rolled writer (`src/parquet.h`): v1 pages, PLAIN,
 uncompressed.
 
@@ -59,9 +49,9 @@ from `rules.md`. It passes the 36 organizer fixtures and reproduces the
 published 1M-event dev answer exactly. The fast build is compared with it on
 the fixtures, the dev set, many generator seeds and hand-made adversarial
 inputs (`tests/`), under several thread counts and chunk sizes, and against a
-build with every fast path disabled (`make slow`). `tests/dense_fuzz.py`
-rewrites generated data to break each thing the dense path relies on and
-checks the result against the reference.
+build with every fast path disabled (`make slow`). `tests/make_long_ids.py`
+rewrites one in eight IDs of any dataset to the long form, and every such copy
+is checked against the reference as well.
 
 ## Build and run
 
