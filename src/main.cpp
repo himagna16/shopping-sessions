@@ -174,19 +174,118 @@ static inline i64 floor_div(i64 a, i64 b) { i64 q = a / b; return q - ((a % b !=
 // interned: bit 63 plus an index into a shared table.
 static const u64 INTERN_BIT = 1ULL << 63;
 
-static std::mutex g_intern_lock;
-static std::unordered_map<std::string, u64> g_intern_map;
-static std::vector<std::string*> g_intern_strs;
+// The interned IDs: every distinct one is stored once, and its key is bit 63
+// plus the address of that copy, so a key leads straight to the bytes. The
+// table is split in 256 parts by hash. A look-up reads its part without a lock
+// (slots only ever go from empty to filled, and a part that grows leaves its old
+// slots in place for readers still on them); only adding a new ID takes the
+// part's lock. Since scorer version 5 one ID in eight is this long, so this is
+// on the path of every eighth row, not an oddity.
+struct InternEntry { u32 len; u8 bytes[4]; };                    // bytes run on for len
+struct InternTable { u64 mask; std::atomic<u64> slot[1]; };      // slot: 16 bits of hash, 48 of address
+struct InternPart {
+    std::atomic<InternTable*> table{nullptr};
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    u64 count = 0;
+    u8* room = nullptr;
+    size_t room_left = 0;
+    char pad[24];
+};
+static InternPart g_intern[256];
 
-static u64 intern_id(const u8* p, size_t n) {
-    std::string s((const char*)p, n);
-    std::lock_guard<std::mutex> guard(g_intern_lock);
-    auto it = g_intern_map.find(s);
-    if (it != g_intern_map.end()) return it->second;
-    u64 key = INTERN_BIT | g_intern_strs.size();
-    g_intern_strs.push_back(new std::string(s));
-    g_intern_map.emplace(std::move(s), key);
-    return key;
+static inline u64 mix128(u64 a, u64 b) { const unsigned __int128 r = (unsigned __int128)a * b; return u64(r) ^ u64(r >> 64); }
+// A 64-bit hash of n bytes; reads only those bytes.
+static inline u64 hash_bytes(const u8* p, size_t n) {
+    u64 h = 0x9E3779B97F4A7C15ULL ^ (n * 0xD6E8FEB86659FD93ULL);
+    while (n >= 16) {
+        h = mix128(rd64(p) ^ 0xA0761D6478BD642FULL, rd64(p + 8) ^ h);
+        p += 16; n -= 16;
+    }
+    u64 a = 0, b = 0;
+    if (n >= 8) { a = rd64(p); b = rd64(p + n - 8); }
+    else if (n >= 4) { a = rd32(p); b = rd32(p + n - 4); }
+    else if (n) { a = (u64(p[0]) << 16) | (u64(p[n >> 1]) << 8) | p[n - 1]; }
+    h = mix128(a ^ 0xE7037ED1A0B428DBULL, b ^ h);
+    return mix128(h, 0x8EBC6AF09C88C6E3ULL);
+}
+
+static InternTable* intern_new_table(u64 slots) {
+    InternTable* t = (InternTable*)calloc(1, sizeof(InternTable) + (slots - 1) * sizeof(std::atomic<u64>));
+    if (!t) die("out of memory for the ID table");
+    t->mask = slots - 1;
+    return t;
+}
+
+static inline const InternEntry* intern_find(const InternTable* t, u64 h, const u8* p, size_t n) {
+    const u64 tag = h >> 48;
+    for (u64 i = (h >> 8) & t->mask;; i = (i + 1) & t->mask) {
+        const u64 v = t->slot[i].load(std::memory_order_acquire);
+        if (!v) return nullptr;
+        if ((v >> 48) == tag) {
+            const InternEntry* e = (const InternEntry*)(v & 0xFFFFFFFFFFFFULL);
+            if (e->len == n && memcmp(e->bytes, p, n) == 0) return e;
+        }
+    }
+}
+
+__attribute__((noinline)) static u64 intern_add(InternPart& part, u64 h, const u8* p, size_t n) {
+    while (part.busy.test_and_set(std::memory_order_acquire)) { }
+    InternTable* t = part.table.load(std::memory_order_relaxed);
+    const InternEntry* found = t ? intern_find(t, h, p, n) : nullptr;      // added by another thread meanwhile?
+    if (!found) {
+        if (!t || part.count * 2 >= t->mask + 1) {
+            // Grow: the new table takes every entry; the old one stays for readers still in it.
+            InternTable* bigger = intern_new_table(t ? (t->mask + 1) * 4 : 1024);
+            if (t) for (u64 i = 0; i <= t->mask; i++) {
+                const u64 v = t->slot[i].load(std::memory_order_relaxed);
+                if (!v) continue;
+                const InternEntry* e = (const InternEntry*)(v & 0xFFFFFFFFFFFFULL);
+                u64 j = (hash_bytes(e->bytes, e->len) >> 8) & bigger->mask;
+                while (bigger->slot[j].load(std::memory_order_relaxed)) j = (j + 1) & bigger->mask;
+                bigger->slot[j].store(v, std::memory_order_relaxed);
+            }
+            part.table.store(bigger, std::memory_order_release);
+            t = bigger;
+        }
+        const size_t need = (sizeof(u32) + n + 8 + 7) & ~size_t(7);         // 8 spare bytes: an entry can be read a word at a time
+        if (part.room_left < need) {
+            const size_t block = std::max<size_t>(need, 1 << 20);
+            part.room = (u8*)malloc(block);
+            if (!part.room) die("out of memory for interned IDs");
+            part.room_left = block;
+        }
+        InternEntry* e = (InternEntry*)part.room;
+        part.room += need; part.room_left -= need;
+        e->len = u32(n);
+        memcpy(e->bytes, p, n);
+        memset(e->bytes + n, 0, 8);
+        u64 j = (h >> 8) & t->mask;
+        while (t->slot[j].load(std::memory_order_relaxed)) j = (j + 1) & t->mask;
+        t->slot[j].store(((h >> 48) << 48) | u64(uintptr_t(e)), std::memory_order_release);
+        part.count++;
+        found = e;
+    }
+    part.busy.clear(std::memory_order_release);
+    return INTERN_BIT | u64(uintptr_t(found));
+}
+
+static inline u64 intern_id(const u8* p, size_t n) {
+    const u64 h = hash_bytes(p, n);
+    InternPart& part = g_intern[h & 255];
+    if (const InternTable* t = part.table.load(std::memory_order_acquire))
+        if (const InternEntry* e = intern_find(t, h, p, n)) return INTERN_BIT | u64(uintptr_t(e));
+    return intern_add(part, h, p, n);
+}
+static inline const InternEntry* intern_entry(u64 key) { return (const InternEntry*)uintptr_t(key & ~INTERN_BIT); }
+
+// An ID that is only ever compared for equality (event_id) and is too long to
+// pack: a 63-bit hash of its bytes stands for it. See pack_event_id.
+static inline u64 long_event_key(const u8* p, size_t n) {
+#ifdef SS_EVENT_INTERN
+    return intern_id(p, n);
+#else
+    return INTERN_BIT | (hash_bytes(p, n) >> 1);
+#endif
 }
 
 [[maybe_unused]] static inline SS_HOT u64 compact7(u64 x) {
@@ -216,13 +315,13 @@ static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8 prefix) {
         if (!((v & high) | ((t - 0x0101010101010101ULL) & ~t & high))) return v;
     }
 #endif
-    return intern_id(p, n);
+    return prefix == 'e' ? long_event_key(p, n) : intern_id(p, n);
 }
 
 static std::string id_string(u64 key, u8 prefix) {
     if (key & INTERN_BIT) {
-        std::lock_guard<std::mutex> guard(g_intern_lock);
-        return *g_intern_strs[key & ~INTERN_BIT];
+        const InternEntry* e = intern_entry(key);
+        return std::string((const char*)e->bytes, e->len);
     }
     char out[9];
     int n = 0;
@@ -231,7 +330,23 @@ static std::string id_string(u64 key, u8 prefix) {
     return std::string(out, n);
 }
 
-static bool id_less_slow(u64 a, u64 b, u8 prefix) { return id_string(a, prefix) < id_string(b, prefix); }
+// The bytes of an ID without building a string: an interned one where it is
+// stored, a packed one written out into buf.
+static inline size_t id_view(u64 key, u8 prefix, u8* buf, const u8*& bytes) {
+    if (key & INTERN_BIT) { const InternEntry* e = intern_entry(key); bytes = e->bytes; return e->len; }
+    size_t n = 0;
+    buf[n++] = prefix;
+    for (; key; key >>= 8) buf[n++] = u8(key & 0xFF);
+    bytes = buf;
+    return n;
+}
+static bool id_less_slow(u64 a, u64 b, u8 prefix) {             // byte-wise order, a prefix before the longer one
+    u8 ba[16], bb[16];
+    const u8 *pa, *pb;
+    const size_t na = id_view(a, prefix, ba, pa), nb = id_view(b, prefix, bb, pb);
+    const int c = memcmp(pa, pb, std::min(na, nb));
+    return c < 0 || (c == 0 && na < nb);
+}
 static inline bool id_less(u64 a, u64 b, u8 prefix) {
     if (!((a | b) & INTERN_BIT)) return __builtin_bswap64(a) < __builtin_bswap64(b);
     return id_less_slow(a, b, prefix);
@@ -262,8 +377,8 @@ static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8) {
 
 static std::string id_string(u64 key, u8) {
     if (key & INTERN_BIT) {
-        std::lock_guard<std::mutex> guard(g_intern_lock);
-        return *g_intern_strs[key & ~INTERN_BIT];
+        const InternEntry* e = intern_entry(key);
+        return std::string((const char*)e->bytes, e->len);
     }
     char out[9];
     int n = 0;
