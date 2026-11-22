@@ -309,6 +309,18 @@ static inline SS_HOT u64 intern_id(const u8* p, size_t n) {
         if (const InternEntry* e = intern_find(table, h, p, n)) return INTERN_BIT | u64(uintptr_t(e));
     return intern_add(part, h, p, n);
 }
+// The same in two steps, for a parser that can ask for the slot now and read it
+// a few rows later: the look-up of a long ID is then no longer a wait on memory.
+static inline SS_HOT void intern_prefetch(u64 h) {
+    const u64 table = g_intern[h & 255].table.load(std::memory_order_acquire);
+    if (table) __builtin_prefetch((const InternSlot*)uintptr_t(table & ~63ULL) + ((h >> 8) & ((1ULL << (table & 63)) - 1)));
+}
+static inline SS_HOT u64 intern_hashed(u64 h, const u8* p, size_t n) {
+    InternPart& part = g_intern[h & 255];
+    if (const u64 table = part.table.load(std::memory_order_acquire))
+        if (const InternEntry* e = intern_find(table, h, p, n)) return INTERN_BIT | u64(uintptr_t(e));
+    return intern_add(part, h, p, n);
+}
 static inline const InternEntry* intern_entry(u64 key) { return (const InternEntry*)uintptr_t(key & ~INTERN_BIT); }
 
 // An ID that is only ever compared for equality (event_id) and is too long to
@@ -338,16 +350,22 @@ static inline u64 long_event_key(const u8* p, size_t n) {
 // Lean form: an ID that is its column's letter plus 1 to 8 ASCII bytes (none
 // NUL) is keyed by those bytes as loaded, zero-padded. Byte order is then the
 // order of the byte-swapped keys.
-static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8 prefix) {
+// True, with its key, for an ID that packs; false for one that has to be interned.
+static inline SS_HOT bool pack_short(const u8* p, size_t n, u8 prefix, u64& key) {
 #ifndef SS_FORCE_SLOW
     if (p[0] == prefix && n - 2 < 8) {
         const u64 mask = ~0ULL >> (8 * (9 - n));
         const u64 v = rd64(p + 1) & mask;
         const u64 t = v | ~mask;
         const u64 high = 0x8080808080808080ULL;
-        if (!((v & high) | ((t - 0x0101010101010101ULL) & ~t & high))) return v;
+        if (!((v & high) | ((t - 0x0101010101010101ULL) & ~t & high))) { key = v; return true; }
     }
 #endif
+    return false;
+}
+static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8 prefix) {
+    u64 key;
+    if (pack_short(p, n, prefix, key)) return key;
     return prefix == 'e' ? long_event_key(p, n) : intern_id(p, n);
 }
 
@@ -407,6 +425,8 @@ static inline SS_HOT u64 pack_id(const u8* p, size_t n, u8) {
     }
     return intern_id(p, n);
 }
+
+static inline SS_HOT bool pack_short(const u8* p, size_t n, u8 prefix, u64& key) { key = pack_id(p, n, prefix); return true; }
 
 static std::string id_string(u64 key, u8) {
     if (key & INTERN_BIT) {
@@ -2015,6 +2035,11 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
     Scatter<RecA>& lists = sh.a[tid];
     DateCache dates;
     u64 sink = 0;
+    enum { WAIT = 8 };
+    struct EventWait { RecA rec; const u8* id; u64 hash; u32 len; };
+    EventWait waiting[WAIT];
+    for (EventWait& w : waiting) w.id = nullptr;
+    u32 wait_at = 0;
     for (;;) {
         size_t at = sh.next_event.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.event_tasks.size()) break;
@@ -2136,7 +2161,21 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
                     }
                     if (ok) {
                         rec.ts = u32(ts - ws);
+#ifdef SS_NOWAIT                     // measurement: every long ID looked up on the spot
                         rec.ukey = pack_id(s1, size_t(e1 - s1), 'u');
+                        if (false) {
+#else
+                        if (!pack_short(s1, size_t(e1 - s1), 'u', rec.ukey)) {
+#endif
+                            // A long user ID: its table slot is asked for now and read
+                            // a few rows on, when this row takes the place of an older one.
+                            const u64 h = hash_bytes(s1, size_t(e1 - s1));
+                            intern_prefetch(h);
+                            EventWait& w = waiting[wait_at++ & (WAIT - 1)];
+                            if (w.id) { w.rec.ukey = intern_hashed(w.hash, w.id, w.len); lists.push(u32(hash64(w.rec.ekey) >> shift), w.rec); }
+                            w.rec = rec; w.id = s1; w.len = u32(e1 - s1); w.hash = h;
+                            return;
+                        }
                     }
                 }
             }
@@ -2145,6 +2184,8 @@ static void parse_events(Shared& sh, u32 tid, Reader& reader) {
 #endif
             lists.push(u32(hash64(rec.ekey) >> shift), rec);
         });
+        for (EventWait& w : waiting)                            // the rows still waiting point into this chunk
+            if (w.id) { w.rec.ukey = intern_hashed(w.hash, w.id, w.len); lists.push(u32(hash64(w.rec.ekey) >> shift), w.rec); w.id = nullptr; }
         release_chunk(sh.files[task.file], task);
     }
     if (sink == 1) fprintf(stderr, "sink\n");
@@ -2169,6 +2210,27 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
     Resolver<Pending, decltype(emit)> resolver(alias, emit);
 #endif
     [[maybe_unused]] u64 sink = 0;
+    // Where a click goes once both its IDs have keys.
+    auto deliver = [&](u64 who, u64 ckey, u32 ts32, u32 camp) SS_INLINE {
+#ifdef SS_ALIAS1
+        resolver.push(who, Pending{ckey, ts32, camp});
+#else
+        // The click goes to its user ID's bucket as it is; whose it is gets
+        // settled there, once for each ID (see process_people).
+        emit(who, hash64(who), Pending{ckey, ts32, camp});
+#endif
+    };
+    enum { WAIT = 8 };
+    struct ClickWait { u64 who, ckey, user_hash, click_hash; const u8 *user, *click; u32 user_len, click_len, ts, camp; bool live; };
+    ClickWait waiting[WAIT];
+    for (ClickWait& w : waiting) w.live = false;
+    u32 wait_at = 0;
+    auto settle = [&](ClickWait& w) {
+        if (w.user) w.who = intern_hashed(w.user_hash, w.user, w.user_len);
+        if (w.click) w.ckey = intern_hashed(w.click_hash, w.click, w.click_len);
+        w.live = false;
+        deliver(w.who, w.ckey, w.ts, w.camp);
+    };
     for (;;) {
         size_t at = sh.next_click.fetch_add(1, std::memory_order_relaxed);
         if (at >= sh.click_tasks.size()) break;
@@ -2211,15 +2273,27 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
 #endif
             // Copies of a click are identical (rules.md), so they change neither
             // the credited campaign nor the set of assisting campaigns: no dedup.
-#ifdef SS_ALIAS1
-            resolver.push(pack_id(s1, size_t(e1 - s1), 'u'), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
+            u64 who, ckey;
+#ifdef SS_NOWAIT
+            who = pack_id(s1, size_t(e1 - s1), 'u'); ckey = pack_id(s0, size_t(e0 - s0), 'k');
+            const bool short_user = true, short_click = true;
 #else
-            // The click goes to its user ID's bucket as it is; whose it is gets
-            // settled there, once for each ID (see process_people).
-            const u64 who = pack_id(s1, size_t(e1 - s1), 'u');
-            emit(who, hash64(who), Pending{pack_id(s0, size_t(e0 - s0), 'k'), u32(ts - lo), u32(campaign)});
+            const bool short_user = pack_short(s1, size_t(e1 - s1), 'u', who), short_click = pack_short(s0, size_t(e0 - s0), 'k', ckey);
 #endif
+            if (!(short_user & short_click)) {
+                // A long ID or two: the slots are asked for now, the row waits a few rows.
+                ClickWait& w = waiting[wait_at++ & (WAIT - 1)];
+                if (w.live) settle(w);
+                w.live = true; w.who = who; w.ckey = ckey; w.ts = u32(ts - lo); w.camp = u32(campaign);
+                w.user = short_user ? nullptr : s1; w.click = short_click ? nullptr : s0;
+                w.user_len = u32(e1 - s1); w.click_len = u32(e0 - s0);
+                if (!short_user) { w.user_hash = hash_bytes(s1, size_t(e1 - s1)); intern_prefetch(w.user_hash); }
+                if (!short_click) { w.click_hash = hash_bytes(s0, size_t(e0 - s0)); intern_prefetch(w.click_hash); }
+                return;
+            }
+            deliver(who, ckey, u32(ts - lo), u32(campaign));
         });
+        for (ClickWait& w : waiting) if (w.live) settle(w);     // the rows still waiting point into this chunk
         release_chunk(sh.files[task.file], task);
     }
 #ifdef SS_ALIAS1
