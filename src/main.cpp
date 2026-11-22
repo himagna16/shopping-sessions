@@ -478,6 +478,26 @@ static inline SS_HOT void tod_pair(const u8* pa, const u8* pb, i32& sa, i32& sb)
 #endif
 }
 
+// tod_pair without its verdicts: the two sums as they come, and one bit per byte
+// that is the digit or colon its place asks for (all 16 set: both texts are well
+// formed, and each is a time of day if its sum is under 86,400).
+#if defined(__SSE4_1__)
+static inline SS_HOT u32 tod_pair_raw(const u8* pa, const u8* pb, u32& a, u32& b) {
+    const __m128i x = _mm_sub_epi8(_mm_set_epi64x((long long)rd64(pb), (long long)rd64(pa)), _mm_set1_epi8('0'));
+    const __m128i limit = _mm_setr_epi8(2, 9, 10, 5, 9, 10, 5, 9, 2, 9, 10, 5, 9, 10, 5, 9);
+    const __m128i colon = _mm_setr_epi8(0, 0, 10, 0, 0, 10, 0, 0, 0, 0, 10, 0, 0, 10, 0, 0);
+    const __m128i at_colon = _mm_setr_epi8(0, 0, -1, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, -1, 0, 0);
+    const __m128i ok = _mm_and_si128(_mm_cmpeq_epi8(_mm_min_epu8(x, limit), x), _mm_cmpeq_epi8(_mm_and_si128(x, at_colon), colon));
+    const __m128i digits = _mm_shuffle_epi8(x, _mm_setr_epi8(0, 1, 3, 4, 6, 7, -1, -1, 8, 9, 11, 12, 14, 15, -1, -1));
+    const __m128i pairs = _mm_maddubs_epi16(digits, _mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0, 10, 1, 10, 1, 10, 1, 0, 0));
+    const __m128i parts = _mm_madd_epi16(pairs, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
+    const __m128i seconds = _mm_add_epi32(parts, _mm_srli_epi64(parts, 32));
+    a = u32(_mm_cvtsi128_si32(seconds));
+    b = u32(_mm_extract_epi32(seconds, 2));
+    return u32(_mm_movemask_epi8(ok));
+}
+#endif
+
 // Any `ts`: F1, F2 or F3 -> epoch ms, or TS_BAD. p readable for n + 8 bytes.
 static inline SS_HOT i64 parse_ts(const u8* p, size_t n, DateCache& cache) {
 #ifndef SS_FORCE_SLOW
