@@ -8,9 +8,10 @@ One C++ program, no dependencies, built into a static binary on an empty image.
 
 ## How it works
 
-1. **Parse.** Every CSV is read in line-aligned chunks from one shared queue.
-   A 64-byte compare finds commas, newlines and quotes; fields are validated
-   and converted in place. Links are parsed and joined (union-find) on one
+1. **Parse.** Every CSV is read in line-aligned chunks from one shared queue,
+   a line at a time (`src/lines.h`): the comma, newline and quote bits of two
+   or three 64-byte windows give a usual line's fields directly, and any other
+   line is decided byte by byte. Fields are validated and converted in place. Links are parsed and joined (union-find) on one
    thread while the others parse events.
 2. **De-duplicate.** Each event copy becomes a 32-byte record placed in a
    bucket chosen by its `event_id`. Per bucket, the copy with the smallest
