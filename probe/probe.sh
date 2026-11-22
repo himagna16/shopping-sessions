@@ -63,7 +63,7 @@ r warm "$S/L" /p > /dev/null
 for round in 1 2; do
 r short "$S/b" /p
 r long "$S/L" /p
-r longNW "$S/L" /pei
+r longBS "$S/L" /pei
 done
 grep -E '^threads' "$S/err" | cut -c1-300
 r long-t1 "$S/L" /p SS_THREADS=1
@@ -79,7 +79,7 @@ E3=$(( E * 3 ))
 r warm "$S/L" /p > /dev/null
 r 60long "$S/L" /p
 r 60long "$S/L" /p
-r 60longNW "$S/L" /pei
+r 60longBS "$S/L" /pei
 grep -E '^threads' "$S/err" | cut -c1-300
 fi
 echo "t=$(( $(date +%s) - START ))s"
