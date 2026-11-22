@@ -21,6 +21,7 @@ E="${PROBE_E:-20000000}"
 sync
 B="$S/b"
 echo "rows $(cat "$B"/events/* | wc -l) $(cat "$B"/clicks/* | wc -l) paranoid $(cat /proc/sys/kernel/perf_event_paranoid 2>/dev/null)"
+echo "$(grep -m1 -o 'avx512[a-z_0-9]*\|bmi2\|gfni\|vaes' /proc/cpuinfo | sort -u | tr '\n' ' ')" | cut -c1-200
 ps warm /p
 for v in pl1 pl2 pl3 pl4 pl5 pl6 pl7 p; do ps $v /$v; done
 ps p-t4 /p SS_THREADS=4
