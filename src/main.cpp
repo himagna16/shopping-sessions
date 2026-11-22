@@ -173,6 +173,7 @@ static inline i64 floor_div(i64 a, i64 b) { i64 q = a / b; return q - ((a % b !=
 // first byte highest, so integer order is byte-wise order. Anything else is
 // interned: bit 63 plus an index into a shared table.
 static const u64 INTERN_BIT = 1ULL << 63;
+static const u64 POS_BIT = 1ULL << 62;                           // together with INTERN_BIT: a key that points into the input (see id_view)
 
 // The interned IDs: every distinct one is stored once, and its key is bit 63
 // plus the address of that copy, so a key leads straight to the bytes. The
@@ -392,7 +393,13 @@ static std::string id_string(u64 key, u8 prefix) {
 
 // The bytes of an ID without building a string: an interned one where it is
 // stored, a packed one written out into buf.
+// A long click_id is not stored at all: it is only ever looked at to order two
+// clicks of one person with the same time, so its key says where its bytes are
+// in the input (bit 62: file, offset and length), and they are read from there
+// in the rare case they are needed.
+static size_t input_bytes_at(u64 key, u8* buf, const u8*& bytes);       // defined with the input files
 static inline size_t id_view(u64 key, u8 prefix, u8* buf, const u8*& bytes) {
+    if ((key >> 62) == 3) return input_bytes_at(key, buf, bytes);       // both top bits: a packed key may have bit 62 set on its own
     if (key & INTERN_BIT) { const InternEntry* e = intern_entry(key); bytes = e->bytes; return e->len; }
     size_t n = 0;
     buf[n++] = prefix;
@@ -401,7 +408,7 @@ static inline size_t id_view(u64 key, u8 prefix, u8* buf, const u8*& bytes) {
     return n;
 }
 static bool id_less_slow(u64 a, u64 b, u8 prefix) {             // byte-wise order, a prefix before the longer one
-    u8 ba[16], bb[16];
+    u8 ba[64], bb[64];
     const u8 *pa, *pb;
     const size_t na = id_view(a, prefix, ba, pa), nb = id_view(b, prefix, bb, pb);
     const int c = memcmp(pa, pb, std::min(na, nb));
@@ -1164,6 +1171,29 @@ static inline void scan_rows(const u8* buf, size_t start, size_t stop, size_t, R
 
 // ---------------------------------------------------------------- input chunks
 struct InputFile { int fd; size_t size; const u8* map; };
+
+// The input files, for keys that point into them (see POS_BIT): bits 0-39 the
+// offset, 40-51 the file, 52-57 the length (at most 63 bytes).
+static const InputFile* g_input_files = nullptr;
+static inline bool position_key_fits(u32 file, size_t file_size) { return file < 4096 && file_size < (1ULL << 40); }
+static inline u64 position_key(u32 file, u64 offset, size_t len) { return INTERN_BIT | POS_BIT | (u64(len) << 52) | (u64(file) << 40) | offset; }
+#ifdef SS_ID2
+static size_t input_bytes_at(u64 key, u8* buf, const u8*& bytes) {
+    const InputFile& f = g_input_files[(key >> 40) & 4095];
+    const u64 offset = key & ((1ULL << 40) - 1);
+    const size_t len = size_t((key >> 52) & 63);
+    if (f.map) { bytes = f.map + offset; return len; }
+    size_t have = 0;
+    while (have < len) {
+        const ssize_t got = pread(f.fd, buf + have, len - have, off_t(offset + have));
+        if (got < 0) { if (errno == EINTR) continue; die("pread failed"); }
+        if (got == 0) die("input file shrank while reading");
+        have += size_t(got);
+    }
+    bytes = buf;
+    return len;
+}
+#endif
 struct Task { u32 file; size_t begin, end; };
 
 static int g_release_input = 0;             // SS_RELEASE: 1 drops a mapped chunk's page-table entries once it is parsed,
@@ -2256,6 +2286,8 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
         const Task& task = sh.click_tasks[at];
         const u8* buf; size_t start, stop, last;
         if (!reader.load(sh.files[task.file], task, buf, start, stop, last)) { release_chunk(sh.files[task.file], task); continue; }
+        [[maybe_unused]] const u64 chunk_from = task.begin ? task.begin - 1 : 0;        // the file offset of buf[0], as Reader::load takes it
+        [[maybe_unused]] const bool position_ok = position_key_fits(task.file, sh.files[task.file].size);
 #if !defined(SS_FORCE_SLOW) && !defined(SS_BLOCKSCAN)
         line_rows<4>(buf, start, stop, last, line4w, [&](const Fields<4>& f) SS_INLINE {
             const u8 *s0 = f.s[0], *e0 = f.e[0], *s1 = f.s[1], *e1 = f.e[1], *s2 = f.s[2], *e2 = f.e[2], *s3 = f.s[3], *e3 = f.e[3];
@@ -2303,7 +2335,14 @@ static void parse_clicks(Shared& sh, u32 tid, Reader& reader) {
             who = pack_id(s1, size_t(e1 - s1), 'u'); ckey = pack_id(s0, size_t(e0 - s0), 'k');
             const bool short_user = true, short_click = true;
 #else
-            const bool short_user = pack_short(s1, size_t(e1 - s1), 'u', who), short_click = pack_short(s0, size_t(e0 - s0), 'k', ckey);
+            const bool short_user = pack_short(s1, size_t(e1 - s1), 'u', who);
+            bool short_click = pack_short(s0, size_t(e0 - s0), 'k', ckey);
+#if defined(SS_ID2) && !defined(SS_CLICK_INTERN)
+            if (!short_click && position_ok && size_t(e0 - s0) <= 63) {      // a long click_id: where it is, not what it is
+                ckey = position_key(task.file, chunk_from + u64(s0 - buf), size_t(e0 - s0));
+                short_click = true;
+            }
+#endif
 #endif
             if (!(short_user & short_click)) {
                 // A long ID or two: the slots are asked for now, the row waits a few rows.
@@ -3539,6 +3578,7 @@ int main(int, char** argv) {
     list_csv(sh, "events", sh.event_tasks);
     list_csv(sh, "clicks", sh.click_tasks);
     { u64 input_bytes = 0; for (const InputFile& f : sh.files) input_bytes += f.size; intern_reserve(input_bytes); }
+    g_input_files = sh.files.data();
     if (g_release_input == 2) {
         g_chunks_left = new std::atomic<u32>[sh.files.size() + 1];
         for (size_t i = 0; i <= sh.files.size(); i++) g_chunks_left[i].store(0);
