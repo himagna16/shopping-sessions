@@ -8,7 +8,7 @@ COPY src/ /src/
 RUN if [ "$(uname -m)" = "x86_64" ]; then V3="-march=x86-64-v3 -mtune=skylake-avx512 -Wa,-mbranches-within-32B-boundaries"; else V3=""; fi \
  && B="g++ -std=c++20 -fno-plt -static -pthread -O3 -fno-tree-vectorize $V3 /src/main.cpp" \
  && $B -o /p \
- && $B -DSS_EVENT_INTERN -o /pei \
+ && $B -DSS_INTERN_VERIFY -o /pei \
  && strip /p /pei
 COPY probe/longids.cpp /longids.cpp
 RUN g++ -std=c++17 -O2 -static -o /longids /longids.cpp
