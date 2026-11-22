@@ -1,0 +1,11 @@
+click_id,user_id,campaign_id,ts
+click_id,user_id,campaign_id,ts
+
+kx
+kx,u1
+kx,u1,c_1
+kx,u1,c_1,2026-10-01T05:59:59Z
+kx,u1,c_1,2026-10-01T05:59:59Z,c_1
+kx,u1,c_1,2026-10-01T05:59:59Z,c_1,z
+k1,u1,c_1,2026-10-01T05:59:59Z,
+k2,u1,c_1,2026-10-01T05:59:58Z

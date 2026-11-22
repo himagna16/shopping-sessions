@@ -1,0 +1,11 @@
+event_id,user_id,ts,ingest_ts,event_type,product_id,price_cents
+d2e_0,early0,2026-10-06T02:24:00Z,2026-10-09T02:24:00Z,view,p1,
+d2e_1,early1,2026-10-06T02:25:40Z,2026-10-09T02:25:40Z,view,p1,
+d2e_2,early2,2026-10-06T02:27:20Z,2026-10-09T02:27:20Z,view,p1,
+d3_c,xearly,2026-10-05T02:00:10Z,2026-10-05T02:00:11Z,purchase,p4,1234
+d3_f,dd1,2026-10-05T02:40:00Z,2026-10-05T02:40:01Z,purchase,p2,9999
+d4_0,only0,garbage,2026-10-06T12:00:04Z,view,p1,
+d4_1,only1,garbage,2026-10-06T12:01:14Z,view,p1,
+d4_2,only2,garbage,2026-10-06T12:02:24Z,view,p1,
+d5_c,mal,2026-10-07T00:00:00Z,NOT_A_TS,view,p1
+d6,"same6",2026-10-07T00:01:40Z,2026-10-07T00:01:42Z,"view",p1,
