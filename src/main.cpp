@@ -218,13 +218,22 @@ static inline SS_HOT u64 hash_bytes(const u8* p, size_t n) {
     return h ? h : 1;
 }
 
-// Sizes the parts' first tables for an input of this many bytes (about one long
-// ID per 500 bytes of the usual data), so that they seldom have to grow.
+template <class T> static T* big_alloc(size_t count);
+
+// Gives every part its first table, sized for an input of this many bytes (the
+// usual data has a long ID to intern about every 2,000 bytes; four slots are
+// kept for each), all in one zero-filled stretch on 2 MB pages: the slots are
+// probed at random, and on small pages every probe would also miss the TLB.
 static void intern_reserve(u64 input_bytes) {
-    u64 per_part = input_bytes / 500 / 256 * 2;
+    const u64 per_part = input_bytes / 2000 / 256 * 4;
     u32 bits = 10;
     while (bits < 20 && (1ULL << bits) < per_part) bits++;
     g_intern_start = bits;
+#ifdef SS_INTERN_LAZY                // measurement: each part's table made when first needed, on small pages
+    return;
+#endif
+    InternSlot* all = big_alloc<InternSlot>(size_t(256) << bits);
+    for (u32 i = 0; i < 256; i++) g_intern[i].table.store(u64(uintptr_t(all + (size_t(i) << bits))) | bits, std::memory_order_release);
 }
 
 static InternSlot* intern_new_slots(u32 bits) {
