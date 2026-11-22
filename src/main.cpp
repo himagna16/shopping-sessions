@@ -180,22 +180,30 @@ static const u64 INTERN_BIT = 1ULL << 63;
 // (slots only ever go from empty to filled, and a part that grows leaves its old
 // slots in place for readers still on them); only adding a new ID takes the
 // part's lock. Since scorer version 5 one ID in eight is this long, so this is
-// on the path of every eighth row, not an oddity.
+// on the path of every eighth row, not an oddity: a look-up is one hash and,
+// nearly always, one slot.
+//
+// A slot holds the ID's whole 64-bit hash, and a look-up that finds its hash
+// takes the slot without reading the stored bytes (that second read is a cache
+// miss on every long ID). Two different IDs with one hash would become one ID:
+// with three million long IDs that is one chance in a few million. Build with
+// -DSS_INTERN_VERIFY to compare the bytes as well.
 struct InternEntry { u32 len; u8 bytes[4]; };                    // bytes run on for len
-struct InternTable { u64 mask; std::atomic<u64> slot[1]; };      // slot: 16 bits of hash, 48 of address
+struct InternSlot { std::atomic<u64> hash; std::atomic<u64> entry; };
 struct InternPart {
-    std::atomic<InternTable*> table{nullptr};
+    std::atomic<u64> table{0};                                   // address of the slots (64-aligned) + log2 of their number
     std::atomic_flag busy = ATOMIC_FLAG_INIT;
     u64 count = 0;
     u8* room = nullptr;
     size_t room_left = 0;
     char pad[24];
 };
-static InternPart g_intern[256];
+alignas(64) static InternPart g_intern[256];
+static u32 g_intern_start = 10;                                  // log2 of a part's first table
 
 static inline u64 mix128(u64 a, u64 b) { const unsigned __int128 r = (unsigned __int128)a * b; return u64(r) ^ u64(r >> 64); }
-// A 64-bit hash of n bytes; reads only those bytes.
-static inline u64 hash_bytes(const u8* p, size_t n) {
+// A 64-bit hash of n bytes, never 0; reads only those bytes.
+static inline SS_HOT u64 hash_bytes(const u8* p, size_t n) {
     u64 h = 0x9E3779B97F4A7C15ULL ^ (n * 0xD6E8FEB86659FD93ULL);
     while (n >= 16) {
         h = mix128(rd64(p) ^ 0xA0761D6478BD642FULL, rd64(p + 8) ^ h);
@@ -206,50 +214,72 @@ static inline u64 hash_bytes(const u8* p, size_t n) {
     else if (n >= 4) { a = rd32(p); b = rd32(p + n - 4); }
     else if (n) { a = (u64(p[0]) << 16) | (u64(p[n >> 1]) << 8) | p[n - 1]; }
     h = mix128(a ^ 0xE7037ED1A0B428DBULL, b ^ h);
-    return mix128(h, 0x8EBC6AF09C88C6E3ULL);
+    h = mix128(h, 0x8EBC6AF09C88C6E3ULL);
+    return h ? h : 1;
 }
 
-static InternTable* intern_new_table(u64 slots) {
-    InternTable* t = (InternTable*)calloc(1, sizeof(InternTable) + (slots - 1) * sizeof(std::atomic<u64>));
-    if (!t) die("out of memory for the ID table");
-    t->mask = slots - 1;
-    return t;
+// Sizes the parts' first tables for an input of this many bytes (about one long
+// ID per 500 bytes of the usual data), so that they seldom have to grow.
+static void intern_reserve(u64 input_bytes) {
+    u64 per_part = input_bytes / 500 / 256 * 2;
+    u32 bits = 10;
+    while (bits < 20 && (1ULL << bits) < per_part) bits++;
+    g_intern_start = bits;
 }
 
-static inline const InternEntry* intern_find(const InternTable* t, u64 h, const u8* p, size_t n) {
-    const u64 tag = h >> 48;
-    for (u64 i = (h >> 8) & t->mask;; i = (i + 1) & t->mask) {
-        const u64 v = t->slot[i].load(std::memory_order_acquire);
-        if (!v) return nullptr;
-        if ((v >> 48) == tag) {
-            const InternEntry* e = (const InternEntry*)(v & 0xFFFFFFFFFFFFULL);
-            if (e->len == n && memcmp(e->bytes, p, n) == 0) return e;
+static InternSlot* intern_new_slots(u32 bits) {
+    void* mem = nullptr;
+    const size_t bytes = sizeof(InternSlot) << bits;
+    if (posix_memalign(&mem, 64, bytes) != 0 || !mem) die("out of memory for the ID table");
+#ifdef MADV_HUGEPAGE
+    if (bytes >= (2u << 20)) madvise(mem, bytes, MADV_HUGEPAGE);
+#endif
+    memset(mem, 0, bytes);
+    return (InternSlot*)mem;
+}
+
+static inline SS_HOT const InternEntry* intern_find(u64 table, u64 h, [[maybe_unused]] const u8* p, [[maybe_unused]] size_t n) {
+    const InternSlot* slots = (const InternSlot*)uintptr_t(table & ~63ULL);
+    const u64 mask = (1ULL << (table & 63)) - 1;
+    for (u64 i = (h >> 8) & mask;; i = (i + 1) & mask) {
+        const u64 seen = slots[i].hash.load(std::memory_order_acquire);
+        if (seen == h) {
+            const InternEntry* e = (const InternEntry*)uintptr_t(slots[i].entry.load(std::memory_order_relaxed));
+#ifdef SS_INTERN_VERIFY
+            if (e->len != n || memcmp(e->bytes, p, n) != 0) continue;
+#endif
+            return e;
         }
+        if (!seen) return nullptr;
     }
 }
 
 __attribute__((noinline)) static u64 intern_add(InternPart& part, u64 h, const u8* p, size_t n) {
     while (part.busy.test_and_set(std::memory_order_acquire)) { }
-    InternTable* t = part.table.load(std::memory_order_relaxed);
-    const InternEntry* found = t ? intern_find(t, h, p, n) : nullptr;      // added by another thread meanwhile?
+    u64 table = part.table.load(std::memory_order_relaxed);
+    const InternEntry* found = table ? intern_find(table, h, p, n) : nullptr;      // added by another thread meanwhile?
     if (!found) {
-        if (!t || part.count * 2 >= t->mask + 1) {
-            // Grow: the new table takes every entry; the old one stays for readers still in it.
-            InternTable* bigger = intern_new_table(t ? (t->mask + 1) * 4 : 1024);
-            if (t) for (u64 i = 0; i <= t->mask; i++) {
-                const u64 v = t->slot[i].load(std::memory_order_relaxed);
-                if (!v) continue;
-                const InternEntry* e = (const InternEntry*)(v & 0xFFFFFFFFFFFFULL);
-                u64 j = (hash_bytes(e->bytes, e->len) >> 8) & bigger->mask;
-                while (bigger->slot[j].load(std::memory_order_relaxed)) j = (j + 1) & bigger->mask;
-                bigger->slot[j].store(v, std::memory_order_relaxed);
+        const u64 size = table ? 1ULL << (table & 63) : 0;
+        if (!table || part.count * 2 >= size) {
+            // Grow: the new slots take every entry; the old ones stay for readers still on them.
+            const u32 bits = table ? u32(table & 63) + 2 : g_intern_start;
+            InternSlot* bigger = intern_new_slots(bits);
+            const u64 mask = (1ULL << bits) - 1;
+            const InternSlot* old = (const InternSlot*)uintptr_t(table & ~63ULL);
+            for (u64 i = 0; i < size; i++) {
+                const u64 hh = old[i].hash.load(std::memory_order_relaxed);
+                if (!hh) continue;
+                u64 j = (hh >> 8) & mask;
+                while (bigger[j].hash.load(std::memory_order_relaxed)) j = (j + 1) & mask;
+                bigger[j].entry.store(old[i].entry.load(std::memory_order_relaxed), std::memory_order_relaxed);
+                bigger[j].hash.store(hh, std::memory_order_relaxed);
             }
-            part.table.store(bigger, std::memory_order_release);
-            t = bigger;
+            table = u64(uintptr_t(bigger)) | bits;
+            part.table.store(table, std::memory_order_release);
         }
         const size_t need = (sizeof(u32) + n + 8 + 7) & ~size_t(7);         // 8 spare bytes: an entry can be read a word at a time
         if (part.room_left < need) {
-            const size_t block = std::max<size_t>(need, 1 << 20);
+            const size_t block = std::max<size_t>(need, 1 << 18);
             part.room = (u8*)malloc(block);
             if (!part.room) die("out of memory for interned IDs");
             part.room_left = block;
@@ -259,9 +289,12 @@ __attribute__((noinline)) static u64 intern_add(InternPart& part, u64 h, const u
         e->len = u32(n);
         memcpy(e->bytes, p, n);
         memset(e->bytes + n, 0, 8);
-        u64 j = (h >> 8) & t->mask;
-        while (t->slot[j].load(std::memory_order_relaxed)) j = (j + 1) & t->mask;
-        t->slot[j].store(((h >> 48) << 48) | u64(uintptr_t(e)), std::memory_order_release);
+        InternSlot* slots = (InternSlot*)uintptr_t(table & ~63ULL);
+        const u64 mask = (1ULL << (table & 63)) - 1;
+        u64 j = (h >> 8) & mask;
+        while (slots[j].hash.load(std::memory_order_relaxed)) j = (j + 1) & mask;
+        slots[j].entry.store(u64(uintptr_t(e)), std::memory_order_relaxed);        // the entry first: a reader that sees the hash finds it
+        slots[j].hash.store(h, std::memory_order_release);
         part.count++;
         found = e;
     }
@@ -269,11 +302,11 @@ __attribute__((noinline)) static u64 intern_add(InternPart& part, u64 h, const u
     return INTERN_BIT | u64(uintptr_t(found));
 }
 
-static inline u64 intern_id(const u8* p, size_t n) {
+static inline SS_HOT u64 intern_id(const u8* p, size_t n) {
     const u64 h = hash_bytes(p, n);
     InternPart& part = g_intern[h & 255];
-    if (const InternTable* t = part.table.load(std::memory_order_acquire))
-        if (const InternEntry* e = intern_find(t, h, p, n)) return INTERN_BIT | u64(uintptr_t(e));
+    if (const u64 table = part.table.load(std::memory_order_acquire))
+        if (const InternEntry* e = intern_find(table, h, p, n)) return INTERN_BIT | u64(uintptr_t(e));
     return intern_add(part, h, p, n);
 }
 static inline const InternEntry* intern_entry(u64 key) { return (const InternEntry*)uintptr_t(key & ~INTERN_BIT); }
@@ -3406,6 +3439,7 @@ int main(int, char** argv) {
     list_csv(sh, "links", sh.link_tasks);
     list_csv(sh, "events", sh.event_tasks);
     list_csv(sh, "clicks", sh.click_tasks);
+    { u64 input_bytes = 0; for (const InputFile& f : sh.files) input_bytes += f.size; intern_reserve(input_bytes); }
     if (g_release_input == 2) {
         g_chunks_left = new std::atomic<u32>[sh.files.size() + 1];
         for (size_t i = 0; i <= sh.files.size(); i++) g_chunks_left[i].store(0);
