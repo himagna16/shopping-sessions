@@ -32,7 +32,9 @@ keyed by the address of its copy, so comparing and writing it needs no look-up.
 A look-up is one hash and one table slot; the slot holds the whole 64-bit hash
 and a hit is taken on it (`-DSS_INTERN_VERIFY` compares the bytes as well: two
 different long IDs with one hash are one chance in a few million per run).
-An `event_id` is only ever compared for equality, so a long one is keyed by a
+A long `click_id` is not stored at all: it is only looked at to order two clicks
+of one person with the same time, so its key says where its bytes are in the
+input. An `event_id` is only ever compared for equality, so a long one is keyed by a
 63-bit hash of its bytes instead of being stored (build with `-DSS_EVENT_INTERN`
 to intern those too; two different long event IDs meeting in one key would take
 about one run in 400,000 at the final's size).
